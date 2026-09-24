@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""Finite, evidence-driven validation against two user-owned CUDA workers.
+
+Standard library only. This program never provisions instances, opens SSH
+connections, starts/stops servers, or publishes code. Run on the GPU host with
+the candidate source, native executable, and processes in the same namespace.
+"""
+
+import argparse
+import hashlib
+import http.client
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+
+BASE = "bc16b190f8875a275287dd70ce5b4c9e54373dd6"
+MODEL = "Qwen/Qwen3-0.6B"
+REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
+TOKENIZER_SHA256 = "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def token_digest(tokens):
+    return hashlib.sha256(b"".join(t.to_bytes(4, "big") for t in tokens)).hexdigest()
+
+
+def command(argv, cwd=None):
+    result = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, check=False)
+    require(result.returncode == 0, f"{argv[0]} failed: {result.stderr[-2000:]}")
+    return result.stdout.strip()
+
+
+def save(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def source_identity(source, expected):
+    source = Path(source).resolve()
+    head = command(["git", "rev-parse", "HEAD"], source)
+    require(re.fullmatch(r"[0-9a-f]{40}", expected), "candidate must be a full commit SHA")
+    require(head == expected, f"source HEAD {head} != candidate {expected}")
+    require(not command(["git", "status", "--porcelain"], source), "candidate source is dirty")
+    command(["git", "merge-base", "--is-ancestor", BASE, head], source)
+    return {"candidate_sha": head, "base_sha": BASE,
+            "tree_sha": command(["git", "rev-parse", "HEAD^{tree}"], source)}
+
+
+def output_directory(path, source):
+    path = Path(path).resolve()
+    require(not path.is_relative_to(Path(source).resolve()), "evidence must be outside source")
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def build(args):
+    """User-invoked build; the agent must not invoke it under the local policy."""
+    out = output_directory(args.output, args.source)
+    target = out / "target"
+    argv = ["cargo", "build", "--locked", "--release", "--bin", "vllm-router",
+            "--target-dir", str(target)]
+    metadata = {"requested_candidate_sha": args.candidate, "command": argv,
+                "architecture": platform.machine(),
+                "started_at_unix": time.time(), "status": "RUNNING"}
+    save(out / "build.json", metadata)
+    try:
+        identity = source_identity(args.source, args.candidate)
+        metadata.update(identity, rustc=command(["rustc", "--version", "--verbose"]))
+        save(out / "build.json", metadata)
+        print("Building the clean candidate; full output is in build.log", flush=True)
+        with (out / "build.log").open("w") as log:
+            result = subprocess.run(argv, cwd=args.source, stdout=log, stderr=subprocess.STDOUT,
+                                    check=False)
+        metadata["returncode"] = result.returncode
+        require(result.returncode == 0, f"native build failed with exit code {result.returncode}")
+        require(source_identity(args.source, args.candidate) == identity,
+                "source changed during build")
+        native = target / "release" / "vllm-router"
+        metadata.update(native=str(native), native_sha256=sha256(native), status="PASS")
+    except (Exception, KeyboardInterrupt) as error:
+        metadata.update(status="FAIL", error=f"{type(error).__name__}: {error}")
+    metadata["finished_at_unix"] = time.time()
+    save(out / "build.json", metadata)
+    print(f"Build {metadata['status']}: {out / 'build.json'}")
+    return 0 if metadata["status"] == "PASS" else 1
+
+
+def engine_core_title(argv, environment):
+    """vLLM 0.29 assigns this exact process title to a DP=1 EngineCore."""
+    expected = environment.get("VLLM_PROCESS_NAME_PREFIX", "VLLM") + "::EngineCore"
+    return expected if argv == [expected] else None
+
+
+def process(pid):
+    root = Path(f"/proc/{pid}")
+    stat = (root / "stat").read_text().rsplit(")", 1)[1].split()
+    argv_raw = (root / "cmdline").read_bytes()
+    argv = [a.decode(errors="replace") for a in argv_raw.split(b"\0") if a]
+    env_raw = (root / "environ").read_bytes().split(b"\0")
+    allowed_env = {"PYTHONHASHSEED", "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES",
+                   "CUDA_VISIBLE_DEVICES", "VLLM_SERVER_DEV_MODE", "VLLM_PROCESS_NAME_PREFIX"}
+    env = {}
+    for entry in env_raw:
+        key, _, value = entry.partition(b"=")
+        if key.decode(errors="replace") in allowed_env:
+            env[key.decode()] = value.decode(errors="replace")
+    # Never copy a process's complete environment or arbitrary command arguments.
+    allowed_flags = {"--revision", "--tokenizer-revision", "--served-model-name", "--port",
+                     "--data-parallel-size", "--tensor-parallel-size", "--pipeline-parallel-size",
+                     "--prefix-caching-hash-algo", "--block-size", "--kv-events-config",
+                     "--policy", "--kv-model", "--kv-block-size", "--kv-hash-algo",
+                     "--kv-hash-seed", "--kv-events-port", "--kv-events-endpoint"}
+    selected = {}
+    for i, argument in enumerate(argv):
+        flag, separator, value = argument.partition("=")
+        if flag in allowed_flags:
+            selected.setdefault(flag, []).append(value if separator else argv[i + 1])
+    return {"pid": pid, "ppid": int(stat[1]), "start_ticks": int(stat[19]),
+            "exe": os.readlink(root / "exe"), "exe_sha256": sha256(root / "exe"),
+            "command_sha256": hashlib.sha256(argv_raw).hexdigest(),
+            "selected_arguments": selected, "selected_environment": env,
+            "engine_core_title": engine_core_title(argv, env),
+            "model_in_command": MODEL in argv}
+
+
+def descendant(pid, parent):
+    seen = set()
+    while pid > 1 and pid not in seen:
+        if pid == parent:
+            return True
+        seen.add(pid)
+        stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        pid = int(stat[1])
+    return False
+
+
+def request(base, path, payload=None, timeout=60):
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(base.rstrip("/") + path, data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.status, dict(response.headers), response.read().decode()
+    except urllib.error.HTTPError as error:
+        return error.code, dict(error.headers), error.read().decode()
+
+
+def json_request(base, path, payload=None):
+    status, _, body = request(base, path, payload)
+    require(status == 200, f"{base}{path}: HTTP {status}: {body[:500]}")
+    return json.loads(body)
+
+
+def metrics(base):
+    status, _, body = request(base, "/metrics")
+    require(status == 200, f"metrics unavailable for {base}")
+    result = {}
+    for line in body.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(r"([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+([^ ]+)(?:\s+.*)?", line)
+        if match:
+            name, labels, value = match.groups()
+            try:
+                result[(name, labels or "")] = float(value)
+            except ValueError:
+                pass
+    return result
+
+
+def count(values, name, label=None):
+    matches = [value for (metric, labels), value in values.items()
+               if metric == name and (label is None or label in labels)]
+    require(matches, f"required metric {name} {label or ''} is absent")
+    return sum(matches)
+
+
+def parse_decisions(text):
+    decisions = []
+    decoder = json.JSONDecoder()
+    for line in text.splitlines():
+        line = ANSI.sub("", line)
+        if "kv_route_decision" not in line:
+            continue
+        try:
+            outer = json.loads(line)
+            fields = outer.get("fields", outer)
+            value = fields["decision"]
+            decisions.append(json.loads(value) if isinstance(value, str) else value)
+            continue
+        except (ValueError, KeyError, TypeError):
+            pass
+        match = re.search(r"\bdecision=", line)
+        if match:
+            value, _ = decoder.raw_decode(line[match.end():].lstrip())
+            decisions.append(json.loads(value) if isinstance(value, str) else value)
+    return decisions
+
+
+class Validation:
+    def __init__(self, args, out):
+        self.args, self.out = args, out
+        self.workers = [args.worker0.rstrip("/"), args.worker1.rstrip("/")]
+        require(len(set(self.workers)) == 2, "worker URLs must be distinct")
+        self.results = []
+
+    def idle(self):
+        for _ in range(120):
+            backend_idle = all(count(metrics(w), "vllm:num_requests_running") == 0
+                               for w in self.workers)
+            registered = json_request(self.args.router, "/workers")["workers"]
+            own = [w for w in registered if w["url"].rstrip("/") in self.workers]
+            require(len(own) == 2, "Router must register both independent workers")
+            if backend_idle and all(w["load"] == 0 and w["is_healthy"] for w in own):
+                return
+            time.sleep(0.25)
+        raise RuntimeError("backend running requests or Router load did not return to zero")
+
+    def tokens(self, payload):
+        if isinstance(payload.get("prompt"), list):
+            return payload["prompt"]
+        fields = ("model", "prompt", "messages", "add_special_tokens",
+                  "chat_template_kwargs", "add_generation_prompt")
+        data = {key: payload[key] for key in fields if key in payload}
+        tokens = [json_request(worker, "/tokenize", data)["tokens"] for worker in self.workers]
+        require(tokens[0] == tokens[1], "the two workers disagree on exact prompt tokens")
+        require(tokens[0] and all(type(t) is int and 0 <= t < 2**32 for t in tokens[0]),
+                "worker tokenizer returned invalid token IDs")
+        return tokens[0]
+
+    def counters(self):
+        return [count(metrics(w), self.args.request_counter) for w in self.workers]
+
+    def observed_backend(self, before):
+        for _ in range(120):
+            after = self.counters()
+            delta = [a - b for a, b in zip(after, before)]
+            if sum(delta) >= 1:
+                require(delta in ([1, 0], [0, 1]),
+                        f"ambiguous backend counts {delta}; dedicate both workers to this run")
+                return delta.index(1), delta
+            time.sleep(0.25)
+        raise RuntimeError("no completed request appeared in backend metrics")
+
+    def log_tail(self, offset):
+        with Path(self.args.router_log).open("rb") as log:
+            log.seek(offset)
+            return log.read().decode(errors="replace")
+
+    def send(self, name, payload, expected=None, stream=False):
+        self.idle()
+        path = "/v1/chat/completions" if "messages" in payload else "/v1/completions"
+        tokens = self.tokens(payload)
+        require(len(tokens) >= 32, "test prompt must span at least two full KV blocks")
+        before = self.counters()
+        offset = Path(self.args.router_log).stat().st_size
+        status, headers, body = request(self.args.router, path, {**payload, "stream": stream})
+        (self.out / f"{name}.router.log").write_text(self.log_tail(offset))
+        save(self.out / f"{name}.response.json", {
+            "http_status": status, "request": payload, "stream": stream,
+            "response_sha256": hashlib.sha256(body.encode()).hexdigest(),
+            "error_body": body if status != 200 else None,
+        })
+        require(status == 200, f"Router returned HTTP {status}: {body[:500]}")
+        if stream:
+            require("text/event-stream" in headers.get("content-type", headers.get("Content-Type", "")),
+                    "stream response is not SSE")
+            require("data: [DONE]" in body and '"choices"' in body, "SSE completion is incomplete")
+        else:
+            require(json.loads(body).get("choices"), "JSON response has no choices")
+        actual, delta = self.observed_backend(before)
+        self.idle()
+        tail = self.log_tail(offset)
+        (self.out / f"{name}.router.log").write_text(tail)
+        decisions = parse_decisions(tail)
+        require(len(decisions) == 1, f"expected exactly one routing decision, got {len(decisions)}")
+        decision = decisions[0]
+        require(decision["worker"].rstrip("/") == self.workers[actual],
+                "decision and independent backend counter disagree")
+        require(decision["token_ids_sha256"] == token_digest(tokens),
+                "Router exact token IDs differ from worker /tokenize")
+        scores = {entry["worker"].rstrip("/"): entry["prefix_blocks"]
+                  for entry in decision["scores"]}
+        require(set(scores) == set(self.workers), "decision must report both worker scores")
+        if expected is not None:
+            require(actual == expected, f"expected W{expected}, observed W{actual}")
+            require(scores[self.workers[expected]] > 0, "target has no real KV-event positive score")
+            require(scores[self.workers[1 - expected]] == 0, "other worker has a positive prefix score")
+        else:
+            require(all(score == 0 for score in scores.values()), "cold/cleared prefix still has ownership")
+        evidence = {"name": name, "status": "PASS", "actual_backend": actual,
+                    "completed_request_deltas": delta, "decision": decision,
+                    "worker_token_ids_sha256": token_digest(tokens), "prompt_tokens": len(tokens),
+                    "request": payload, "response_sha256": hashlib.sha256(body.encode()).hexdigest(),
+                    "stream": stream}
+        save(self.out / f"{name}.json", evidence)
+        return evidence
+
+    def case(self, name, callback):
+        try:
+            evidence = callback()
+            self.results.append(evidence or {"name": name, "status": "PASS"})
+            print(f"PASS {name}", flush=True)
+        except Exception as error:
+            self.results.append({"name": name, "status": "FAIL", "error": str(error)})
+            print(f"FAIL {name}: {error}", flush=True)
+        save(self.out / "cases.json", self.results)
+
+    def positive(self, name, kind, target, stream=False):
+        nonce = uuid.uuid4().hex
+        text = (f"{nonce} synthetic public cache-routing case {name}. " * 16
+                + "Return a short response.")
+        payload = {"model": MODEL, "max_tokens": 8, "temperature": 0}
+        if kind == "chat":
+            payload["messages"] = [{"role": "user", "content": text}]
+        else:
+            payload.update(prompt=text, add_special_tokens=True)
+            if kind == "ids":
+                payload["prompt"] = self.tokens(payload)
+        path = "/v1/chat/completions" if kind == "chat" else "/v1/completions"
+        self.idle()
+        before = self.counters()
+        json_request(self.workers[target], path, payload)
+        actual, delta = self.observed_backend(before)
+        require(actual == target, "direct warming reached the wrong worker")
+        # Time for the asynchronous real ZMQ event; never warm through the Router.
+        time.sleep(self.args.event_wait)
+        result = self.send(name, payload, target, stream)
+        result["direct_warm_completed_request_deltas"] = delta
+        save(self.out / f"{name}.json", result)
+        return result
+
+    def clear(self):
+        name = "real_all_blocks_cleared"
+        nonce = uuid.uuid4().hex
+        payload = {"model": MODEL, "prompt": (nonce + " lifecycle public fixture ") * 16,
+                   "max_tokens": 4, "temperature": 0}
+        json_request(self.workers[0], "/v1/completions", payload)
+        time.sleep(self.args.event_wait)
+        self.send(name + "_before", payload, 0)
+        self.idle()
+        reset = json_request(self.workers[0], "/reset_prefix_cache", {})
+        require(reset.get("success") is True, "worker did not confirm prefix-cache reset")
+        # vLLM 0.29 queues AllBlocksCleared at reset, but an idle engine publishes
+        # it only on a subsequent scheduler step. A fresh direct-only marker
+        # drives that step without restoring ownership of the cleared prefix.
+        marker = {"model": MODEL, "prompt": (uuid.uuid4().hex + " clear event flush ") * 4,
+                  "max_tokens": 1, "temperature": 0}
+        marker_tokens = self.tokens(marker)
+        require(marker_tokens[:16] != self.tokens(payload)[:16],
+                "event-flush marker unexpectedly shares the cleared prefix")
+        before = self.counters()
+        json_request(self.workers[0], "/v1/completions", marker)
+        actual, delta = self.observed_backend(before)
+        require(actual == 0, "cache-clear marker did not reach only W0")
+        time.sleep(self.args.event_wait)
+        result = self.send(name + "_after", payload)
+        result["reset_response"] = reset
+        result["direct_event_flush_marker"] = {
+            "request": marker, "token_ids_sha256": token_digest(marker_tokens),
+            "completed_request_deltas": delta,
+        }
+        save(self.out / f"{name}_after.json", result)
+        return result
+
+    def error_cleanup(self):
+        self.idle()
+        payload = {"model": MODEL, "prompt": uuid.uuid4().hex + " error cleanup " * 40,
+                   "max_tokens": 2147483647}
+        offset = Path(self.args.router_log).stat().st_size
+        status, _, body = request(self.args.router, "/v1/completions", payload)
+        require(400 <= status < 500, f"expected backend rejection, got HTTP {status}")
+        self.idle()
+        tail = self.log_tail(offset)
+        require(parse_decisions(tail), "error case never dispatched to a backend")
+        (self.out / "backend_error_cleanup.router.log").write_text(tail)
+        return {"name": "backend_error_cleanup", "status": "PASS", "http_status": status,
+                "response": body, "router_and_backend_load_after": 0}
+
+    def cancel_cleanup(self):
+        self.idle()
+        offset = Path(self.args.router_log).stat().st_size
+        before = [metrics(worker) for worker in self.workers]
+        abort_before = [sum(v for (name, labels), v in m.items()
+                            if name == self.args.request_counter and 'finished_reason="abort"' in labels)
+                        for m in before]
+        parsed = urllib.parse.urlsplit(self.args.router)
+        cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        connection = cls(parsed.hostname, parsed.port, timeout=60)
+        payload = {"model": MODEL, "prompt": uuid.uuid4().hex + " cancellation fixture " * 40,
+                   "max_tokens": 1024, "ignore_eos": True, "stream": True}
+        try:
+            connection.request("POST", parsed.path.rstrip("/") + "/v1/completions",
+                               json.dumps(payload), {"Content-Type": "application/json"})
+            response = connection.getresponse()
+            require(response.status == 200, f"cancel stream HTTP {response.status}")
+            for _ in range(100):
+                line = response.readline()
+                require(line, "stream ended before cancellation")
+                require(b"[DONE]" not in line, "request completed before cancellation")
+                if line.startswith(b"data:") and b'"choices"' in line:
+                    break
+            else:
+                raise RuntimeError("no response event before cancellation")
+            response.close()
+        finally:
+            connection.close()
+        self.idle()
+        (self.out / "stream_cancel_cleanup.router.log").write_text(self.log_tail(offset))
+        delta = [0, 0]
+        for _ in range(120):
+            abort_after = [sum(v for (name, labels), v in metrics(worker).items()
+                               if name == self.args.request_counter and 'finished_reason="abort"' in labels)
+                           for worker in self.workers]
+            delta = [a - b for a, b in zip(abort_after, abort_before)]
+            if sum(delta):
+                break
+            time.sleep(0.25)
+        require(delta in ([1, 0], [0, 1]), f"backend abort was not proven: {delta}")
+        return {"name": "stream_cancel_cleanup", "status": "PASS", "abort_deltas": delta,
+                "router_and_backend_load_after": 0}
+
+
+def validate(args):
+    out = output_directory(args.output, args.source)
+    report = {"status": "RUNNING", "started_at_unix": time.time(), "command": sys.argv,
+              "model": MODEL, "model_revision": REVISION}
+    save(out / "summary.json", report)
+    try:
+        require(platform.system() == "Linux", "run in the GPU processes' Linux /proc namespace")
+        identity = source_identity(args.source, args.candidate)
+        manifest = json.loads(Path(args.build_manifest).read_text())
+        native_sha = sha256(args.native)
+        require(manifest["status"] == "PASS" and manifest["candidate_sha"] == args.candidate
+                and manifest["native_sha256"] == native_sha,
+                "build manifest does not bind this candidate to this native executable")
+        processes = [process(pid) for pid in [args.router_pid, args.worker0_pid, args.worker1_pid,
+                                              args.engine0_pid, args.engine1_pid]]
+        require(len({p["pid"] for p in processes}) == 5, "router, HTTP and EngineCore PIDs must be distinct")
+        require(processes[0]["exe_sha256"] == native_sha, "live Router is not the candidate native executable")
+        require(all(p["engine_core_title"] for p in processes[3:]),
+                "engine PIDs must identify vLLM DP=1 EngineCore processes, not arbitrary children")
+        require(descendant(args.engine0_pid, args.worker0_pid)
+                and descendant(args.engine1_pid, args.worker1_pid), "EngineCore ancestry is not independent")
+        event_endpoints = []
+        for worker_index, p in enumerate(processes[1:3]):
+            env, flags = p["selected_environment"], p["selected_arguments"]
+            require(p["model_in_command"], "worker command must identify the pinned public model")
+            require(env.get("PYTHONHASHSEED") == "0", "worker PYTHONHASHSEED must be 0")
+            require(env.get("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES") == "0", "full-byte event hashes required")
+            require(flags.get("--revision") == [REVISION], "worker revision is not pinned")
+            require(flags.get("--tokenizer-revision") == [REVISION], "worker tokenizer revision is not pinned")
+            require(flags.get("--block-size") == ["16"], "worker block size must be 16")
+            require(flags.get("--prefix-caching-hash-algo") == ["sha256_cbor"], "worker hash algorithm mismatch")
+            worker_url = urllib.parse.urlsplit([args.worker0, args.worker1][worker_index])
+            require(flags.get("--port") == [str(worker_url.port)], "HTTP PID does not match worker URL port")
+            events = json.loads(flags.get("--kv-events-config", ["{}"])[0])
+            require(events.get("enable_kv_cache_events") is True and events.get("publisher") == "zmq",
+                    "worker must publish real ZMQ KV events")
+            event_endpoints.append(events.get("endpoint"))
+            if args.allow_cache_reset:
+                require(env.get("VLLM_SERVER_DEV_MODE") == "1", "cache-clear test needs isolated dev endpoint")
+            for flag in ("--data-parallel-size", "--tensor-parallel-size", "--pipeline-parallel-size"):
+                require(flags.get(flag, ["1"]) == ["1"], f"{flag} must be 1")
+        require(all(event_endpoints) and len(set(event_endpoints)) == 2,
+                "workers must have distinct explicitly configured event endpoints")
+        gpu_selection = [p["selected_environment"].get("CUDA_VISIBLE_DEVICES") for p in processes[1:3]]
+        require(gpu_selection[0] and gpu_selection[0] == gpu_selection[1]
+                and "," not in gpu_selection[0], "this matrix requires the same single selected GPU")
+        require(sha256(args.tokenizer) == TOKENIZER_SHA256, "tokenizer does not match pinned public revision")
+        environment = {"platform": platform.platform(), "python": sys.version,
+                       "vllm": importlib.metadata.version("vllm"),
+                       "gpu": command(["nvidia-smi", "--query-gpu=name,uuid,driver_version,memory.total",
+                                       "--format=csv,noheader"]),
+                       "processes": processes, "build": manifest,
+                       "tokenizer_sha256": sha256(args.tokenizer)}
+        environment["cuda_runtime"] = command([
+            sys.executable, "-c",
+            "import json, torch; print(json.dumps({'torch': torch.__version__, 'cuda': torch.version.cuda}))",
+        ])
+        require(environment["vllm"] == "0.29.0", "this acceptance matrix pins vLLM 0.29.0")
+        save(out / "environment.json", environment)
+        report.update(identity, native_sha256=native_sha)
+        suite = Validation(args, out)
+        suite.idle()
+        for kind in ("text", "ids", "chat"):
+            for target in (0, 1):
+                name = f"{kind}_first_route_w{target}"
+                suite.case(name, lambda n=name, k=kind, t=target:
+                           suite.positive(n, k, t, stream=t == 1))
+        cold = {"model": MODEL, "prompt": (uuid.uuid4().hex + " cold fixture ") * 16,
+                "max_tokens": 4}
+        suite.case("cold_miss", lambda: suite.send("cold_miss", cold))
+        if args.allow_cache_reset:
+            suite.case("real_all_blocks_cleared", suite.clear)
+        else:
+            suite.results.append({"name": "real_all_blocks_cleared", "status": "NOT RUN",
+                                  "reason": "requires --allow-cache-reset for the two owned workers"})
+        suite.case("backend_error_cleanup", suite.error_cleanup)
+        suite.case("stream_cancel_cleanup", suite.cancel_cleanup)
+        after = [process(p["pid"]) for p in processes]
+        process_keys = ("pid", "start_ticks", "exe_sha256", "command_sha256", "engine_core_title")
+        require([tuple(p[key] for key in process_keys) for p in processes]
+                == [tuple(p[key] for key in process_keys) for p in after],
+                "a tested process identity or executable changed during validation")
+        require(source_identity(args.source, args.candidate) == identity, "candidate changed during validation")
+        report["cases"] = suite.results
+        report["status"] = ("FAIL" if any(r["status"] == "FAIL" for r in suite.results)
+                            else "INCOMPLETE" if any(r["status"] != "PASS" for r in suite.results)
+                            else "PASS")
+        report["scope"] = "single GPU host, two independent DP=1 workers; no performance claim"
+        report["not_covered"] = ["worker restart/new generation (CPU deterministic coverage required)",
+                                 "late event and sequence gap (CPU deterministic coverage required)",
+                                 "multi-GPU or multi-host behavior"]
+    except Exception as error:
+        report.update(status="FAIL", error=str(error))
+    report["finished_at_unix"] = time.time()
+    save(out / "summary.json", report)
+    print(f"{report['status']}: {out / 'summary.json'}")
+    return 0 if report["status"] == "PASS" else 1
+
+
+def self_check():
+    """Offline checks for the evidence parser; no server or GPU is contacted."""
+    import contextlib
+    import io
+    import tempfile
+    from unittest import mock
+
+    decision = {"worker": "http://127.0.0.1:8000", "prefix_blocks": 2,
+                "scores": [{"worker": "http://127.0.0.1:8000", "prefix_blocks": 2}]}
+    encoded = json.dumps(decision, separators=(",", ":"))
+    inputs = [
+        "DEBUG kv_route_decision decision=" + encoded,
+        "\x1b[32mDEBUG\x1b[0m kv_route_decision decision=" + encoded + " other=1",
+        json.dumps({"message": "kv_route_decision", "decision": encoded}),
+        json.dumps({"fields": {"message": "kv_route_decision", "decision": encoded}}),
+        "DEBUG kv_route_decision decision=" + json.dumps(encoded),
+    ]
+    for text in inputs:
+        require(parse_decisions(text) == [decision], "routing log parser self-check failed")
+    require(parse_decisions("unrelated log") == [], "unrelated log accepted")
+    require(token_digest([0x01020304]) == hashlib.sha256(b"\x01\x02\x03\x04").hexdigest(),
+            "token digest byte order is wrong")
+    try:
+        count({}, "required_missing_counter")
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("missing metrics must fail closed")
+    require(engine_core_title(["VLLM::EngineCore"], {}) == "VLLM::EngineCore",
+            "DP=1 EngineCore title not recognized")
+    require(engine_core_title(["fixture::EngineCore"], {"VLLM_PROCESS_NAME_PREFIX": "fixture"}),
+            "configured vLLM process prefix not recognized")
+    for argv in (["python", "-c", "multiprocessing.resource_tracker"],
+                 ["VLLM::Worker_TP0"], ["VLLM::EngineCore_DP1"], []):
+        require(engine_core_title(argv, {}) is None, "non-DP=1-EngineCore process accepted")
+    # Mock every external command: exercise manifest failure handling without
+    # running Cargo, rustc, git, or a GPU process.
+    identity = {"candidate_sha": "a" * 40, "base_sha": BASE, "tree_sha": "b" * 40}
+    scenarios = [
+        ("source-change", [identity, RuntimeError("dirty source after build")], 0),
+        ("missing-native", [identity, identity], 0),
+        ("nonzero-build", [identity], 1),
+    ]
+    with tempfile.TemporaryDirectory(prefix="kv-evidence-self-check-") as temporary:
+        root = Path(temporary)
+        source = root / "source"
+        source.mkdir()
+        for name, source_results, returncode in scenarios:
+            args = argparse.Namespace(source=str(source), candidate="a" * 40,
+                                      output=str(root / name))
+            overrides = {"source_identity": mock.Mock(side_effect=source_results),
+                         "command": mock.Mock(return_value="mock rustc (not executed)")}
+            with mock.patch.dict(globals(), overrides), \
+                    mock.patch.object(subprocess, "run", return_value=argparse.Namespace(returncode=returncode)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                require(build(args) == 1, "failed build was reported successful")
+            manifest = json.loads((root / name / "build.json").read_text())
+            require(manifest["status"] == "FAIL" and manifest.get("error")
+                    and manifest.get("finished_at_unix"), "failed build left incomplete evidence")
+    print("PASS offline log/token/metric/process/failed-build evidence checks (no Cargo or CUDA run)")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="action", required=True)
+    commands.add_parser("self-check", help="offline evidence parser checks; no GPU required")
+    for action in ("build", "validate"):
+        sub = commands.add_parser(action)
+        sub.add_argument("--source", required=True)
+        sub.add_argument("--candidate", required=True)
+        sub.add_argument("--output", required=True, help="new directory outside source")
+        if action == "validate":
+            sub.add_argument("--native", required=True)
+            sub.add_argument("--build-manifest", required=True)
+            sub.add_argument("--tokenizer", required=True, help="pinned tokenizer.json")
+            sub.add_argument("--router", default="http://127.0.0.1:3001")
+            sub.add_argument("--worker0", default="http://127.0.0.1:8000")
+            sub.add_argument("--worker1", default="http://127.0.0.1:8001")
+            sub.add_argument("--router-log", required=True)
+            for name in ("router", "worker0", "worker1", "engine0", "engine1"):
+                sub.add_argument(f"--{name}-pid", required=True, type=int)
+            sub.add_argument("--event-wait", type=float, default=2.0)
+            sub.add_argument("--request-counter", default="vllm:request_success_total")
+            sub.add_argument("--allow-cache-reset", action="store_true")
+    args = parser.parse_args()
+    if args.action == "self-check":
+        return self_check()
+    return build(args) if args.action == "build" else validate(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -59,6 +59,14 @@ impl AppContext {
         rate_limit_tokens_per_second: Option<usize>,
         api_key_validation_urls: Vec<String>,
     ) -> Result<Self, String> {
+        if matches!(
+            router_config.policy,
+            crate::config::PolicyConfig::KvAware { .. }
+        ) {
+            router_config
+                .validate()
+                .map_err(|error| error.to_string())?;
+        }
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 
@@ -245,27 +253,38 @@ async fn inference_generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<ChatCompletionRequest>,
+    Json(raw): Json<serde_json::Value>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
-    state.router.route_chat(Some(&headers), &body, None).await
+    let body: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
+        Ok(body) => body,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
+    state
+        .router
+        .route_chat_raw(Some(&headers), &raw, &body, None)
+        .await
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
+    Json(raw): Json<serde_json::Value>,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
+    let body: CompletionRequest = match serde_json::from_value(raw.clone()) {
+        Ok(body) => body,
+        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+    };
     state
         .router
-        .route_completion(Some(&headers), &body, None)
+        .route_completion_raw(Some(&headers), &raw, &body, None)
         .await
 }
 

@@ -141,9 +141,66 @@ struct TypedDispatch<'a> {
     prepared: Option<crate::backend::PreparedChat>,
 }
 
+/// Borrow the raw payload for forwarding and typed request for shared routing.
+#[derive(Clone)]
+struct RawGenerationRequest<'a, T> {
+    raw: &'a serde_json::Value,
+    typed: &'a T,
+}
+
+impl<T> serde::Serialize for RawGenerationRequest<'_, T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<T: GenerationRequest> GenerationRequest for RawGenerationRequest<'_, T> {
+    fn is_stream(&self) -> bool {
+        self.typed.is_stream()
+    }
+    fn get_model(&self) -> Option<&str> {
+        self.typed.get_model()
+    }
+    fn extract_text_for_routing(&self) -> String {
+        self.typed.extract_text_for_routing()
+    }
+}
+
+#[derive(Debug)]
+struct KvRuntime {
+    _pool: crate::kv_events::KVEventPool,
+    tokenizer: crate::prompt_tokens::PromptTokenizer,
+    model: String,
+}
+
+/// Own the selected worker itself, so removal/replacement cannot redirect
+/// cleanup to a different instance with the same URL.
+struct KvLoadLease(Option<Arc<dyn Worker>>);
+
+impl KvLoadLease {
+    fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        RouterMetrics::set_running_requests(worker.url(), worker.load());
+        Self(Some(worker))
+    }
+    fn attach(mut self, response: Response) -> Response {
+        hold_load_until_body_done(response, self.0.take().expect("live KV load lease"))
+    }
+}
+
+impl Drop for KvLoadLease {
+    fn drop(&mut self) {
+        if let Some(worker) = self.0.take() {
+            worker.decrement_load();
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
+        }
+    }
+}
+
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
+    kv_runtime: Option<KvRuntime>,
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
@@ -187,6 +244,17 @@ impl Router {
         worker_urls: Vec<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        let kv_tokenizer =
+            if let crate::config::PolicyConfig::KvAware { config } = &ctx.router_config.policy {
+                ctx.router_config
+                    .validate()
+                    .map_err(|error| error.to_string())?;
+                Some(crate::prompt_tokens::PromptTokenizer::load(
+                    &config.tokenizer_path,
+                )?)
+            } else {
+                None
+            };
         // Update active workers gauge
         RouterMetrics::set_active_workers(worker_urls.len());
 
@@ -345,7 +413,40 @@ impl Router {
             }))
         });
 
+        let kv_runtime = if let (crate::config::PolicyConfig::KvAware { config }, Some(tokenizer)) =
+            (&ctx.router_config.policy, kv_tokenizer)
+        {
+            let policy = ctx.policy_registry.get_default_policy();
+            let index = policy
+                .as_any()
+                .downcast_ref::<crate::policies::KvAwarePolicy>()
+                .ok_or("kv_aware policy was not initialized")?
+                .index();
+            let mappings: Vec<_> = config
+                .worker_endpoints
+                .iter()
+                .map(|(w, e)| (w.clone(), e.clone()))
+                .collect();
+            let endpoints =
+                crate::kv_events::resolve_endpoints(&worker_urls, &mappings, config.default_port)?;
+            let pool = crate::kv_events::KVEventPool::start(
+                endpoints,
+                config.topic.clone(),
+                config.block_size,
+                index.clone(),
+            )?;
+            ctx.worker_registry.bind_kv_index(&index);
+            Some(KvRuntime {
+                _pool: pool,
+                tokenizer,
+                model: config.model.clone(),
+            })
+        } else {
+            None
+        };
+
         Ok(Router {
+            kv_runtime,
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
@@ -1000,6 +1101,16 @@ impl Router {
         text: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
+        self.select_worker_for_model_with_tokens(model_id, text, headers, None)
+    }
+
+    fn select_worker_for_model_with_tokens(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        token_ids: Option<&[u32]>,
+    ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1024,7 +1135,12 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
+        let idx = policy.select_worker_with_tokens(
+            &available,
+            text,
+            token_ids,
+            request_headers.as_ref(),
+        )?;
         Some(available[idx].clone())
     }
 
@@ -1034,6 +1150,18 @@ impl Router {
         typed_req: &T,
         route: &str,
         model_id: Option<&str>,
+    ) -> Response {
+        self.route_request_with_tokens(headers, typed_req, route, model_id, None)
+            .await
+    }
+
+    async fn route_request_with_tokens<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &str,
+        model_id: Option<&str>,
+        token_ids: Option<Vec<u32>>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -1110,7 +1238,12 @@ impl Router {
                     };
                     Some(worker)
                 } else {
-                    self.select_worker_for_model(model_id, Some(&text), headers)
+                    self.select_worker_for_model_with_tokens(
+                        model_id,
+                        Some(&text),
+                        headers,
+                        token_ids.as_deref(),
+                    )
                 };
                 let worker = match selected_worker {
                     Some(w) => w,
@@ -1147,8 +1280,11 @@ impl Router {
                     None
                 };
 
-                let response = self
-                    .send_typed_request(
+                let response = if self.kv_runtime.is_some() {
+                    self.send_kv_request(headers, typed_req, route, worker.clone(), is_stream)
+                        .await
+                } else {
+                    self.send_typed_request(
                         typed_req,
                         TypedDispatch {
                             headers,
@@ -1160,14 +1296,25 @@ impl Router {
                         },
                         program_completion.clone(),
                     )
-                    .await;
+                    .await
+                };
 
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
                 // should count against the circuit breaker.
                 let status = response.status();
+                if !(status.is_success() || status.is_client_error()) {
+                    // Fence ownership before a concurrent success can recover
+                    // the circuit. Non-KV registries make this a no-op.
+                    self.worker_registry.retire_kv_worker(worker.url());
+                }
                 let was_available = worker.is_available();
                 worker.record_outcome(status.is_success() || status.is_client_error());
                 if was_available != worker.is_available() {
+                    if worker.is_available() {
+                        self.worker_registry.resume_kv_worker(&worker);
+                    } else {
+                        self.worker_registry.retire_kv_worker(worker.url());
+                    }
                     self.worker_registry.notify_worker_state_change();
                 }
 
@@ -1206,6 +1353,94 @@ impl Router {
         }
 
         response
+    }
+
+    /// HTTP-only dispatch for the narrow KV-aware deployment. The lease covers
+    /// header wait, JSON buffering and the entire client-owned streaming body.
+    async fn send_kv_request<T: serde::Serialize>(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &T,
+        route: &str,
+        worker: Arc<dyn Worker>,
+        is_stream: bool,
+    ) -> Response {
+        let lease = KvLoadLease::new(worker.clone());
+        let url = format!("{}{}", worker.url().trim_end_matches('/'), route);
+        let mut request = self.client.post(&url).json(body);
+        if let Some(headers) = headers {
+            for (name, value) in headers {
+                if *name != CONTENT_TYPE
+                    && *name != CONTENT_LENGTH
+                    && !header_utils::TRACE_HEADER_NAMES
+                        .iter()
+                        .any(|header| name.as_str().eq_ignore_ascii_case(header))
+                {
+                    request = request.header(name, value);
+                }
+            }
+        }
+        let response = match otel_http::send_client_request(
+            request,
+            headers,
+            ClientRequestOptions {
+                method: "POST",
+                url: &url,
+                route: Some(route),
+                request_phase: Some("inference"),
+            },
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Worker request failed: {error}"),
+                )
+                    .into_response()
+            }
+        };
+        let status = response.status();
+        let response_headers = header_utils::preserve_response_headers(response.headers());
+        let mut outgoing = if is_stream && status.is_success() {
+            // No detached producer or unbounded queue: dropping the client
+            // body also drops the upstream stream and the load lease.
+            lease.attach(Response::new(Body::from_stream(response.bytes_stream())))
+        } else {
+            match response.bytes().await {
+                Ok(bytes) => Response::new(Body::from(bytes)),
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Worker body failed: {error}"),
+                    )
+                        .into_response()
+                }
+            }
+        };
+        *outgoing.status_mut() = status;
+        *outgoing.headers_mut() = response_headers;
+        outgoing
+    }
+
+    fn kv_tokens(
+        &self,
+        model: Option<&str>,
+        tokens: impl FnOnce(&crate::prompt_tokens::PromptTokenizer) -> Result<Vec<u32>, String>,
+    ) -> Option<Vec<u32>> {
+        let runtime = self.kv_runtime.as_ref()?;
+        if model.is_some_and(|model| model != runtime.model) {
+            debug!("kv_input_unavailable: request model differs from configured worker model");
+            return None;
+        }
+        match tokens(&runtime.tokenizer) {
+            Ok(ids) => Some(ids),
+            Err(reason) => {
+                debug!(%reason, "kv_input_unavailable");
+                None
+            }
+        }
     }
 
     // Helper: return base worker URL (strips DP suffix when enabled)
@@ -1690,6 +1925,9 @@ impl Router {
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+        if self.kv_runtime.is_some() {
+            return Err("kv_aware requires static workers; restart with the complete worker/endpoint mapping".to_string());
+        }
         let mut urls = self.get_worker_urls();
         urls.push(worker_url.to_string());
         crate::backend::classify_worker_urls(&urls)?;
@@ -2230,13 +2468,50 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_chat_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        raw: &serde_json::Value,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        if self.kv_runtime.is_none() {
+            return self.route_chat(headers, body, model_id).await;
+        }
+        let ids = self.kv_tokens(body.model.as_deref(), |tokenizer| tokenizer.chat_raw(raw));
+        let request = RawGenerationRequest { raw, typed: body };
+        self.route_request_with_tokens(headers, &request, "/v1/chat/completions", model_id, ids)
+            .await
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
+        let ids = self.kv_tokens(body.model.as_deref(), |tokenizer| {
+            tokenizer.completion(body)
+        });
+        self.route_request_with_tokens(headers, body, "/v1/completions", model_id, ids)
+            .await
+    }
+
+    async fn route_completion_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        raw: &serde_json::Value,
+        body: &CompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        if self.kv_runtime.is_none() {
+            return self.route_completion(headers, body, model_id).await;
+        }
+        let ids = self.kv_tokens(body.model.as_deref(), |tokenizer| {
+            tokenizer.completion(body)
+        });
+        let request = RawGenerationRequest { raw, typed: body };
+        self.route_request_with_tokens(headers, &request, "/v1/completions", model_id, ids)
             .await
     }
 
@@ -2653,6 +2928,149 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn kv_raw_payload_preserves_extensions_and_single_token_ids() {
+        let raw = serde_json::json!({"model": "Qwen/Qwen3-0.6B", "prompt": [42, 43],
+            "vendor_extension": {"keep": true}, "stream": false});
+        let typed: CompletionRequest = serde_json::from_value(raw.clone()).unwrap();
+        let forwarded = RawGenerationRequest {
+            raw: &raw,
+            typed: &typed,
+        };
+        assert_eq!(serde_json::to_value(&forwarded).unwrap(), raw);
+        assert!(!forwarded.is_stream());
+    }
+
+    #[test]
+    fn kv_chat_fallback_keeps_reasoning_and_unknown_fields() {
+        let raw = serde_json::json!({"messages": [
+            {"role": "user", "content": "public fixture", "vendor_message": 7},
+            {"role": "assistant", "content": "answer", "reasoning_content": "synthetic reasoning"},
+            {"role": "user", "content": "continue"}], "vendor_request": {"keep": true}});
+        assert!(crate::prompt_tokens::render_qwen3_chat(&raw).is_err());
+        let typed: ChatCompletionRequest = serde_json::from_value(raw.clone()).unwrap();
+        let forwarded = RawGenerationRequest {
+            raw: &raw,
+            typed: &typed,
+        };
+        assert_eq!(serde_json::to_value(forwarded).unwrap(), raw);
+    }
+
+    async fn kv_test_server(app: axum::Router) -> (Arc<dyn Worker>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            Arc::new(BasicWorker::new(
+                format!("http://{address}"),
+                WorkerType::Regular,
+            )),
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn kv_dispatch_releases_json_and_http_error_leases() {
+        let app = axum::Router::new()
+            .route(
+                "/ok",
+                axum::routing::post(|Json(raw): Json<serde_json::Value>| async move { Json(raw) }),
+            )
+            .route(
+                "/error",
+                axum::routing::post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            );
+        let (worker, server) = kv_test_server(app).await;
+        let router = create_test_regular_router();
+        let payload = serde_json::json!({"prompt": [1, 2], "unknown": "preserved"});
+        let response = router
+            .send_kv_request(None, &payload, "/ok", worker.clone(), false)
+            .await;
+        assert_eq!(worker.load(), 0);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &to_bytes(response.into_body(), 4096).await.unwrap()
+            )
+            .unwrap(),
+            payload
+        );
+        let response = router
+            .send_kv_request(None, &payload, "/error", worker.clone(), true)
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(worker.load(), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kv_stream_lease_lasts_until_client_body_drop() {
+        let app = axum::Router::new().route(
+            "/stream",
+            axum::routing::post(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: {}\n\n"))
+                });
+                Response::new(Body::from_stream(
+                    first.chain(futures_util::stream::pending()),
+                ))
+            }),
+        );
+        let (worker, server) = kv_test_server(app).await;
+        let router = create_test_regular_router();
+        let response = router
+            .send_kv_request(
+                None,
+                &serde_json::json!({}),
+                "/stream",
+                worker.clone(),
+                true,
+            )
+            .await;
+        assert_eq!(worker.load(), 1);
+        drop(response);
+        assert_eq!(worker.load(), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kv_cancel_before_headers_releases_owned_worker_lease() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = entered.clone();
+        let app = axum::Router::new().route(
+            "/pending",
+            axum::routing::post(move || {
+                let notify = notify.clone();
+                async move {
+                    notify.notify_one();
+                    std::future::pending::<StatusCode>().await
+                }
+            }),
+        );
+        let (worker, server) = kv_test_server(app).await;
+        let owned_worker = worker.clone();
+        let task = tokio::spawn(async move {
+            create_test_regular_router()
+                .send_kv_request(
+                    None,
+                    &serde_json::json!({}),
+                    "/pending",
+                    owned_worker,
+                    false,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(worker.load(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(worker.load(), 0);
+        server.abort();
+    }
+
     fn create_test_regular_router() -> Router {
         // Create registries
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -2668,6 +3086,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            kv_runtime: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -2699,6 +3118,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            kv_runtime: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -2963,6 +3383,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            kv_runtime: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
