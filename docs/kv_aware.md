@@ -72,6 +72,7 @@ vllm serve Qwen/Qwen3-0.6B \
   --served-model-name Qwen/Qwen3-0.6B --host 127.0.0.1 --port 8000 \
   --data-parallel-size 1 --tensor-parallel-size 1 --pipeline-parallel-size 1 \
   --gpu-memory-utilization 0.40 --max-model-len 4096 --enforce-eager \
+  --enable-log-requests \
   --enable-prefix-caching --prefix-caching-hash-algo sha256_cbor --block-size 16 \
   --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv"}'
 ```
@@ -196,6 +197,8 @@ python3 scripts/kv_aware_cuda_validate.py validate \
   --build-manifest /absolute/path/to/build-evidence/build.json \
   --tokenizer /absolute/path/to/pinned/tokenizer.json \
   --router-log /absolute/path/to/new/router.log \
+  --worker0-log /absolute/path/to/worker0.log \
+  --worker1-log /absolute/path/to/worker1.log \
   --router-pid ROUTER_PID \
   --worker0-pid HTTP0_PID --engine0-pid ENGINE0_PID \
   --worker1-pid HTTP1_PID --engine1-pid ENGINE1_PID \
@@ -234,6 +237,24 @@ the overall result is INCOMPLETE. A missing counter, missing decision log,
 ambiguous backend delta, token mismatch, or missing abort evidence cannot pass.
 The default request counter is `vllm:request_success_total`; an override must
 name an equivalent completed-request counter, never an approximate cache metric.
+
+For the cancellation case, enable `--enable-log-requests` on both isolated
+workers and redirect each HTTP process's stdout/stderr directly to its own log.
+Provide both `--worker0-log` and `--worker1-log`, or neither. The harness checks
+each log's device/inode against that HTTP PID's stdout/stderr, reads only bytes
+after the probe's recorded offset, and matches the selected API-server PID and
+the exact SSE response ID in vLLM's `Aborted request(s)` record. A single-prompt
+Completion adds `-0` to the response ID; vLLM may append its eight-hex-character
+internal suffix. Similar prefixes or another worker's log cannot establish abort.
+
+PASS also requires a complete explicitly nonterminal SSE event, matching Router
+and worker active counts before client shutdown, unchanged completed-request
+counts at that point, and healthy zero loads afterwards with no natural
+completion. Stock vLLM 0.29 can remove externally aborted requests before its
+finished-request statistics are updated, so an abort counter need not increase.
+When no worker logs are supplied, the strict matching-worker abort-counter
+increase remains mandatory; idle state alone never passes. The case JSON keeps
+the event, counters and timestamps, with bounded-run worker/Router log excerpts.
 
 `summary.json` is the acceptance result. `worker_versions.json` retains both
 live version responses, including failed preflight observations. Per-case JSON files and log excerpts

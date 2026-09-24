@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -338,6 +339,59 @@ def parse_decisions(text):
     return decisions
 
 
+def first_nonterminal_sse(response):
+    # Complete-record validation follows the downstream acceptance helper's
+    # cf37596e38b5f994d83b65c0b112cd91b8614e28 fix, without its P/D framework.
+    consumed, data_lines = 0, []
+    while consumed <= 65536:
+        line = response.readline(65536 - consumed + 1)
+        require(line, "stream ended before a complete nonterminal SSE record")
+        consumed += len(line)
+        require(consumed <= 65536, "first SSE record exceeded the byte bound")
+        require(not (line.startswith(b"event:") and line[6:].strip() == b"error"),
+                "cancel stream returned an SSE error event")
+        if line.startswith(b"data:"):
+            payload = line[5:].strip()
+            require(payload != b"[DONE]", "stream completed before cancellation")
+            if payload:
+                data_lines.append(payload)
+        if line in (b"\n", b"\r\n") and data_lines:
+            event = json.loads(b"\n".join(data_lines))
+            require(isinstance(event, dict) and not event.get("error"), "invalid SSE response object")
+            choices = event.get("choices")
+            require(isinstance(choices, list) and choices
+                    and all(isinstance(choice, dict) and "finish_reason" in choice
+                            and choice["finish_reason"] is None for choice in choices),
+                    "first complete SSE record was not explicitly nonterminal")
+            require(isinstance(event.get("id"), str) and event["id"], "SSE response ID is missing")
+            return event, consumed
+    raise RuntimeError("no complete nonterminal SSE record")
+
+
+def matching_abort_lines(text, response_id, worker_pid):
+    # One Completion prompt/n=1 yields response.id + '-0'. Stock vLLM may add
+    # exactly eight hex characters for its internal ID; never substring-match.
+    request_id = re.compile(re.escape(response_id) + r"-0(?:-[0-9a-f]{8})?")
+    matched = []
+    for line in text.splitlines():
+        clean = ANSI.sub("", line)
+        process = re.search(r"\(APIServer pid=(\d+)\)", clean)
+        if not process or int(process[1]) != worker_pid:
+            continue
+        record = re.search(r"\bAborted request\(s\) ([^\r\n]+)\.\s*$", clean)
+        if record and any(request_id.fullmatch(value.strip()) for value in record[1].split(",")):
+            matched.append(clean)
+    return matched
+
+
+def verify_cancel_active(before, active):
+    running, loads = active["backend_running"], active["router_loads"]
+    require(running in ([1, 0], [0, 1]) and loads == running and all(active["healthy"]),
+            "one matching Router and worker active request was not observed before cancellation")
+    require(active["completed"] == before["completed"], "request completed before cancellation")
+    return running.index(1)
+
+
 class Validation:
     def __init__(self, args, out):
         self.args, self.out = args, out
@@ -518,48 +572,123 @@ class Validation:
         return {"name": "backend_error_cleanup", "status": "PASS", "http_status": status,
                 "response": body, "router_and_backend_load_after": 0}
 
-    def cancel_cleanup(self):
-        self.idle()
-        offset = Path(self.args.router_log).stat().st_size
-        before = [metrics(worker) for worker in self.workers]
-        abort_before = [sum(v for (name, labels), v in m.items()
-                            if name == self.args.request_counter and 'finished_reason="abort"' in labels)
-                        for m in before]
-        parsed = urllib.parse.urlsplit(self.args.router)
-        cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-        connection = cls(parsed.hostname, parsed.port, timeout=60)
-        payload = {"model": MODEL, "prompt": uuid.uuid4().hex + " cancellation fixture " * 40,
-                   "max_tokens": 1024, "ignore_eos": True, "stream": True}
-        try:
-            connection.request("POST", parsed.path.rstrip("/") + "/v1/completions",
-                               json.dumps(payload), {"Content-Type": "application/json"})
-            response = connection.getresponse()
-            require(response.status == 200, f"cancel stream HTTP {response.status}")
-            for _ in range(100):
-                line = response.readline()
-                require(line, "stream ended before cancellation")
-                require(b"[DONE]" not in line, "request completed before cancellation")
-                if line.startswith(b"data:") and b'"choices"' in line:
-                    break
-            else:
-                raise RuntimeError("no response event before cancellation")
-            response.close()
-        finally:
-            connection.close()
-        self.idle()
-        (self.out / "stream_cancel_cleanup.router.log").write_text(self.log_tail(offset))
-        delta = [0, 0]
-        for _ in range(120):
-            abort_after = [sum(v for (name, labels), v in metrics(worker).items()
+    def cancel_snapshot(self):
+        values = [metrics(worker) for worker in self.workers]
+        registered = json_request(self.args.router, "/workers")["workers"]
+        own = {worker["url"].rstrip("/"): worker for worker in registered
+               if worker["url"].rstrip("/") in self.workers}
+        require(set(own) == set(self.workers), "cancel probe requires both registered workers")
+        return {"observed_at_unix": time.time(),
+                "backend_running": [count(value, "vllm:num_requests_running") for value in values],
+                "router_loads": [own[worker]["load"] for worker in self.workers],
+                "healthy": [own[worker]["is_healthy"] for worker in self.workers],
+                "completed": [count(value, self.args.request_counter) for value in values],
+                "aborts": [sum(value for (name, labels), value in worker.items()
                                if name == self.args.request_counter and 'finished_reason="abort"' in labels)
-                           for worker in self.workers]
-            delta = [a - b for a, b in zip(abort_after, abort_before)]
-            if sum(delta):
-                break
-            time.sleep(0.25)
-        require(delta in ([1, 0], [0, 1]), f"backend abort was not proven: {delta}")
-        return {"name": "stream_cancel_cleanup", "status": "PASS", "abort_deltas": delta,
-                "router_and_backend_load_after": 0}
+                           for worker in values]}
+
+    def cancel_cleanup(self):
+        name = "stream_cancel_cleanup"
+        evidence = {"name": name, "status": "RUNNING", "started_at_unix": time.time()}
+        try:
+            self.idle()
+            offset = Path(self.args.router_log).stat().st_size
+            paths = [self.args.worker0_log, self.args.worker1_log]
+            require(bool(paths[0]) == bool(paths[1]), "provide both worker logs or neither")
+            log_offsets = []
+            for path, pid in zip(paths, (self.args.worker0_pid, self.args.worker1_pid)):
+                if path:
+                    stat = Path(path).stat()
+                    output_fds = [Path(f"/proc/{pid}/fd/{fd}").stat() for fd in (1, 2)]
+                    require(any((value.st_dev, value.st_ino) == (stat.st_dev, stat.st_ino)
+                                for value in output_fds), "worker log is not that HTTP process's stdout/stderr")
+                    log_offsets.append({"path": path, "offset": stat.st_size,
+                                        "device": stat.st_dev, "inode": stat.st_ino, "worker_pid": pid})
+            evidence["worker_log_offsets"] = log_offsets
+            before = self.cancel_snapshot()
+            evidence["before"] = before
+            parsed = urllib.parse.urlsplit(self.args.router)
+            cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+            connection = cls(parsed.hostname, parsed.port, timeout=60)
+            response = None
+            payload = {"model": MODEL, "prompt": uuid.uuid4().hex + " cancellation fixture " * 40,
+                       "max_tokens": 1024, "ignore_eos": True, "stream": True}
+            evidence["request"] = payload
+            try:
+                evidence["dispatch_at_unix"] = time.time()
+                connection.request("POST", parsed.path.rstrip("/") + "/v1/completions",
+                                   json.dumps(payload), {"Content-Type": "application/json"})
+                raw_socket = connection.sock
+                response = connection.getresponse()
+                evidence.update(headers_at_unix=time.time(), http_status=response.status,
+                                response_headers=dict(response.getheaders()))
+                require(response.status == 200, f"cancel stream HTTP {response.status}")
+                require("text/event-stream" in response.getheader("Content-Type", ""), "cancel response is not SSE")
+                event, consumed = first_nonterminal_sse(response)
+                evidence.update(first_nonterminal_event=event, bytes_read_before_close=consumed,
+                                first_event_at_unix=time.time())
+                active = self.cancel_snapshot()
+                evidence["active_before_close"] = active
+                target = verify_cancel_active(before, active)
+                evidence["worker"] = self.workers[target]
+                require(raw_socket is not None, "cannot identify client socket for explicit shutdown")
+                raw_socket.shutdown(socket.SHUT_RDWR)
+                evidence["shutdown_at_unix"] = time.time()
+            finally:
+                if response is not None:
+                    response.close()
+                connection.close()
+                evidence["closed_at_unix"] = time.time()
+            self.idle()
+            evidence["idle_at_unix"] = time.time()
+            expected_delta = [int(index == target) for index in range(2)]
+            proof = False
+            for _ in range(120):
+                after = self.cancel_snapshot()
+                evidence["after"] = after
+                delta = [a - b for a, b in zip(after["aborts"], before["aborts"])]
+                completed_delta = [a - b for a, b in zip(after["completed"], before["completed"])]
+                natural_delta = [a - b for a, b in zip(completed_delta, delta)]
+                evidence.update(abort_deltas=delta, completed_request_deltas=completed_delta,
+                                natural_completion_deltas=natural_delta)
+                require(natural_delta == [0, 0], f"cancel request completed naturally: {natural_delta}")
+                require(delta in ([0, 0], expected_delta), "unexpected abort count on the two exclusive workers")
+                matches = [[], []]
+                for index, log in enumerate(log_offsets):
+                    stat = Path(log["path"]).stat()
+                    require((stat.st_dev, stat.st_ino) == (log["device"], log["inode"])
+                            and stat.st_size >= log["offset"], "worker log rotated during cancellation probe")
+                    with Path(log["path"]).open("rb") as stream:
+                        stream.seek(log["offset"])
+                        tail = stream.read().decode(errors="replace")
+                    (self.out / f"{name}.worker{index}.log").write_text(tail)
+                    matches[index] = matching_abort_lines(tail, event["id"], log["worker_pid"])
+                evidence["matching_abort_log_lines"] = matches
+                if log_offsets:
+                    proof = bool(matches[target]) and not matches[1 - target]
+                    evidence["abort_evidence"] = "request-ID-correlated vLLM abort log"
+                else:
+                    proof = delta == expected_delta
+                    evidence["abort_evidence"] = "strict abort counter delta (no worker logs provided)"
+                if proof:
+                    break
+                time.sleep(0.25)
+            tail = self.log_tail(offset)
+            (self.out / f"{name}.router.log").write_text(tail)
+            decisions = parse_decisions(tail)
+            require(len(decisions) == 1 and decisions[0]["worker"].rstrip("/") == self.workers[target],
+                    "cancel routing decision disagrees with observed active worker")
+            require(proof, "backend abort was not proven by the required request log or counter")
+            require(after["backend_running"] == [0, 0] and after["router_loads"] == [0, 0]
+                    and all(after["healthy"]), "cancel probe did not finish healthy and idle")
+            evidence.update(status="PASS", router_and_backend_load_after=0)
+            return evidence
+        except Exception as error:
+            evidence.update(status="FAIL", error=str(error))
+            raise
+        finally:
+            evidence["finished_at_unix"] = time.time()
+            save(self.out / f"{name}.json", evidence)
 
 
 def validate(args):
@@ -764,6 +893,37 @@ def self_check():
                 return
             raise RuntimeError(message)
 
+        stream_event = {"id": "cmpl-fixture", "choices": [{"finish_reason": None, "text": "x"}]}
+        stream_bytes = b"data: " + json.dumps(stream_event).encode() + b"\r\n\r\n"
+        require(first_nonterminal_sse(io.BytesIO(stream_bytes))[0] == stream_event,
+                "complete nonterminal SSE frame was rejected")
+        for invalid_stream in (
+            b'data: {"id":"cmpl-fixture","choices":[{"finish_reason":"length"}]}\n\n',
+            b'data: {"id":"cmpl-fixture","choices":[{}]}\n\n',
+            b"data: [DONE]\n\n", stream_bytes.rstrip(),
+            stream_bytes.rstrip() + b"\nevent: error\n\n",
+        ):
+            expect_rejection(lambda: first_nonterminal_sse(io.BytesIO(invalid_stream)),
+                             "completed/malformed SSE frame was accepted as active")
+        abort_line = "(APIServer pid=123) INFO [async_llm.py:836] Aborted request(s) cmpl-fixture-0-97467303."
+        require(matching_abort_lines(abort_line, "cmpl-fixture", 123) == [abort_line],
+                "exact vLLM internal abort ID was not recognized")
+        for wrong_line in (abort_line.replace("cmpl-fixture-0", "cmpl-fixture-extra-0"),
+                           abort_line.replace("-0-97467303", "-1-97467303"),
+                           abort_line.replace("97467303", "974673031"),
+                           abort_line.replace("pid=123", "pid=124")):
+            require(not matching_abort_lines(wrong_line, "cmpl-fixture", 123),
+                    "wrong request/worker abort log was accepted")
+        before_cancel = {"completed": [4, 3]}
+        active_cancel = {"completed": [4, 3], "backend_running": [1, 0],
+                         "router_loads": [1, 0], "healthy": [True, True]}
+        require(verify_cancel_active(before_cancel, active_cancel) == 0, "active worker check failed")
+        for inactive in (dict(active_cancel, backend_running=[0, 0]),
+                         dict(active_cancel, router_loads=[0, 0]),
+                         dict(active_cancel, completed=[5, 3])):
+            expect_rejection(lambda: verify_cancel_active(before_cancel, inactive),
+                             "inactive/already-completed cancellation request was accepted")
+
         with mock.patch.dict(globals(), {"MODELSCOPE_REQUIRED_SHA256": fixture_hashes}):
             verified_model = verify_model_manifest(model_manifest_path)
             worker = {"model_in_command": True, "serve_model_path": str(model_dir),
@@ -821,7 +981,7 @@ def self_check():
             captured = json.loads(path.read_text())
             require(len(captured) == 2 and captured[1]["status"] == ("PASS" if should_pass else "FAIL"),
                     "worker version responses were not retained")
-    print("PASS offline log/token/metric/process/publisher/version/model-manifest/failed-build evidence checks (no Cargo or CUDA run)")
+    print("PASS offline log/token/metric/process/publisher/version/model-manifest/cancellation/failed-build evidence checks (no Cargo or CUDA run)")
     return 0
 
 
@@ -843,6 +1003,8 @@ def main():
             sub.add_argument("--worker0", default="http://127.0.0.1:8000")
             sub.add_argument("--worker1", default="http://127.0.0.1:8001")
             sub.add_argument("--router-log", required=True)
+            sub.add_argument("--worker0-log", help="HTTP W0 stdout/stderr log with --enable-log-requests; provide both worker logs")
+            sub.add_argument("--worker1-log", help="HTTP W1 stdout/stderr log with --enable-log-requests; provide both worker logs")
             for name in ("router", "worker0", "worker1", "engine0", "engine1"):
                 sub.add_argument(f"--{name}-pid", required=True, type=int)
             sub.add_argument("--event-wait", type=float, default=2.0)
