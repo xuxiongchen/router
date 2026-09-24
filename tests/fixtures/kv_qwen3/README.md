@@ -22,12 +22,19 @@ confirm attribution and license requirements before publication.
 | vocab.json | ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910 |
 | merges.txt | 8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5 |
 
-## Supported profile
+## Fixed verification corpus, not a runtime revision allowlist
 
-Workers must run the fixed model revision and default tokenizer/template, with
-no adapter, cache salt, prompt truncation, or custom template. Model aliases
-must resolve to that model. The router's local tokenizer hash does not establish
-worker configuration equivalence; the hardware matrix must verify it.
+This corpus fixes Qwen3-0.6B tokenizer/template bytes so results can be reproduced.
+Production routing instead validates the configured local Qwen3 Dense metadata
+and tokenizer semantics; it does not require this model size, name, or revision.
+The standard template fingerprint enables the restricted Chat renderer. Unknown
+templates disable Chat affinity while preserving exact Completion support.
+
+The finite 0.6B hardware matrix uses immutable model assets (including the
+explicitly recorded ModelScope snapshot described in `docs/kv_aware.md`), with
+no adapter, cache salt, prompt truncation, or custom template. Worker aliases
+must resolve to those actual assets. Local metadata does not prove worker
+configuration equivalence; the live token checks must establish that separately.
 
 - Completion: one string (honoring boolean `add_special_tokens`, default true)
   or one nonempty array of nonnegative token IDs. Batches fall back.
