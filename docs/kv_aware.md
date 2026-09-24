@@ -20,6 +20,13 @@ and cache-clear events invalidate ownership. A retained subscriber runtime is
 owned by the Router. Missing positive evidence uses fair fallback among eligible
 workers. This is a correctness feature, not a multi-GPU performance claim.
 
+KV Events are asynchronous PUB/SUB observations, not a synchronized cache
+snapshot. This slice does not replay missed history. Observed gaps or disconnects
+purge ownership; a lost final event cannot be detected until a subsequent
+sequence or connection event reveals the discontinuity. Affinity never changes
+the request's inference semantics, and a selected worker may still need to
+recompute an evicted prefix.
+
 ## Runtime contract
 
 Use an isolated environment with vLLM **0.29.0**. Both workers must use the same
@@ -143,6 +150,10 @@ Router request for that prefix; a fresh prefix verifies the reverse direction.
   EngineCore PIDs have vLLM's DP=1 EngineCore process title and belong to the
   corresponding HTTP process. All five processes retain their original
   PID/start-time, command and executable identities.
+- Each running worker's `/version` response reports exactly `0.29.0`. These
+  responses are saved separately from the harness Python environment's package
+  metadata. Missing endpoints, version mismatches and unreachable workers fail
+  preflight; an installed local package cannot establish a worker's version.
 
 The script never provisions hardware, uses SSH, starts/stops servers, injects
 KV events, or pushes code. `--allow-cache-reset` authorizes resetting the owned
@@ -152,7 +163,8 @@ ambiguous backend delta, token mismatch, or missing abort evidence cannot pass.
 The default request counter is `vllm:request_success_total`; an override must
 name an equivalent completed-request counter, never an approximate cache metric.
 
-`summary.json` is the acceptance result. Per-case JSON files and log excerpts
+`summary.json` is the acceptance result. `worker_versions.json` retains both
+live version responses, including failed preflight observations. Per-case JSON files and log excerpts
 contain only this run's synthetic requests and observations. Keep full build
 logs and machine metadata outside the public patch. Review the evidence before
 sharing it. Worker restart/new generation, late events, sequence gaps, and

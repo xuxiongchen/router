@@ -3005,6 +3005,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kv_retry_reuses_exact_tokens_preserves_raw_and_releases_each_lease() {
+        // Abort only these test-owned servers on both success and assertion
+        // failure. The successful path also joins them with a bounded wait.
+        struct TestServers(Vec<tokio::task::JoinHandle<()>>);
+        impl Drop for TestServers {
+            fn drop(&mut self) {
+                for server in &self.0 {
+                    server.abort();
+                }
+            }
+        }
+
+        let attempts = Arc::new(Mutex::new(Vec::<(&'static str, serde_json::Value)>::new()));
+        let seen0 = attempts.clone();
+        let app0 = axum::Router::new().route(
+            "/v1/completions",
+            axum::routing::post(move |Json(raw): Json<serde_json::Value>| {
+                let seen = seen0.clone();
+                async move {
+                    seen.lock().push(("w0", raw));
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let (worker0, server0) = kv_test_server(app0).await;
+        let mut servers = TestServers(vec![server0]);
+        let seen1 = attempts.clone();
+        let app1 = axum::Router::new().route(
+            "/v1/completions",
+            axum::routing::post(move |Json(raw): Json<serde_json::Value>| {
+                let seen = seen1.clone();
+                async move {
+                    seen.lock().push(("w1", raw.clone()));
+                    Json(raw)
+                }
+            }),
+        );
+        let (worker1, server1) = kv_test_server(app1).await;
+        servers.0.push(server1);
+
+        // Both real subscriber sockets belong to this test. Keep their PUB
+        // endpoints alive until the router has joined its subscriber threads.
+        let context = zmq::Context::new();
+        let mut publishers = Vec::new();
+        let mut endpoints = Vec::new();
+        for worker in [&worker0, &worker1] {
+            let publisher = context.socket(zmq::PUB).unwrap();
+            publisher.set_linger(0).unwrap();
+            publisher.bind("tcp://127.0.0.1:*").unwrap();
+            endpoints.push((
+                worker.url().to_string(),
+                publisher.get_last_endpoint().unwrap().unwrap(),
+            ));
+            publishers.push(publisher);
+        }
+
+        let config = crate::config::KvAwareConfig::default();
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker0.clone());
+        router.worker_registry.register(worker1.clone());
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                config: Box::new(config.clone()),
+            }));
+        router.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        router.retry_config = RetryConfig {
+            max_retries: 2,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+        let policy = router.policy_registry.get_default_policy();
+        let index = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+            .unwrap()
+            .index();
+        let pool = crate::kv_events::KVEventPool::start(
+            endpoints,
+            "kv-retry-regression".into(),
+            config.block_size,
+            index.clone(),
+        )
+        .unwrap();
+        router.worker_registry.bind_kv_index(&index);
+        router.kv_runtime = Some(KvRuntime {
+            _pool: pool,
+            tokenizer: crate::prompt_tokens::PromptTokenizer::synthetic_for_test(),
+            model: config.model.clone(),
+        });
+
+        let token_ids: Vec<u32> = (0..32).collect();
+        let keys = crate::kv_index::BlockKeyGenerator::new(config.block_size, 0)
+            .generate_block_keys(&token_ids);
+        assert_eq!(keys.len(), 2);
+        let generation0 = index.current_generation(worker0.url()).unwrap();
+        let generation1 = index.current_generation(worker1.url()).unwrap();
+        assert!(index.store(worker0.url(), generation0, &keys));
+        assert!(index.store(worker1.url(), generation1, &keys[..1]));
+        for _ in 0..7 {
+            worker1.increment_load();
+        }
+        let initial_loads = [worker0.load(), worker1.load()];
+        assert_eq!(initial_loads, [0, 7]);
+
+        // Explicit null and omitted default fields distinguish lossless raw
+        // forwarding from a typed reserialization. All fields remain within
+        // the exact Completion profile, so neither attempt may cold-fallback.
+        let raw = serde_json::json!({
+            "model": "Qwen/Qwen3-0.6B", "prompt": token_ids,
+            "suffix": null, "max_tokens": 1, "temperature": 0.0,
+            "add_special_tokens": false, "user": "synthetic retry fixture"
+        });
+        let typed: CompletionRequest = serde_json::from_value(raw.clone()).unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            router.route_completion_raw(None, &raw, &typed, None),
+        )
+        .await
+        .expect("bounded two-attempt request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let returned: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(returned, raw);
+        assert_eq!(
+            attempts.lock().as_slice(),
+            &[("w0", raw.clone()), ("w1", raw.clone())]
+        );
+        assert_eq!([worker0.load(), worker1.load()], initial_loads);
+        assert!(
+            worker0.is_available(),
+            "one 500 must not exclude W0 via its circuit breaker"
+        );
+        assert_eq!(index.prefix_score(worker0.url(), &keys), 0);
+        assert_eq!(index.current_generation(worker0.url()), None);
+        assert_eq!(index.prefix_score(worker1.url(), &keys), 1);
+        // Without exact tokens, the retry would prefer low-load W0 again.
+        assert_eq!(
+            router
+                .select_worker_for_model(None, None, None)
+                .unwrap()
+                .url(),
+            worker0.url()
+        );
+
+        drop(router);
+        assert_eq!(index.ownership_count(), 0);
+        drop(publishers);
+        while let Some(server) = servers.0.pop() {
+            server.abort();
+            let stopped = tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .expect("test HTTP server shutdown");
+            assert!(stopped.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
     async fn kv_stream_lease_lasts_until_client_body_drop() {
         let app = axum::Router::new().route(
             "/stream",

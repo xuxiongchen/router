@@ -27,6 +27,7 @@ import uuid
 BASE = "bc16b190f8875a275287dd70ce5b4c9e54373dd6"
 MODEL = "Qwen/Qwen3-0.6B"
 REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
+VLLM_VERSION = "0.29.0"
 TOKENIZER_SHA256 = "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -172,6 +173,30 @@ def json_request(base, path, payload=None):
     status, _, body = request(base, path, payload)
     require(status == 200, f"{base}{path}: HTTP {status}: {body[:500]}")
     return json.loads(body)
+
+
+def capture_worker_versions(workers, evidence_path):
+    """Query each live API server; local package metadata is not worker proof."""
+    observations = []
+    for worker in workers:
+        observation = {"worker": worker.rstrip("/"), "endpoint": "/version", "status": "FAIL"}
+        try:
+            status, _, body = request(worker, "/version")
+            observation["http_status"] = status
+            observation["response_body"] = body
+            response = json.loads(body)
+            observation["response"] = response
+            require(status == 200, f"worker version endpoint returned HTTP {status}")
+            require(isinstance(response, dict) and response.get("version") == VLLM_VERSION,
+                    f"running worker must report exactly vLLM {VLLM_VERSION}")
+            observation["status"] = "PASS"
+        except Exception as error:
+            observation["error"] = f"{type(error).__name__}: {error}"
+        observations.append(observation)
+        save(evidence_path, observations)
+    require(len(observations) == 2 and all(item["status"] == "PASS" for item in observations),
+            "both running workers must expose /version and report the pinned version; see worker_versions.json")
+    return observations
 
 
 def metrics(base):
@@ -491,17 +516,21 @@ def validate(args):
         require(gpu_selection[0] and gpu_selection[0] == gpu_selection[1]
                 and "," not in gpu_selection[0], "this matrix requires the same single selected GPU")
         require(sha256(args.tokenizer) == TOKENIZER_SHA256, "tokenizer does not match pinned public revision")
+        worker_versions = capture_worker_versions([args.worker0, args.worker1], out / "worker_versions.json")
         environment = {"platform": platform.platform(), "python": sys.version,
-                       "vllm": importlib.metadata.version("vllm"),
+                       "harness_python_executable": sys.executable,
+                       "harness_vllm_distribution_version": importlib.metadata.version("vllm"),
+                       "running_worker_version_responses": worker_versions,
                        "gpu": command(["nvidia-smi", "--query-gpu=name,uuid,driver_version,memory.total",
                                        "--format=csv,noheader"]),
                        "processes": processes, "build": manifest,
                        "tokenizer_sha256": sha256(args.tokenizer)}
-        environment["cuda_runtime"] = command([
+        environment["harness_torch_cuda_runtime"] = command([
             sys.executable, "-c",
             "import json, torch; print(json.dumps({'torch': torch.__version__, 'cuda': torch.version.cuda}))",
         ])
-        require(environment["vllm"] == "0.29.0", "this acceptance matrix pins vLLM 0.29.0")
+        require(environment["harness_vllm_distribution_version"] == VLLM_VERSION,
+                f"run the harness in the pinned vLLM {VLLM_VERSION} environment")
         save(out / "environment.json", environment)
         report.update(identity, native_sha256=native_sha)
         suite = Validation(args, out)
@@ -602,7 +631,27 @@ def self_check():
             manifest = json.loads((root / name / "build.json").read_text())
             require(manifest["status"] == "FAIL" and manifest.get("error")
                     and manifest.get("finished_at_unix"), "failed build left incomplete evidence")
-    print("PASS offline log/token/metric/process/failed-build evidence checks (no Cargo or CUDA run)")
+        workers = ["http://worker0", "http://worker1"]
+        good_version = (200, {}, json.dumps({"version": VLLM_VERSION}))
+        version_scenarios = [
+            ("both-pinned", [good_version, good_version], True),
+            ("wrong-worker-version", [good_version, (200, {}, '{"version":"0.28.0"}')], False),
+            ("missing-version-endpoint", [good_version, (404, {}, '{"detail":"Not Found"}')], False),
+            ("unreachable-worker", [good_version, urllib.error.URLError("unreachable")], False),
+        ]
+        for name, responses, should_pass in version_scenarios:
+            path = root / f"{name}.json"
+            with mock.patch.dict(globals(), {"request": mock.Mock(side_effect=responses)}):
+                try:
+                    capture_worker_versions(workers, path)
+                    passed = True
+                except RuntimeError:
+                    passed = False
+            require(passed == should_pass, "worker version evidence accepted an unsupported runtime")
+            captured = json.loads(path.read_text())
+            require(len(captured) == 2 and captured[1]["status"] == ("PASS" if should_pass else "FAIL"),
+                    "worker version responses were not retained")
+    print("PASS offline log/token/metric/process/version/failed-build evidence checks (no Cargo or CUDA run)")
     return 0
 
 

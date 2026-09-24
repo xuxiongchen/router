@@ -74,7 +74,14 @@ impl LoadBalancingPolicy for KvAwarePolicy {
             .map(|(i, _, _)| *i)
             .collect();
         tied.sort_unstable_by(|a, b| workers[*a].url().cmp(workers[*b].url()));
-        let selected = tied[self.cursor.fetch_add(1, Ordering::Relaxed) % tied.len()];
+        // A unique cache hit must not consume a fallback turn: alternating
+        // hot and cold requests would otherwise always send cold requests to
+        // the same worker in a two-worker pool.
+        let selected = if tied.len() == 1 {
+            tied[0]
+        } else {
+            tied[self.cursor.fetch_add(1, Ordering::Relaxed) % tied.len()]
+        };
         if tracing::enabled!(tracing::Level::DEBUG) {
             let scores: Vec<_> = candidates.iter().map(|(i, score, _)|
                 serde_json::json!({"worker": workers[*i].url(), "prefix_blocks": score})).collect();
@@ -145,5 +152,37 @@ mod tests {
             policy.select_worker_with_tokens(&workers, None, Some(&ids), None),
             Some(0)
         );
+    }
+
+    #[test]
+    fn unique_hits_do_not_consume_cold_fallback_turns() {
+        let policy = KvAwarePolicy::new(&KvAwareConfig::default());
+        let workers: Vec<Arc<dyn Worker>> = ["http://w0:8000", "http://w1:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        let hot = vec![1; 32];
+        let cold = vec![2; 32];
+        let generation = policy.index.begin_worker(workers[1].url());
+        policy.index.store(
+            workers[1].url(),
+            generation,
+            &policy.generator.generate_block_keys(&hot),
+        );
+        let mut cold_choices = Vec::new();
+        for _ in 0..4 {
+            assert_eq!(
+                policy.select_worker_with_tokens(&workers, None, Some(&hot), None),
+                Some(1)
+            );
+            cold_choices.push(
+                policy
+                    .select_worker_with_tokens(&workers, None, Some(&cold), None)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(cold_choices, [0, 1, 0, 1]);
     }
 }

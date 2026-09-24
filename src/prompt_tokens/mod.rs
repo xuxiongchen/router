@@ -25,6 +25,16 @@ pub struct PromptTokenizer {
 }
 
 impl PromptTokenizer {
+    /// Test-only direct-token input support. Production still requires the
+    /// SHA-pinned tokenizer through `load`; this empty vocabulary cannot stand
+    /// in for model tokenization or the pinned Python oracle.
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_test() -> Self {
+        Self {
+            tokenizer: Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default()),
+        }
+    }
+
     /// `local_path` is the pinned tokenizer.json file or its containing directory.
     /// The configured workers must serve this same model/tokenizer revision and
     /// its unmodified chat template; the file hash alone cannot verify workers.
@@ -227,9 +237,7 @@ mod tests {
     fn tokenizer() -> PromptTokenizer {
         // Small synthetic tokenizer tests extraction and rejection independent
         // of network/model assets. The pinned oracle tests token IDs separately.
-        PromptTokenizer {
-            tokenizer: Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default()),
-        }
+        PromptTokenizer::synthetic_for_test()
     }
 
     #[test]
