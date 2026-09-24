@@ -116,6 +116,8 @@ impl Subscription {
         );
         let socket = context.socket(zmq::SUB)?;
         socket.set_linger(0)?;
+        // Endpoint validation accepts IPv6; libzmq otherwise defaults to IPv4 only.
+        socket.set_ipv6(true)?;
         socket.set_rcvhwm(1024)?;
         socket.set_maxmsgsize(MAX_PAYLOAD_BYTES as i64)?;
         socket.set_subscribe(topic.as_bytes())?;
@@ -237,7 +239,7 @@ fn subscriber_loop(
         }
         let frames = match active.socket.recv_multipart(zmq::DONTWAIT) {
             Ok(frames) => frames,
-            Err(error) if error == zmq::Error::EAGAIN => continue,
+            Err(zmq::Error::EAGAIN) => continue,
             Err(error) => {
                 warn!(worker, %error, "KV subscriber receive failed; discarding ownership");
                 reconnect(
@@ -318,6 +320,17 @@ fn reconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_enables_dual_stack_addresses() {
+        let context = zmq::Context::new();
+        let publisher = context.socket(zmq::PUB).unwrap();
+        publisher.set_linger(0).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+        let subscription = Subscription::open(&context, &endpoint, "kv").unwrap();
+        assert!(subscription.socket.is_ipv6().unwrap());
+    }
 
     #[test]
     fn sequence_gaps_rollbacks_and_overflow_require_new_subscription() {

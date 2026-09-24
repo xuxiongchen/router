@@ -97,7 +97,10 @@ fn canonical_endpoint(value: &str) -> Result<String, String> {
 fn display_host(parsed: &Url) -> Result<String, String> {
     match parsed.host().ok_or("missing endpoint host")? {
         Host::Ipv6(address) => Ok(format!("[{address}]")),
-        host => Ok(host.to_string()),
+        Host::Ipv4(address) => Ok(address.to_string()),
+        // `tcp` is a non-special URL scheme: url::Url's opaque host
+        // parser preserves ASCII case, but DNS names are case-insensitive.
+        Host::Domain(domain) => Ok(domain.to_ascii_lowercase()),
     }
 }
 
@@ -141,5 +144,16 @@ mod tests {
         ] {
             assert!(parse_endpoint_mapping(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn rejects_shared_endpoint_hidden_by_dns_case() {
+        let workers: Vec<String> = vec!["http://host:8000".into(), "http://host:8001".into()];
+        let mappings = vec![
+            (workers[0].clone(), "tcp://HOST.Example:5557".into()),
+            (workers[1].clone(), "tcp://host.example:5557".into()),
+        ];
+        let error = resolve_endpoints(&workers, &mappings, 5557).unwrap_err();
+        assert!(error.contains("cannot share KV endpoint tcp://host.example:5557"));
     }
 }

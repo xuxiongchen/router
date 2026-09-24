@@ -1094,7 +1094,8 @@ impl Router {
         })
     }
 
-    /// Select worker for a specific model considering circuit breaker state
+    /// Test helper for the token-free policy path.
+    #[cfg(test)]
     fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
