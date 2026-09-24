@@ -191,6 +191,22 @@ def serve_model_path(argv):
     return str(Path(argv[position]).resolve())
 
 
+def vllm_publisher_mode(endpoint):
+    """Mirror vLLM 0.29 ZmqEventPublisher._socket_setup's bind heuristic."""
+    require(isinstance(endpoint, str) and endpoint, "worker needs an explicit KV event endpoint")
+    return ("bind" if "*" in endpoint or "::" in endpoint
+            or endpoint.startswith("ipc://") or endpoint.startswith("inproc://") else "connect")
+
+
+def verify_direct_publisher(endpoint):
+    mode = vllm_publisher_mode(endpoint)
+    require(not endpoint.startswith("tcp://") or mode == "bind",
+            "vLLM 0.29 TCP publisher would connect, while this Router's subscriber also connects; "
+            "the direct-worker fixture requires a bound publisher. Use tcp://*:PORT only on an "
+            "explicitly authorized test host with the KV ports blocked from public access.")
+    return mode
+
+
 def process(pid):
     root = Path(f"/proc/{pid}")
     stat = (root / "stat").read_text().rsplit(")", 1)[1].split()
@@ -588,6 +604,7 @@ def validate(args):
             events = json.loads(flags.get("--kv-events-config", ["{}"])[0])
             require(events.get("enable_kv_cache_events") is True and events.get("publisher") == "zmq",
                     "worker must publish real ZMQ KV events")
+            verify_direct_publisher(events.get("endpoint"))
             event_endpoints.append(events.get("endpoint"))
             if args.allow_cache_reset:
                 require(env.get("VLLM_SERVER_DEV_MODE") == "1", "cache-clear test needs isolated dev endpoint")
@@ -678,6 +695,22 @@ def self_check():
     for text in inputs:
         require(parse_decisions(text) == [decision], "routing log parser self-check failed")
     require(parse_decisions("unrelated log") == [], "unrelated log accepted")
+    publisher_cases = {
+        "tcp://*:5557": "bind", "tcp://[::1]:5557": "bind",
+        "tcp://127.0.0.1:*": "bind",
+        "ipc:///tmp/kv-events": "bind", "inproc://kv-events": "bind",
+        "tcp://127.0.0.1:5557": "connect", "tcp://localhost:5558": "connect",
+        "tcp://0.0.0.0:5557": "connect", "tcp://worker:5557": "connect",
+    }
+    for endpoint, mode in publisher_cases.items():
+        require(vllm_publisher_mode(endpoint) == mode, "vLLM publisher bind heuristic mismatch")
+        try:
+            verify_direct_publisher(endpoint)
+            accepted = True
+        except RuntimeError:
+            accepted = False
+        require(accepted == (not endpoint.startswith("tcp://") or mode == "bind"),
+                "connect-only TCP publisher was accepted by the direct-worker fixture")
     require(token_digest([0x01020304]) == hashlib.sha256(b"\x01\x02\x03\x04").hexdigest(),
             "token digest byte order is wrong")
     try:
@@ -788,7 +821,7 @@ def self_check():
             captured = json.loads(path.read_text())
             require(len(captured) == 2 and captured[1]["status"] == ("PASS" if should_pass else "FAIL"),
                     "worker version responses were not retained")
-    print("PASS offline log/token/metric/process/version/model-manifest/failed-build evidence checks (no Cargo or CUDA run)")
+    print("PASS offline log/token/metric/process/publisher/version/model-manifest/failed-build evidence checks (no Cargo or CUDA run)")
     return 0
 
 

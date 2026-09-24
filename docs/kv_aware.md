@@ -73,13 +73,26 @@ vllm serve Qwen/Qwen3-0.6B \
   --data-parallel-size 1 --tensor-parallel-size 1 --pipeline-parallel-size 1 \
   --gpu-memory-utilization 0.40 --max-model-len 4096 --enforce-eager \
   --enable-prefix-caching --prefix-caching-hash-algo sha256_cbor --block-size 16 \
-  --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:5557","topic":"kv"}'
+  --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv"}'
 ```
 
 Launch the second process with HTTP port **8001** and event endpoint
-**tcp://127.0.0.1:5558**; retain the other model/hash settings. Development mode
-is used only for the isolated real-cache-clear test. Keep these services bound
-to loopback. Do not enable development endpoints on a public production server.
+**tcp://*:5558**; retain the other model/hash settings. Keep worker HTTP and
+Router HTTP bound to **127.0.0.1**. Development mode is used only for the isolated
+real-cache-clear test; do not expose those HTTP endpoints publicly.
+
+In vLLM 0.29, `tcp://*:PORT` makes the PUB socket **bind**, whereas
+`tcp://127.0.0.1:PORT` makes it **connect**. The Router SUB socket also connects,
+so using fixed loopback publisher addresses here leaves neither side listening.
+The worker wildcard KV bindings are only for an explicitly authorized test host
+whose management-network/firewall rules block public access to ports 5557/5558.
+Confirm that protection before launch; never expose these unauthenticated KV
+ports publicly. Router endpoint mappings remain `tcp://127.0.0.1:5557` and
+`tcp://127.0.0.1:5558`.
+The harness mirrors the pinned publisher's bind/connect heuristic and rejects
+connect-only TCP publishers for this direct-worker fixture, which has no broker.
+That configuration check is not proof of a live listener or received events;
+the first-route positive-score and backend-count checks remain mandatory.
 
 Start the candidate native Router after both workers are ready:
 
