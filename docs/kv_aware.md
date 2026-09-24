@@ -3,11 +3,13 @@
 `kv_aware` uses KV blocks reported by each worker to route a request to a worker
 with its longest cached prefix. This initial implementation supports the native
 `vllm-router` CLI, static Regular HTTP routing, and independently addressable
-DP=1 workers serving **Qwen/Qwen3-0.6B** at revision
-`c1899de289a04d12100db370d81485cdf75e47ca`. It does not require a worker patch.
+DP=1 workers with a compatible **Qwen3 Dense** tokenizer profile. It does not
+require a worker patch. The finite acceptance matrix uses **Qwen/Qwen3-0.6B**
+and immutable assets; compatibility checks do not establish that other model
+sizes have been tested.
 
 The supported inputs are a Completion string, a single Completion token-ID
-array, and the pinned model's text Chat template. Chat permits an optional
+array, and the verified Qwen3 text Chat template. Chat permits an optional
 initial system message, alternating user/assistant string messages, and a final
 user message. Generation prompting is enabled; `enable_thinking` may be true
 or false. Tools, multimodal content, reasoning history, adapters, cache salt,
@@ -30,10 +32,18 @@ recompute an evicted prefix.
 ## Runtime contract
 
 Use an isolated environment with vLLM **0.29.0**. Both workers must use the same
-model/tokenizer revision, unmodified Chat template, block size **16**, hash
-algorithm **sha256_cbor**, and **PYTHONHASHSEED=0**. Set
-`VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` so events carry full hash bytes. The
-Router verifies the local `tokenizer.json` SHA-256:
+model/tokenizer assets, block size **16**, hash algorithm **sha256_cbor**, and
+**PYTHONHASHSEED=0**. Set `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0` so events carry
+full hash bytes. The Router reads local `tokenizer.json`, `tokenizer_config.json`,
+and `config.json` from the same directory. It checks Qwen3 Dense model metadata
+and tokenizer semantics, not a hard-coded model revision or tokenizer file hash.
+The standard verified Chat template enables exact Chat affinity; an unknown
+template retains Completion support but falls back without Chat affinity.
+`--kv-model` is the workers' served model alias.
+
+For reproducible **0.6B validation**, the harness pins the tokenizer profile to
+the public Hugging Face revision `c1899de289a04d12100db370d81485cdf75e47ca` and
+requires this `tokenizer.json` SHA-256:
 
 ```text
 aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
@@ -41,17 +51,21 @@ aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
 
 The pinned public assets are available from
 [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca).
-The Router does not download assets at startup. A matching file does not by
-itself establish the workers' configuration: validate the running workers too.
+The Router does not download assets at startup. Matching local metadata does not
+by itself establish the workers' configuration: validate the running workers too.
+Keep the CPU oracle environment separate: its pinned Transformers dependency
+must not overwrite vLLM's runtime dependencies.
 
 These example commands are for a user-provisioned host and an explicitly
 authorized GPU. Choose memory limits that fit two copies on that GPU. Launch
 each worker as its own process; two URLs for one worker are not sufficient.
-The validation script will check separate HTTP and EngineCore processes.
+The validation script will check separate HTTP and EngineCore processes. On one
+GPU, let the first worker finish initialization before starting the second so
+their memory profiling does not overlap.
 
 ```sh
 CUDA_VISIBLE_DEVICES=0 PYTHONHASHSEED=0 \
-VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 VLLM_SERVER_DEV_MODE=1 \
+VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 VLLM_SERVER_DEV_MODE=1 VLLM_USE_RUST_FRONTEND=0 \
 vllm serve Qwen/Qwen3-0.6B \
   --revision c1899de289a04d12100db370d81485cdf75e47ca \
   --tokenizer-revision c1899de289a04d12100db370d81485cdf75e47ca \
@@ -70,7 +84,7 @@ to loopback. Do not enable development endpoints on a public production server.
 Start the candidate native Router after both workers are ready:
 
 ```sh
-/absolute/path/to/candidate/vllm-router \
+env -u RUST_LOG /absolute/path/to/candidate/vllm-router \
   --host 127.0.0.1 --port 3001 --backend vllm \
   --worker-urls http://127.0.0.1:8000 http://127.0.0.1:8001 \
   --policy kv_aware --kv-model Qwen/Qwen3-0.6B \
@@ -86,6 +100,49 @@ Capture this process's stdout/stderr in a new task-owned log. Explicit endpoint
 mapping takes precedence over `--kv-events-port`, which remains a host/port
 fallback for unmapped workers. A shared endpoint and `base_port + dp_rank` are
 not supported.
+
+### Reproducible ModelScope validation snapshot
+
+Download and hash-verify the fixed public acceptance snapshot without accessing
+Hugging Face. The authorized root must already exist; the output directory must
+be new and inside it:
+
+```sh
+python3 scripts/kv_qwen3_modelscope.py \
+  --allowed-root /absolute/path/to/authorized/workspace \
+  --output /absolute/path/to/authorized/workspace/qwen3-0.6b-validation
+```
+
+This standard-library helper verifies all eight required files against the
+immutable ModelScope file listing and separately checks the tokenizer goldens.
+It writes the download manifest consumed by the validator below. These pins
+belong to the acceptance fixture, not the production Router's model allowlist.
+
+The same 0.6B matrix also accepts the immutable ModelScope snapshot
+`Qwen/Qwen3-0.6B` at commit `09b42cad3d112e832108974449ccb5e8e0f5b5d1` through
+`validate --model-manifest /absolute/model/directory/download-manifest.json`.
+This records **ModelScope weight provenance**, not equality with weights at the
+Hugging Face commit. Its tokenizer files match the fixed tokenizer fixture.
+Both workers must use the verified directory as their absolute `vllm serve`
+positional model argument, retain `--served-model-name Qwen/Qwen3-0.6B`, and set
+both `--revision` and `--tokenizer-revision` to that ModelScope commit. These flags
+record the source pin; the manifest hashes verify the locally loaded artifacts.
+Use that directory's `tokenizer.json` for the Router and validation arguments.
+
+The download manifest must have `status: "verified"`, `source: "ModelScope"`,
+`model`, `source_commit`, absolute `output`, and a `required_files` array covering
+`config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`,
+`merges.txt`, `vocab.json`, `LICENSE`, and `model.safetensors`. Each `files` entry
+must contain `path`, `status: "verified"`, `source_commit`, `bytes`, `sha256`, and
+the matching ModelScope `api_sha256`. The local `modelscope-api-files.json` must
+match `source_listing_sha256`. Only these eight model files plus the three
+download evidence files (`download-manifest.json`, `download-events.jsonl`, and
+`modelscope-api-files.json`) may be present in the snapshot directory.
+
+The harness rehashes all eight files before and after validation, checks the
+four approved config/weight/tokenizer artifact hashes, and rejects changed
+files, unexpected files, or a worker loading a different directory. Omitting
+`--model-manifest` preserves the original pinned Hugging Face validation mode.
 
 ## Reproducible validation
 
@@ -114,7 +171,9 @@ python3 scripts/kv_aware_cuda_validate.py build \
 Start the Router using the resulting
 `build-evidence/target/release/vllm-router`. The Linux GPU build is specific to
 that host architecture; an ARM64 development artifact is not an x86_64 artifact.
-After launch, run the finite acceptance matrix with the actual task-owned PIDs:
+After launch, run the finite acceptance matrix with the actual task-owned PIDs.
+Use the vLLM environment's Python and the same Linux process namespace; the
+harness needs its package metadata as well as access to the five `/proc` entries:
 
 ```sh
 python3 scripts/kv_aware_cuda_validate.py validate \
@@ -167,6 +226,8 @@ name an equivalent completed-request counter, never an approximate cache metric.
 live version responses, including failed preflight observations. Per-case JSON files and log excerpts
 contain only this run's synthetic requests and observations. Keep full build
 logs and machine metadata outside the public patch. Review the evidence before
-sharing it. Worker restart/new generation, late events, sequence gaps, and
+sharing it. `model_source.json` distinguishes the actual model source commit and
+artifact hashes from the tokenizer-profile fixture revision. Worker
+restart/new generation, late events, sequence gaps, and
 compatibility with the disabled feature require the corresponding deterministic
 CPU tests; a real cache-clear case alone does not prove those behaviors.

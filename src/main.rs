@@ -120,7 +120,7 @@ struct CliArgs {
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash", "kv_aware"])]
     policy: String,
 
-    /// Pinned Qwen3-0.6B tokenizer.json or directory, for exact KV routing.
+    /// Local Qwen3 Dense tokenizer.json or directory with model/tokenizer configs.
     #[arg(long, help_heading = "KV Events")]
     kv_tokenizer_path: Option<String>,
     #[arg(long, default_value = "Qwen/Qwen3-0.6B", help_heading = "KV Events")]

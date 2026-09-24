@@ -286,7 +286,7 @@ impl ConfigValidator {
                     || config.model.trim().is_empty()
                 {
                     return Err(ConfigError::ValidationFailed { reason:
-                        "kv_aware requires positive block size/index capacity/port and a pinned tokenizer path/model".into() });
+                        "kv_aware requires positive block size/index capacity/port, a local Qwen3 Dense tokenizer profile and a served model alias".into() });
                 }
             }
             PolicyConfig::Random | PolicyConfig::RoundRobin => {

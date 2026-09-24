@@ -8,6 +8,8 @@ pub struct KvAwareConfig {
     /// Must match every worker's block size and sha256_cbor configuration.
     pub block_size: usize,
     pub hash_seed: u32,
+    /// Local tokenizer.json (or directory), with neighboring Qwen3 Dense
+    /// config.json and tokenizer_config.json matching the workers.
     pub tokenizer_path: String,
     /// Accepted request model alias; omitted request.model is also accepted.
     pub model: String,

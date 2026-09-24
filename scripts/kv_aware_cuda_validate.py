@@ -27,8 +27,19 @@ import uuid
 BASE = "bc16b190f8875a275287dd70ce5b4c9e54373dd6"
 MODEL = "Qwen/Qwen3-0.6B"
 REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
+MODELSCOPE_REVISION = "09b42cad3d112e832108974449ccb5e8e0f5b5d1"
 VLLM_VERSION = "0.29.0"
 TOKENIZER_SHA256 = "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+MODELSCOPE_REQUIRED_SHA256 = {
+    "model.safetensors": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b",
+    "config.json": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
+    "tokenizer.json": TOKENIZER_SHA256,
+    "tokenizer_config.json": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+}
+MODELSCOPE_FILES = {
+    "config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",
+    "merges.txt", "vocab.json", "LICENSE", "model.safetensors",
+}
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -70,6 +81,61 @@ def source_identity(source, expected):
             "tree_sha": command(["git", "rev-parse", "HEAD^{tree}"], source)}
 
 
+def verify_model_manifest(path):
+    """Verify the approved local ModelScope snapshot, not an HF weight identity."""
+    path = Path(path).resolve()
+    manifest = json.loads(path.read_text())
+    require(manifest.get("status") == "verified" and manifest.get("source") == "ModelScope"
+            and manifest.get("model") == MODEL
+            and manifest.get("source_commit") == MODELSCOPE_REVISION,
+            "model manifest is not the approved immutable ModelScope snapshot")
+    output = Path(manifest.get("output", ""))
+    require(output.is_absolute() and output.is_dir(), "model manifest needs an existing absolute output directory")
+    output = output.resolve()
+    required = manifest.get("required_files", [])
+    require(len(required) == len(MODELSCOPE_FILES) and set(required) == MODELSCOPE_FILES,
+            "model manifest required-file set is incomplete")
+    entries = manifest.get("files", [])
+    require(isinstance(entries, list) and len(entries) == len(MODELSCOPE_FILES),
+            "model manifest must describe every required model file exactly once")
+    verified = {}
+    for entry in entries:
+        name = entry.get("path")
+        require(name in MODELSCOPE_FILES and name not in verified, "unexpected or duplicate model file")
+        target = (output / name).resolve()
+        require(target.parent == output and target.is_file(), "model file is missing or escapes its snapshot directory")
+        actual_sha = sha256(target)
+        require(entry.get("status") == "verified" and entry.get("source_commit") == MODELSCOPE_REVISION
+                and actual_sha == entry.get("sha256") == entry.get("api_sha256")
+                and target.stat().st_size == entry.get("bytes"),
+                f"model file differs from its ModelScope manifest: {name}")
+        if name in MODELSCOPE_REQUIRED_SHA256:
+            require(actual_sha == MODELSCOPE_REQUIRED_SHA256[name], f"unapproved model artifact: {name}")
+        verified[name] = {"sha256": actual_sha, "bytes": target.stat().st_size}
+    metadata_names = {"download-manifest.json", "download-events.jsonl", "modelscope-api-files.json"}
+    require({item.name for item in output.iterdir()} <= MODELSCOPE_FILES | metadata_names,
+            "unmanifested files exist in the local model snapshot")
+    listing = output / "modelscope-api-files.json"
+    require(listing.resolve().parent == output and sha256(listing) == manifest.get("source_listing_sha256"),
+            "ModelScope source listing differs from the download manifest")
+    return {"source": "ModelScope", "source_commit": MODELSCOPE_REVISION, "model": MODEL,
+            "local_dir": str(output), "manifest": str(path), "manifest_sha256": sha256(path),
+            "source_listing_sha256": sha256(listing), "files": verified,
+            "tokenizer_profile_revision": REVISION,
+            "provenance_claim": "ModelScope weights at the recorded commit; tokenizer profile matches the pinned HF fixture. No HF weight identity is asserted."}
+
+
+def verify_worker_model(worker, model_source):
+    flags = worker["selected_arguments"]
+    revision = model_source["source_commit"]
+    require(worker["model_in_command"], "worker command must identify the pinned public model")
+    require(flags.get("--revision") == [revision], "worker revision is not pinned to its recorded model source")
+    require(flags.get("--tokenizer-revision") == [revision], "worker tokenizer revision is not pinned to its model source")
+    if model_source["source"] == "ModelScope":
+        require(worker["serve_model_path"] == model_source["local_dir"],
+                "worker must load the verified ModelScope directory as its vllm serve positional model")
+
+
 def output_directory(path, source):
     path = Path(path).resolve()
     require(not path.is_relative_to(Path(source).resolve()), "evidence must be outside source")
@@ -78,7 +144,7 @@ def output_directory(path, source):
 
 
 def build(args):
-    """User-invoked build; the agent must not invoke it under the local policy."""
+    """Build a clean candidate only when the caller is authorized to compile it."""
     out = output_directory(args.output, args.source)
     target = out / "target"
     argv = ["cargo", "build", "--locked", "--release", "--bin", "vllm-router",
@@ -115,6 +181,16 @@ def engine_core_title(argv, environment):
     return expected if argv == [expected] else None
 
 
+def serve_model_path(argv):
+    """Capture only an explicit absolute `vllm serve` positional model path."""
+    if argv.count("serve") != 1:
+        return None
+    position = argv.index("serve") + 1
+    if position >= len(argv) or not Path(argv[position]).is_absolute():
+        return None
+    return str(Path(argv[position]).resolve())
+
+
 def process(pid):
     root = Path(f"/proc/{pid}")
     stat = (root / "stat").read_text().rsplit(")", 1)[1].split()
@@ -144,6 +220,7 @@ def process(pid):
             "command_sha256": hashlib.sha256(argv_raw).hexdigest(),
             "selected_arguments": selected, "selected_environment": env,
             "engine_core_title": engine_core_title(argv, env),
+            "serve_model_path": serve_model_path(argv),
             "model_in_command": MODEL in argv}
 
 
@@ -472,11 +549,19 @@ class Validation:
 def validate(args):
     out = output_directory(args.output, args.source)
     report = {"status": "RUNNING", "started_at_unix": time.time(), "command": sys.argv,
-              "model": MODEL, "model_revision": REVISION}
+              "model": MODEL, "tokenizer_profile_revision": REVISION}
     save(out / "summary.json", report)
     try:
         require(platform.system() == "Linux", "run in the GPU processes' Linux /proc namespace")
         identity = source_identity(args.source, args.candidate)
+        model_source = (verify_model_manifest(args.model_manifest) if args.model_manifest else
+                        {"source": "Hugging Face", "model": MODEL, "source_commit": REVISION,
+                         "tokenizer_profile_revision": REVISION})
+        report.update(model_source=model_source, model_revision=model_source["source_commit"])
+        save(out / "model_source.json", model_source)
+        if args.model_manifest:
+            require(Path(args.tokenizer).resolve() == Path(model_source["local_dir"]) / "tokenizer.json",
+                    "Router tokenizer evidence must come from the verified local model snapshot")
         manifest = json.loads(Path(args.build_manifest).read_text())
         native_sha = sha256(args.native)
         require(manifest["status"] == "PASS" and manifest["candidate_sha"] == args.candidate
@@ -493,11 +578,9 @@ def validate(args):
         event_endpoints = []
         for worker_index, p in enumerate(processes[1:3]):
             env, flags = p["selected_environment"], p["selected_arguments"]
-            require(p["model_in_command"], "worker command must identify the pinned public model")
+            verify_worker_model(p, model_source)
             require(env.get("PYTHONHASHSEED") == "0", "worker PYTHONHASHSEED must be 0")
             require(env.get("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES") == "0", "full-byte event hashes required")
-            require(flags.get("--revision") == [REVISION], "worker revision is not pinned")
-            require(flags.get("--tokenizer-revision") == [REVISION], "worker tokenizer revision is not pinned")
             require(flags.get("--block-size") == ["16"], "worker block size must be 16")
             require(flags.get("--prefix-caching-hash-algo") == ["sha256_cbor"], "worker hash algorithm mismatch")
             worker_url = urllib.parse.urlsplit([args.worker0, args.worker1][worker_index])
@@ -556,6 +639,9 @@ def validate(args):
                 == [tuple(p[key] for key in process_keys) for p in after],
                 "a tested process identity or executable changed during validation")
         require(source_identity(args.source, args.candidate) == identity, "candidate changed during validation")
+        if args.model_manifest:
+            require(verify_model_manifest(args.model_manifest) == model_source,
+                    "model snapshot or download manifest changed during validation")
         report["cases"] = suite.results
         report["status"] = ("FAIL" if any(r["status"] == "FAIL" for r in suite.results)
                             else "INCOMPLETE" if any(r["status"] != "PASS" for r in suite.results)
@@ -619,6 +705,57 @@ def self_check():
         root = Path(temporary)
         source = root / "source"
         source.mkdir()
+        model_dir = root / "model"
+        model_dir.mkdir()
+        entries = []
+        for name in sorted(MODELSCOPE_FILES):
+            target = model_dir / name
+            target.write_text(f"offline fixture {name}\n")
+            entries.append({"path": name, "status": "verified", "source_commit": MODELSCOPE_REVISION,
+                            "bytes": target.stat().st_size, "sha256": sha256(target), "api_sha256": sha256(target)})
+        listing = model_dir / "modelscope-api-files.json"
+        listing.write_text("offline source listing\n")
+        model_manifest = {"status": "verified", "source": "ModelScope", "model": MODEL,
+                          "source_commit": MODELSCOPE_REVISION, "output": str(model_dir),
+                          "required_files": sorted(MODELSCOPE_FILES), "files": entries,
+                          "source_listing_sha256": sha256(listing)}
+        model_manifest_path = model_dir / "download-manifest.json"
+        save(model_manifest_path, model_manifest)
+        fixture_hashes = {entry["path"]: entry["sha256"] for entry in entries
+                          if entry["path"] in MODELSCOPE_REQUIRED_SHA256}
+
+        def expect_rejection(check, message):
+            try:
+                check()
+            except RuntimeError:
+                return
+            raise RuntimeError(message)
+
+        with mock.patch.dict(globals(), {"MODELSCOPE_REQUIRED_SHA256": fixture_hashes}):
+            verified_model = verify_model_manifest(model_manifest_path)
+            worker = {"model_in_command": True, "serve_model_path": str(model_dir),
+                      "selected_arguments": {"--revision": [MODELSCOPE_REVISION],
+                                             "--tokenizer-revision": [MODELSCOPE_REVISION]}}
+            verify_worker_model(worker, verified_model)
+            require(serve_model_path(["vllm", "serve", str(model_dir)]) == str(model_dir),
+                    "explicit local model path was not recognized")
+            require(serve_model_path(["vllm", "serve", MODEL]) is None,
+                    "repository name was accepted as a verified local snapshot")
+            for incorrect_path in (None, str(root / "other-model")):
+                expect_rejection(lambda: verify_worker_model(dict(worker, serve_model_path=incorrect_path), verified_model),
+                                 "wrong worker model path was accepted")
+            original = (model_dir / "model.safetensors").read_bytes()
+            (model_dir / "model.safetensors").write_bytes(original + b"tampered")
+            expect_rejection(lambda: verify_model_manifest(model_manifest_path), "tampered weights were accepted")
+            (model_dir / "model.safetensors").write_bytes(original)
+            save(model_manifest_path, dict(model_manifest, source_commit="0" * 40))
+            expect_rejection(lambda: verify_model_manifest(model_manifest_path), "wrong model revision was accepted")
+            save(model_manifest_path, model_manifest)
+            (model_dir / "unexpected-model-file").write_text("not in manifest")
+            expect_rejection(lambda: verify_model_manifest(model_manifest_path), "unmanifested model file was accepted")
+        hf_worker = {"model_in_command": True, "selected_arguments": {
+            "--revision": [REVISION], "--tokenizer-revision": [REVISION]}}
+        verify_worker_model(hf_worker, {"source": "Hugging Face", "source_commit": REVISION})
         for name, source_results, returncode in scenarios:
             args = argparse.Namespace(source=str(source), candidate="a" * 40,
                                       output=str(root / name))
@@ -651,7 +788,7 @@ def self_check():
             captured = json.loads(path.read_text())
             require(len(captured) == 2 and captured[1]["status"] == ("PASS" if should_pass else "FAIL"),
                     "worker version responses were not retained")
-    print("PASS offline log/token/metric/process/version/failed-build evidence checks (no Cargo or CUDA run)")
+    print("PASS offline log/token/metric/process/version/model-manifest/failed-build evidence checks (no Cargo or CUDA run)")
     return 0
 
 
@@ -668,6 +805,7 @@ def main():
             sub.add_argument("--native", required=True)
             sub.add_argument("--build-manifest", required=True)
             sub.add_argument("--tokenizer", required=True, help="pinned tokenizer.json")
+            sub.add_argument("--model-manifest", help="verified immutable ModelScope download-manifest.json; omitted means the pinned HF model revision")
             sub.add_argument("--router", default="http://127.0.0.1:3001")
             sub.add_argument("--worker0", default="http://127.0.0.1:8000")
             sub.add_argument("--worker1", default="http://127.0.0.1:8001")
