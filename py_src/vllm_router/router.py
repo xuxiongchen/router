@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Optional
 
 from vllm_router.router_args import RouterArgs
@@ -15,6 +16,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "cache_aware": PolicyType.CacheAware,
         "power_of_two": PolicyType.PowerOfTwo,
         "consistent_hash": PolicyType.ConsistentHash,
+        "kv_aware": PolicyType.KvAware,
     }
     return policy_map[policy_str]
 
@@ -103,17 +105,62 @@ class Router:
             router: Optional _Router instance. If provided, kwargs are ignored.
             **kwargs: Keyword arguments to pass to _Router constructor if router is None.
         """
+        self._render_facade = None
+        self._render_started = False
         if router is not None:
             self._router = router
         else:
-            # Create _Router from kwargs
+            backend = kwargs.pop("kv_input_backend", "native")
+            render_config = kwargs.pop("kv_render_config", None)
+            if backend not in ("native", "vllm"):
+                raise ValueError("kv_input_backend must be native or vllm")
+            if backend == "vllm":
+                if kwargs.get("policy") != PolicyType.KvAware or not render_config:
+                    raise ValueError("vllm input backend requires kv_aware and kv_render_config")
+                if (kwargs.get("vllm_pd_disaggregation") or kwargs.get("service_discovery")
+                        or kwargs.get("enable_igw") or kwargs.get("enable_program_scheduling")
+                        or kwargs.get("intra_node_data_parallel_size", 1) != 1):
+                    raise ValueError("vllm input backend requires static Regular DP=1 workers")
+                # Import only for this explicit backend. No native-only import
+                # or startup path depends on the optional vLLM installation.
+                from vllm_router.render_bridge import create_facade
+
+                facade = create_facade(render_config)
+                workers = {url.rstrip("/") for url in kwargs.get("worker_urls", [])}
+                declared = {url.rstrip("/") for url in facade.worker_urls}
+                if not workers or workers != declared:
+                    raise ValueError("render configuration worker URLs differ from Router workers")
+                configured_path = kwargs.get("kv_tokenizer_path")
+                if (configured_path is not None
+                        and Path(configured_path).resolve() != Path(facade.tokenizer_path).resolve()):
+                    raise ValueError("kv_tokenizer_path conflicts with the render configuration")
+                for key, effective in (("kv_model", facade.model),
+                                       ("kv_block_size", facade.block_size)):
+                    if kwargs.get(key) is not None and kwargs[key] != effective:
+                        raise ValueError(f"{key} conflicts with the render configuration")
+                    kwargs[key] = effective
+                if kwargs.get("kv_hash_algo") != facade.hash_algorithm:
+                    raise ValueError("kv_hash_algo conflicts with the render configuration")
+                if kwargs.get("kv_hash_seed", 0) != facade.hash_seed:
+                    raise ValueError("kv_hash_seed conflicts with the render configuration")
+                kwargs["kv_tokenizer_path"] = facade.tokenizer_path
+                self._render_facade = facade
+            elif render_config is not None:
+                raise ValueError("kv_render_config requires the vllm input backend")
+            # Preserve PR1 native defaults, while allowing the render backend
+            # to distinguish an omitted option from an explicit override.
+            if kwargs.get("kv_model") is None:
+                kwargs.pop("kv_model", None)
+            if kwargs.get("kv_block_size") is None:
+                kwargs.pop("kv_block_size", None)
             self._router = _Router(**kwargs)
 
     @staticmethod
     def from_args(args: RouterArgs) -> "Router":
         """Create a router from a RouterArgs instance."""
 
-        args_dict = vars(args)
+        args._validate_router_args()
+        args_dict = vars(args).copy()
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []
@@ -133,11 +180,23 @@ class Router:
         # remove mini_lb parameter
         args_dict.pop("mini_lb")
 
-        return Router(router=_Router(**args_dict))
+        return Router(**args_dict)
 
     def start(self) -> None:
         """Start the router server.
 
         This method blocks until the server is shut down.
         """
-        self._router.start()
+        if self._render_facade is None:
+            self._router.start()
+            return
+        if self._render_started:
+            raise RuntimeError("a render-backed Router cannot be restarted after shutdown")
+        self._render_started = True
+        facade = self._render_facade
+        self._router.start(
+            render_facade=facade,
+            render_contract_id=facade.contract_id,
+            render_contract_epoch=facade.epoch,
+            render_limits=facade.limits,
+        )

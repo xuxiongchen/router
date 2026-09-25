@@ -33,6 +33,7 @@ pub enum PolicyType {
     CacheAware,
     PowerOfTwo,
     ConsistentHash,
+    KvAware,
 }
 
 #[pyclass]
@@ -42,6 +43,15 @@ struct Router {
     port: u16,
     worker_urls: Vec<String>,
     policy: PolicyType,
+    kv_tokenizer_path: Option<String>,
+    kv_model: String,
+    kv_hash_algo: Option<String>,
+    kv_block_size: usize,
+    kv_hash_seed: u32,
+    kv_events_topic_filter: String,
+    kv_events_port: u16,
+    kv_events_endpoints: Vec<String>,
+    kv_index_max_entries: usize,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
@@ -119,6 +129,48 @@ impl Router {
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
+        let kv_config = if self.policy == PolicyType::KvAware
+            || self.prefill_policy == Some(PolicyType::KvAware)
+            || self.decode_policy == Some(PolicyType::KvAware)
+        {
+            if self.kv_hash_algo.as_deref() != Some("sha256_cbor") {
+                return Err(config::ConfigError::ValidationFailed {
+                    reason: "kv_aware requires kv_hash_algo=sha256_cbor and matching workers"
+                        .into(),
+                });
+            }
+            let mut worker_endpoints = HashMap::new();
+            for entry in &self.kv_events_endpoints {
+                let (worker, endpoint) = kv_events::parse_endpoint_mapping(entry)
+                    .map_err(|reason| config::ConfigError::ValidationFailed { reason })?;
+                if worker_endpoints.insert(worker, endpoint).is_some() {
+                    return Err(config::ConfigError::ValidationFailed {
+                        reason: "duplicate KV worker endpoint mapping".into(),
+                    });
+                }
+            }
+            config::KvAwareConfig {
+                block_size: self.kv_block_size,
+                hash_seed: self.kv_hash_seed,
+                tokenizer_path: self.kv_tokenizer_path.clone().unwrap_or_default(),
+                model: self.kv_model.clone(),
+                topic: self.kv_events_topic_filter.clone(),
+                default_port: self.kv_events_port,
+                worker_endpoints,
+                index_max_entries: self.kv_index_max_entries,
+            }
+        } else {
+            if self.kv_tokenizer_path.is_some()
+                || self.kv_hash_algo.is_some()
+                || !self.kv_events_endpoints.is_empty()
+            {
+                return Err(config::ConfigError::ValidationFailed {
+                    reason: "KV options require policy=kv_aware".into(),
+                });
+            }
+            config::KvAwareConfig::default()
+        };
+
         // Convert policy helper function
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
             match policy {
@@ -136,6 +188,9 @@ impl Router {
                 },
                 PolicyType::ConsistentHash => ConfigPolicyConfig::ConsistentHash {
                     virtual_nodes: 160, // Default value
+                },
+                PolicyType::KvAware => ConfigPolicyConfig::KvAware {
+                    config: Box::new(kv_config.clone()),
                 },
             }
         };
@@ -332,6 +387,15 @@ impl Router {
         wasm_middleware_routes = vec![],
         enable_program_scheduling = false,
         program_scheduling_config_json = None,
+        kv_tokenizer_path = None,
+        kv_model = String::from("Qwen/Qwen3-0.6B"),
+        kv_hash_algo = None,
+        kv_block_size = 16,
+        kv_hash_seed = 0,
+        kv_events_topic_filter = String::new(),
+        kv_events_port = 5557,
+        kv_events_endpoints = vec![],
+        kv_index_max_entries = 100_000,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -399,6 +463,15 @@ impl Router {
         wasm_middleware_routes: Vec<String>,
         enable_program_scheduling: bool,
         program_scheduling_config_json: Option<String>,
+        kv_tokenizer_path: Option<String>,
+        kv_model: String,
+        kv_hash_algo: Option<String>,
+        kv_block_size: usize,
+        kv_hash_seed: u32,
+        kv_events_topic_filter: String,
+        kv_events_port: u16,
+        kv_events_endpoints: Vec<String>,
+        kv_index_max_entries: usize,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -420,6 +493,15 @@ impl Router {
             port,
             worker_urls,
             policy,
+            kv_tokenizer_path,
+            kv_model,
+            kv_hash_algo,
+            kv_block_size,
+            kv_hash_seed,
+            kv_events_topic_filter,
+            kv_events_port,
+            kv_events_endpoints,
+            kv_index_max_entries,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,
@@ -483,7 +565,30 @@ impl Router {
         })
     }
 
-    fn start(&self) -> PyResult<()> {
+    #[pyo3(signature = (*, render_facade=None, render_contract_id=None, render_contract_epoch=1, render_limits=None))]
+    fn start(
+        &self,
+        py: Python<'_>,
+        render_facade: Option<Py<PyAny>>,
+        render_contract_id: Option<String>,
+        render_contract_epoch: u64,
+        render_limits: Option<HashMap<String, u64>>,
+    ) -> PyResult<()> {
+        let render_input =
+            match (render_facade, render_contract_id) {
+                (Some(facade), Some(id)) if self.policy == PolicyType::KvAware => Some((
+                    facade,
+                    prompt_tokens::bridge::RenderContract {
+                        id,
+                        epoch: render_contract_epoch,
+                    },
+                )),
+                (None, None) if render_limits.is_none() => None,
+                _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                    "render injection requires kv_aware, a facade and a render contract identity",
+                )),
+            };
+        let bridge_limits = render_bridge_limits(render_limits)?;
         // Convert to RouterConfig and validate
         let router_config = self.to_router_config().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {}", e))
@@ -524,39 +629,94 @@ impl Router {
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
         });
 
-        // Use tokio runtime instead of actix-web System for better compatibility
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let startup_timeout = std::time::Duration::from_secs(self.worker_startup_timeout_secs);
+        let server_config = server::ServerConfig {
+            host: self.host.clone(),
+            port: self.port,
+            router_config,
+            max_payload_size: self.max_payload_size,
+            wasm_middleware: self.wasm_middleware.clone(),
+            wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
+            wasm_middleware_routes: self.wasm_middleware_routes.clone(),
+            log_dir: self.log_dir.clone(),
+            log_level: self.log_level.clone(),
+            service_discovery_config,
+            prometheus_config,
+            request_timeout_secs: self.request_timeout_secs,
+            request_id_headers: self.request_id_headers.clone(),
+            trace_config: if self.enable_trace {
+                Some(config::TraceConfig {
+                    otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+                    ..Default::default()
+                })
+            } else {
+                None
+            },
+        };
 
-        // Block on the async startup function
-        runtime.block_on(async move {
-            server::startup(server::ServerConfig {
-                host: self.host.clone(),
-                port: self.port,
-                router_config,
-                max_payload_size: self.max_payload_size,
-                wasm_middleware: self.wasm_middleware.clone(),
-                wasm_middleware_sha256: self.wasm_middleware_sha256.clone(),
-                wasm_middleware_routes: self.wasm_middleware_routes.clone(),
-                log_dir: self.log_dir.clone(),
-                log_level: self.log_level.clone(),
-                service_discovery_config,
-                prometheus_config,
-                request_timeout_secs: self.request_timeout_secs,
-                request_id_headers: self.request_id_headers.clone(),
-                trace_config: if self.enable_trace {
-                    Some(config::TraceConfig {
-                        otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
-                        ..Default::default()
-                    })
-                } else {
-                    None
-                },
-            })
-            .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        // PyO3 0.26 provides detach(). In particular, the long-lived server
+        // must not retain the GIL while its dedicated render thread needs it.
+        // Only owned Python handles cross this boundary; no Bound/Python token.
+        py.detach(move || -> Result<(), String> {
+            let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+            let bridge = render_input
+                .map(|(facade, contract)| {
+                    prompt_tokens::bridge::RenderBridge::new(facade, contract, bridge_limits)
+                        .map(std::sync::Arc::new)
+                })
+                .transpose()?;
+            let result = runtime.block_on(async {
+                if let Some(bridge) = &bridge {
+                    bridge.wait_ready(startup_timeout).await?;
+                }
+                server::startup_with_render_bridge(server_config, bridge.clone())
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            if let Some(bridge) = bridge {
+                bridge.shutdown();
+                // A started synchronous Python computation cannot be killed.
+                // The bridge's non-daemon Python lifetime guard prevents normal
+                // interpreter finalization until its actual callback/ref drain.
+                if !runtime.block_on(bridge.wait_closed(std::time::Duration::from_secs(30))) {
+                    return Err("render shutdown deadline exceeded; Python callback may still be active and the interpreter lifetime guard remains; irrecoverable work requires terminating the whole process externally".into());
+                }
+            }
+            result
         })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
+}
+
+fn render_bridge_limits(
+    overrides: Option<HashMap<String, u64>>,
+) -> PyResult<prompt_tokens::bridge::BridgeLimits> {
+    let mut limits = prompt_tokens::bridge::BridgeLimits::default();
+    for (name, value) in overrides.unwrap_or_default() {
+        let size = || {
+            usize::try_from(value).map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "render limit exceeds the platform size bound",
+                )
+            })
+        };
+        match name.as_str() {
+            "max_pending_jobs" => limits.max_pending_jobs = size()?,
+            "max_input_bytes" => limits.max_input_bytes = size()?,
+            "max_tokens_per_request" => limits.max_tokens_per_request = size()?,
+            "max_reserved_tokens" => limits.max_reserved_tokens = size()?,
+            "queue_timeout_ms" => limits.queue_timeout = std::time::Duration::from_millis(value),
+            "execution_timeout_ms" => {
+                limits.execution_timeout = std::time::Duration::from_millis(value)
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "unknown render bridge limit",
+                ))
+            }
+        }
+    }
+    Ok(limits)
 }
 
 #[pymodule]

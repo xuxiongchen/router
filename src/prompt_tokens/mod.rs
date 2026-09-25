@@ -15,6 +15,8 @@ use tokenizers::Tokenizer;
 
 use crate::protocols::spec::{CompletionRequest, PromptInput};
 
+pub mod bridge;
+
 // This fingerprint identifies renderer semantics, not a model/revision or
 // tokenizer vocabulary. Unknown templates disable Chat affinity only.
 const QWEN3_CHAT_TEMPLATE_SHA256: &str =

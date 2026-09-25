@@ -37,13 +37,15 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         else:
             router_args = args
 
+        # Validate before MiniLB can override a policy or ignore an explicitly
+        # requested exact-input backend.
+        router_args._validate_router_args()
         if router_args.mini_lb:
             mini_lb = MiniLoadBalancer(router_args)
             mini_lb.start()
         else:
             if Router is None:
                 raise RuntimeError("Rust Router is not installed")
-            router_args._validate_router_args()
             router = Router.from_args(router_args)
             router.start()
 

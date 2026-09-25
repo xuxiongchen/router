@@ -8,8 +8,8 @@ use crate::{
     policies::PolicyRegistry,
     protocols::{
         spec::{
-            ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest,
-            InferenceGenerateRequest, RerankRequest, V1RerankReqInput,
+            EmbeddingRequest, GenerateRequest, InferenceGenerateRequest, RerankRequest,
+            V1RerankReqInput,
         },
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
@@ -20,6 +20,7 @@ use crate::{
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 use axum::{
+    body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -40,6 +41,7 @@ use tracing::{error, info, warn, Level};
 
 #[derive(Clone)]
 pub struct AppContext {
+    pub render_bridge: Option<Arc<crate::prompt_tokens::bridge::RenderBridge>>,
     pub client: Client,
     pub router_config: RouterConfig,
     pub rate_limiter: Arc<TokenBucket>,
@@ -82,6 +84,7 @@ impl AppContext {
         };
 
         Ok(Self {
+            render_bridge: None,
             client,
             router_config,
             rate_limiter,
@@ -253,39 +256,57 @@ async fn inference_generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(raw): Json<serde_json::Value>,
+    raw: Bytes,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
-    let body: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
-        Ok(body) => body,
-        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
-    };
+    if !json_content_type(&headers) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected application/json",
+        )
+            .into_response();
+    }
     state
         .router
-        .route_chat_raw(Some(&headers), &raw, &body, None)
+        .route_chat_bytes(Some(&headers), &raw, None)
         .await
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(raw): Json<serde_json::Value>,
+    raw: Bytes,
 ) -> Response {
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
 
-    let body: CompletionRequest = match serde_json::from_value(raw.clone()) {
-        Ok(body) => body,
-        Err(error) => return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
-    };
+    if !json_content_type(&headers) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Expected application/json",
+        )
+            .into_response();
+    }
     state
         .router
-        .route_completion_raw(Some(&headers), &raw, &body, None)
+        .route_completion_bytes(Some(&headers), &raw, None)
         .await
+}
+
+fn json_content_type(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            value == "application/json"
+                || (value.starts_with("application/") && value.ends_with("+json"))
+        })
 }
 
 async fn rerank(
@@ -875,6 +896,14 @@ pub fn build_app_with_wasm_middleware(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    startup_with_render_bridge(config, None).await
+}
+
+/// Python-hosted optional input provider. The native entrypoint passes None.
+pub async fn startup_with_render_bridge(
+    config: ServerConfig,
+    render_bridge: Option<Arc<crate::prompt_tokens::bridge::RenderBridge>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("DEBUG: Server startup function called");
 
     // Only initialize logging if not already done (for Python bindings support)
@@ -945,13 +974,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Create the application context with all dependencies
     println!("DEBUG: Creating AppContext");
-    let app_context = AppContext::new(
+    let mut app_context = AppContext::new(
         config.router_config.clone(),
         client.clone(),
         config.router_config.max_concurrent_requests,
         config.router_config.rate_limit_tokens_per_second,
         config.router_config.api_key_validation_urls.clone(),
     )?;
+    app_context.render_bridge = render_bridge.clone();
     println!("DEBUG: AppContext created");
 
     let app_context = Arc::new(app_context);
@@ -1162,7 +1192,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let listener = TcpListener::bind(&addr).await?;
     info!("Starting server on {}", addr);
     serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            if let Some(bridge) = render_bridge {
+                bridge.shutdown();
+            }
+        })
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 

@@ -104,6 +104,27 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         self.route_chat(headers, body, model_id).await
     }
 
+    /// Preserve the original JSON bytes through an optional exact-input provider.
+    /// Routers without that provider retain their existing typed ingress.
+    async fn route_chat_bytes(
+        &self,
+        headers: Option<&HeaderMap>,
+        bytes: &[u8],
+        model_id: Option<&str>,
+    ) -> Response {
+        let raw: serde_json::Value = match serde_json::from_slice(bytes) {
+            Ok(raw) => raw,
+            Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON request").into_response(),
+        };
+        let body = match serde_json::from_value(raw.clone()) {
+            Ok(body) => body,
+            Err(error) => {
+                return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+            }
+        };
+        self.route_chat_raw(headers, &raw, &body, model_id).await
+    }
+
     /// Route a completion request
     async fn route_completion(
         &self,
@@ -120,6 +141,26 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         model_id: Option<&str>,
     ) -> Response {
         self.route_completion(headers, body, model_id).await
+    }
+
+    async fn route_completion_bytes(
+        &self,
+        headers: Option<&HeaderMap>,
+        bytes: &[u8],
+        model_id: Option<&str>,
+    ) -> Response {
+        let raw: serde_json::Value = match serde_json::from_slice(bytes) {
+            Ok(raw) => raw,
+            Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON request").into_response(),
+        };
+        let body = match serde_json::from_value(raw.clone()) {
+            Ok(body) => body,
+            Err(error) => {
+                return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+            }
+        };
+        self.route_completion_raw(headers, &raw, &body, model_id)
+            .await
     }
 
     /// Route a responses request

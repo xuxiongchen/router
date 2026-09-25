@@ -11,6 +11,7 @@ use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
 };
+use crate::prompt_tokens::bridge::{PreparedResult, RenderBridge, RenderContract, RequestKind};
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
@@ -169,8 +170,59 @@ impl<T: GenerationRequest> GenerationRequest for RawGenerationRequest<'_, T> {
 #[derive(Debug)]
 struct KvRuntime {
     _pool: crate::kv_events::KVEventPool,
-    tokenizer: crate::prompt_tokens::PromptTokenizer,
+    tokenizer: Option<crate::prompt_tokens::PromptTokenizer>,
+    render_bridge: Option<Arc<RenderBridge>>,
     model: String,
+}
+
+/// Owned request-scoped routing hint, never a complete cache key. The unchanged
+/// policy adds its existing hash domain; unsupported cache extras get no hint.
+#[derive(Clone)]
+struct PreparedKvInput {
+    tokens: Option<Arc<[u32]>>,
+    contract: Option<RenderContract>,
+}
+
+/// Only scheduling metadata is decoded here. vLLM validates the original bytes,
+/// including fields the Router's older OpenAI schema does not yet understand.
+#[derive(Clone, serde::Serialize)]
+struct RenderRoutingRequest {
+    model: Option<String>,
+    stream: bool,
+}
+
+impl RenderRoutingRequest {
+    fn from_bytes(raw: &[u8]) -> Result<Self, ()> {
+        // Last-key-wins agrees with the Worker ingress. This temporary map is
+        // NEVER fed to Python or forwarded; those paths keep original bytes.
+        let value: serde_json::Value = serde_json::from_slice(raw).map_err(|_| ())?;
+        let object = value.as_object().ok_or(())?;
+        let model = match object.get("model") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(model)) => Some(model.clone()),
+            _ => return Err(()),
+        };
+        // This flag controls response buffering only. Let vLLM own schema
+        // coercion: stream:null is non-streaming; conservatively stream other
+        // non-boolean forms rather than buffering a possibly valid SSE body.
+        // The Worker receives the unchanged field and determines its meaning.
+        let stream = object
+            .get("stream")
+            .is_some_and(|value| !value.is_null() && value != &serde_json::Value::Bool(false));
+        Ok(Self { model, stream })
+    }
+}
+
+impl GenerationRequest for RenderRoutingRequest {
+    fn is_stream(&self) -> bool {
+        self.stream
+    }
+    fn get_model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+    fn extract_text_for_routing(&self) -> String {
+        String::new()
+    }
 }
 
 /// Own the selected worker itself, so removal/replacement cannot redirect
@@ -249,9 +301,13 @@ impl Router {
                 ctx.router_config
                     .validate()
                     .map_err(|error| error.to_string())?;
-                Some(crate::prompt_tokens::PromptTokenizer::load(
-                    &config.tokenizer_path,
-                )?)
+                if ctx.render_bridge.is_some() {
+                    None
+                } else {
+                    Some(crate::prompt_tokens::PromptTokenizer::load(
+                        &config.tokenizer_path,
+                    )?)
+                }
             } else {
                 None
             };
@@ -413,8 +469,8 @@ impl Router {
             }))
         });
 
-        let kv_runtime = if let (crate::config::PolicyConfig::KvAware { config }, Some(tokenizer)) =
-            (&ctx.router_config.policy, kv_tokenizer)
+        let kv_runtime = if let crate::config::PolicyConfig::KvAware { config } =
+            &ctx.router_config.policy
         {
             let policy = ctx.policy_registry.get_default_policy();
             let index = policy
@@ -438,7 +494,8 @@ impl Router {
             ctx.worker_registry.bind_kv_index(&index);
             Some(KvRuntime {
                 _pool: pool,
-                tokenizer,
+                tokenizer: kv_tokenizer,
+                render_bridge: ctx.render_bridge.clone(),
                 model: config.model.clone(),
             })
         } else {
@@ -1164,6 +1221,29 @@ impl Router {
         model_id: Option<&str>,
         token_ids: Option<Vec<u32>>,
     ) -> Response {
+        self.route_request_prepared(
+            headers,
+            typed_req,
+            route,
+            model_id,
+            token_ids.map(|tokens| PreparedKvInput {
+                tokens: Some(tokens.into()),
+                contract: None,
+            }),
+            None,
+        )
+        .await
+    }
+
+    async fn route_request_prepared<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &str,
+        model_id: Option<&str>,
+        input: Option<PreparedKvInput>,
+        raw_bytes: Option<&[u8]>,
+    ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
 
@@ -1216,6 +1296,22 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
+                // A late result or retry must never cross a render-contract
+                // epoch. Do not bypass an invalid deployment through fallback.
+                if let Some(contract) = input.as_ref().and_then(|input| input.contract.as_ref()) {
+                    if !self
+                        .kv_runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.render_bridge.as_ref())
+                        .is_some_and(|bridge| bridge.is_current(contract))
+                    {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Render contract is no longer current",
+                        )
+                            .into_response();
+                    }
+                }
                 // Each backend attempt is a fresh scheduling arrival. The
                 // previous ProgramCompletion finishes exactly once before a
                 // retry invokes this closure again.
@@ -1243,7 +1339,7 @@ impl Router {
                         model_id,
                         Some(&text),
                         headers,
-                        token_ids.as_deref(),
+                        input.as_ref().and_then(|input| input.tokens.as_deref()),
                     )
                 };
                 let worker = match selected_worker {
@@ -1282,8 +1378,15 @@ impl Router {
                 };
 
                 let response = if self.kv_runtime.is_some() {
-                    self.send_kv_request(headers, typed_req, route, worker.clone(), is_stream)
-                        .await
+                    self.send_kv_request_bytes(
+                        headers,
+                        typed_req,
+                        route,
+                        worker.clone(),
+                        is_stream,
+                        raw_bytes,
+                    )
+                    .await
                 } else {
                     self.send_typed_request(
                         typed_req,
@@ -1358,6 +1461,7 @@ impl Router {
 
     /// HTTP-only dispatch for the narrow KV-aware deployment. The lease covers
     /// header wait, JSON buffering and the entire client-owned streaming body.
+    #[cfg(test)]
     async fn send_kv_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -1366,9 +1470,29 @@ impl Router {
         worker: Arc<dyn Worker>,
         is_stream: bool,
     ) -> Response {
+        self.send_kv_request_bytes(headers, body, route, worker, is_stream, None)
+            .await
+    }
+
+    async fn send_kv_request_bytes<T: serde::Serialize>(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &T,
+        route: &str,
+        worker: Arc<dyn Worker>,
+        is_stream: bool,
+        raw_bytes: Option<&[u8]>,
+    ) -> Response {
         let lease = KvLoadLease::new(worker.clone());
         let url = format!("{}{}", worker.url().trim_end_matches('/'), route);
-        let mut request = self.client.post(&url).json(body);
+        let mut request = match raw_bytes {
+            Some(raw) => self
+                .client
+                .post(&url)
+                .header(CONTENT_TYPE, "application/json")
+                .body(raw.to_vec()),
+            None => self.client.post(&url).json(body),
+        };
         if let Some(headers) = headers {
             for (name, value) in headers {
                 if *name != CONTENT_TYPE
@@ -1435,11 +1559,150 @@ impl Router {
             debug!("kv_input_unavailable: request model differs from configured worker model");
             return None;
         }
-        match tokens(&runtime.tokenizer) {
+        match tokens(runtime.tokenizer.as_ref()?) {
             Ok(ids) => Some(ids),
             Err(reason) => {
                 debug!(%reason, "kv_input_unavailable");
                 None
+            }
+        }
+    }
+
+    async fn route_kv_bytes(
+        &self,
+        headers: Option<&HeaderMap>,
+        raw: &[u8],
+        model_id: Option<&str>,
+        kind: RequestKind,
+    ) -> Response {
+        let runtime = self
+            .kv_runtime
+            .as_ref()
+            .expect("KV ingress checked runtime");
+        let route = match kind {
+            RequestKind::Chat => "/v1/chat/completions",
+            RequestKind::Completion => "/v1/completions",
+        };
+        if let Some(bridge) = &runtime.render_bridge {
+            let Some(contract) = bridge.current_contract() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Render deployment is unavailable",
+                )
+                    .into_response();
+            };
+            // Copy the immutable body once for the cross-runtime job. Neither
+            // serde's map ordering nor our older protocol types enter Python.
+            let prepared = bridge.prepare_bytes(kind, raw).await;
+            let tokens = match prepared {
+                PreparedResult::Exact(prepared) => {
+                    if prepared.contract != contract || !bridge.is_current(&contract) {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "Render contract changed")
+                            .into_response();
+                    }
+                    prepared.cache_eligible.then_some(prepared.token_ids)
+                }
+                PreparedResult::Invalid { http_status } => {
+                    let status = StatusCode::from_u16(http_status)
+                        .ok()
+                        .filter(StatusCode::is_client_error)
+                        .unwrap_or(StatusCode::BAD_REQUEST);
+                    return (
+                        status,
+                        axum::Json(serde_json::json!({
+                            "error": {
+                                "message": "Invalid vLLM text request",
+                                "type": "invalid_request_error",
+                                "param": null,
+                                "code": status.as_u16()
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                PreparedResult::Cancelled => {
+                    return (StatusCode::SERVICE_UNAVAILABLE, "Render request cancelled")
+                        .into_response();
+                }
+                PreparedResult::Unsupported
+                | PreparedResult::Unavailable
+                | PreparedResult::Busy
+                | PreparedResult::Deadline(_) => None,
+            };
+            // This metadata is used only by the existing fair policy and raw
+            // transport. Full validation belongs to the vLLM serving facade.
+            let metadata = match RenderRoutingRequest::from_bytes(raw) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, "Invalid request envelope").into_response()
+                }
+            };
+            return self
+                .route_request_prepared(
+                    headers,
+                    &metadata,
+                    route,
+                    model_id,
+                    Some(PreparedKvInput {
+                        tokens,
+                        contract: Some(contract),
+                    }),
+                    Some(raw),
+                )
+                .await;
+        }
+        let value: serde_json::Value = match serde_json::from_slice(raw) {
+            Ok(value) => value,
+            Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON request").into_response(),
+        };
+        match kind {
+            RequestKind::Chat => {
+                let body: ChatCompletionRequest = match serde_json::from_value(value.clone()) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+                            .into_response()
+                    }
+                };
+                let tokens = self.kv_tokens(body.model.as_deref(), |tokenizer| {
+                    tokenizer.chat_raw(&value)
+                });
+                self.route_request_prepared(
+                    headers,
+                    &body,
+                    route,
+                    model_id,
+                    tokens.map(|tokens| PreparedKvInput {
+                        tokens: Some(tokens.into()),
+                        contract: None,
+                    }),
+                    Some(raw),
+                )
+                .await
+            }
+            RequestKind::Completion => {
+                let body: CompletionRequest = match serde_json::from_value(value) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+                            .into_response()
+                    }
+                };
+                let tokens = self.kv_tokens(body.model.as_deref(), |tokenizer| {
+                    tokenizer.completion(&body)
+                });
+                self.route_request_prepared(
+                    headers,
+                    &body,
+                    route,
+                    model_id,
+                    tokens.map(|tokens| PreparedKvInput {
+                        tokens: Some(tokens.into()),
+                        contract: None,
+                    }),
+                    Some(raw),
+                )
+                .await
             }
         }
     }
@@ -2485,6 +2748,27 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_chat_bytes(
+        &self,
+        headers: Option<&HeaderMap>,
+        raw: &[u8],
+        model_id: Option<&str>,
+    ) -> Response {
+        if self.kv_runtime.is_some() {
+            return self
+                .route_kv_bytes(headers, raw, model_id, RequestKind::Chat)
+                .await;
+        }
+        let value: serde_json::Value = match serde_json::from_slice(raw) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        match serde_json::from_value(value) {
+            Ok(body) => self.route_chat(headers, &body, model_id).await,
+            Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+        }
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
@@ -2514,6 +2798,27 @@ impl RouterTrait for Router {
         let request = RawGenerationRequest { raw, typed: body };
         self.route_request_with_tokens(headers, &request, "/v1/completions", model_id, ids)
             .await
+    }
+
+    async fn route_completion_bytes(
+        &self,
+        headers: Option<&HeaderMap>,
+        raw: &[u8],
+        model_id: Option<&str>,
+    ) -> Response {
+        if self.kv_runtime.is_some() {
+            return self
+                .route_kv_bytes(headers, raw, model_id, RequestKind::Completion)
+                .await;
+        }
+        let value: serde_json::Value = match serde_json::from_slice(raw) {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        match serde_json::from_value(value) {
+            Ok(body) => self.route_completion(headers, &body, model_id).await,
+            Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response(),
+        }
     }
 
     async fn route_responses(
@@ -3007,6 +3312,102 @@ mod tests {
 
     #[tokio::test]
     async fn kv_retry_reuses_exact_tokens_preserves_raw_and_releases_each_lease() {
+        kv_retry_case(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn kv_render_bridge_prepares_once_and_retries_original_bytes() {
+        kv_retry_case(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn kv_render_bridge_epoch_change_blocks_retry() {
+        kv_retry_case(true, true).await;
+    }
+
+    #[test]
+    fn kv_render_envelope_preserves_worker_null_and_last_key_semantics() {
+        let request = RenderRoutingRequest::from_bytes(
+            br#"{"model":"first","model":"last","stream":true,"stream":null}"#,
+        )
+        .unwrap();
+        assert_eq!(request.model.as_deref(), Some("last"));
+        assert!(!request.stream);
+        // Pydantic may accept coercible flags. This only chooses a safe body
+        // transport; the original flag still reaches the actual Worker.
+        assert!(
+            RenderRoutingRequest::from_bytes(br#"{"stream":"true"}"#)
+                .unwrap()
+                .stream
+        );
+    }
+
+    #[tokio::test]
+    async fn kv_render_invalid_request_preserves_404_without_dispatch() {
+        for (reported, expected) in [(404, StatusCode::NOT_FOUND), (500, StatusCode::BAD_REQUEST)] {
+            let context = zmq::Context::new();
+            let publisher = context.socket(zmq::PUB).unwrap();
+            publisher.set_linger(0).unwrap();
+            publisher.bind("tcp://127.0.0.1:*").unwrap();
+            let index = Arc::new(crate::kv_index::KVBlockIndex::new(8));
+            let pool = crate::kv_events::KVEventPool::start(
+                vec![(
+                    "http://worker1:8080".into(),
+                    publisher.get_last_endpoint().unwrap().unwrap(),
+                )],
+                "invalid-request-test".into(),
+                16,
+                index,
+            )
+            .unwrap();
+            let bridge = Arc::new(RenderBridge::for_test(
+                RenderContract {
+                    id: "invalid-request-contract".into(),
+                    epoch: 1,
+                },
+                crate::prompt_tokens::bridge::BridgeLimits::default(),
+                move |_, _| PreparedResult::Invalid {
+                    http_status: reported,
+                },
+            ));
+            bridge.wait_ready(Duration::from_secs(1)).await.unwrap();
+            let mut router = create_test_regular_router();
+            router.kv_runtime = Some(KvRuntime {
+                _pool: pool,
+                tokenizer: None,
+                render_bridge: Some(bridge.clone()),
+                model: "known-model".into(),
+            });
+            let response = router
+                .route_completion_bytes(
+                    None,
+                    br#"{"model":"missing-model","prompt":"public synthetic prompt"}"#,
+                    None,
+                )
+                .await;
+            assert_eq!(response.status(), expected);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], expected.as_u16());
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_eq!(body["error"]["message"], "Invalid vLLM text request");
+            assert!(!body.to_string().contains("synthetic prompt"));
+            assert_eq!(
+                router
+                    .worker_registry
+                    .get_by_url("http://worker1:8080")
+                    .unwrap()
+                    .load(),
+                0
+            );
+            bridge.shutdown();
+            assert!(bridge.wait_closed(Duration::from_secs(1)).await);
+            drop(router);
+        }
+    }
+
+    async fn kv_retry_case(use_bridge: bool, invalidate_after_first: bool) {
         // Abort only these test-owned servers on both success and assertion
         // failure. The successful path also joins them with a bounded wait.
         struct TestServers(Vec<tokio::task::JoinHandle<()>>);
@@ -3018,14 +3419,20 @@ mod tests {
             }
         }
 
-        let attempts = Arc::new(Mutex::new(Vec::<(&'static str, serde_json::Value)>::new()));
+        let attempts = Arc::new(Mutex::new(Vec::<(&'static str, Vec<u8>)>::new()));
+        let invalidation_hook: Arc<Mutex<Option<Arc<RenderBridge>>>> = Arc::new(Mutex::new(None));
+        let hook = invalidation_hook.clone();
         let seen0 = attempts.clone();
         let app0 = axum::Router::new().route(
             "/v1/completions",
-            axum::routing::post(move |Json(raw): Json<serde_json::Value>| {
+            axum::routing::post(move |raw: bytes::Bytes| {
                 let seen = seen0.clone();
+                let hook = hook.clone();
                 async move {
-                    seen.lock().push(("w0", raw));
+                    seen.lock().push(("w0", raw.to_vec()));
+                    if let Some(bridge) = hook.lock().as_ref() {
+                        bridge.invalidate();
+                    }
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
             }),
@@ -3035,11 +3442,11 @@ mod tests {
         let seen1 = attempts.clone();
         let app1 = axum::Router::new().route(
             "/v1/completions",
-            axum::routing::post(move |Json(raw): Json<serde_json::Value>| {
+            axum::routing::post(move |raw: bytes::Bytes| {
                 let seen = seen1.clone();
                 async move {
-                    seen.lock().push(("w1", raw.clone()));
-                    Json(raw)
+                    seen.lock().push(("w1", raw.to_vec()));
+                    raw
                 }
             }),
         );
@@ -3099,7 +3506,8 @@ mod tests {
         router.worker_registry.bind_kv_index(&index);
         router.kv_runtime = Some(KvRuntime {
             _pool: pool,
-            tokenizer: crate::prompt_tokens::PromptTokenizer::synthetic_for_test(),
+            tokenizer: Some(crate::prompt_tokens::PromptTokenizer::synthetic_for_test()),
+            render_bridge: None,
             model: config.model.clone(),
         });
 
@@ -3125,20 +3533,73 @@ mod tests {
             "suffix": null, "max_tokens": 1, "temperature": 0.0,
             "add_special_tokens": false, "user": "synthetic retry fixture"
         });
-        let typed: CompletionRequest = serde_json::from_value(raw.clone()).unwrap();
+        // Deliberately retain whitespace and nonalphabetical object order.
+        let raw_bytes = format!("{{ \"user\":\"synthetic retry fixture\", \"prompt\":{},\n\"model\":\"Qwen/Qwen3-0.6B\",\"suffix\":null,\"max_tokens\":1,\"temperature\":0.0,\"add_special_tokens\":false }}", serde_json::to_string(&token_ids).unwrap()).into_bytes();
+        let render_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bridge = if use_bridge {
+            let contract = RenderContract {
+                id: "synthetic-routing-contract".into(),
+                epoch: 1,
+            };
+            let calls = render_calls.clone();
+            let expected_bytes = raw_bytes.clone();
+            let result = crate::prompt_tokens::bridge::PreparedTokens {
+                token_ids: token_ids.clone().into(),
+                contract: contract.clone(),
+                cache_eligible: true,
+            };
+            let observed_worker = worker0.clone();
+            let bridge = Arc::new(RenderBridge::for_test(
+                contract,
+                Default::default(),
+                move |kind, bytes| {
+                    assert_eq!(kind, RequestKind::Completion);
+                    assert_eq!(bytes, expected_bytes);
+                    assert_eq!(
+                        observed_worker.load(),
+                        0,
+                        "no worker reservation while rendering"
+                    );
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    PreparedResult::Exact(result.clone())
+                },
+            ));
+            bridge.wait_ready(Duration::from_secs(1)).await.unwrap();
+            let runtime = router.kv_runtime.as_mut().unwrap();
+            runtime.tokenizer = None;
+            runtime.render_bridge = Some(bridge.clone());
+            if invalidate_after_first {
+                *invalidation_hook.lock() = Some(bridge.clone());
+            }
+            Some(bridge)
+        } else {
+            None
+        };
         let response = tokio::time::timeout(
             Duration::from_secs(10),
-            router.route_completion_raw(None, &raw, &typed, None),
+            router.route_completion_bytes(None, &raw_bytes, None),
         )
         .await
         .expect("bounded two-attempt request");
-        assert_eq!(response.status(), StatusCode::OK);
-        let returned: serde_json::Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
-        assert_eq!(returned, raw);
+        if invalidate_after_first {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(attempts.lock().as_slice(), &[("w0", raw_bytes.clone())]);
+        } else {
+            assert_eq!(response.status(), StatusCode::OK);
+            let returned = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(returned.as_ref(), raw_bytes);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&returned).unwrap(),
+                raw
+            );
+            assert_eq!(
+                attempts.lock().as_slice(),
+                &[("w0", raw_bytes.clone()), ("w1", raw_bytes.clone())]
+            );
+        }
         assert_eq!(
-            attempts.lock().as_slice(),
-            &[("w0", raw.clone()), ("w1", raw.clone())]
+            render_calls.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(use_bridge)
         );
         assert_eq!([worker0.load(), worker1.load()], initial_loads);
         assert!(
@@ -3157,6 +3618,10 @@ mod tests {
             worker0.url()
         );
 
+        if let Some(bridge) = bridge {
+            bridge.shutdown();
+            assert!(bridge.wait_closed(Duration::from_secs(1)).await);
+        }
         drop(router);
         assert_eq!(index.ownership_count(), 0);
         drop(publishers);

@@ -25,6 +25,19 @@ class RouterArgs:
     policy: str = "cache_aware"
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
+    # Exact-input and existing PR1 KV configuration. None distinguishes an
+    # omitted value from an explicit override of the render deployment source.
+    kv_input_backend: str = "native"
+    kv_render_config: Optional[str] = None
+    kv_tokenizer_path: Optional[str] = None
+    kv_model: Optional[str] = None
+    kv_hash_algo: Optional[str] = None
+    kv_block_size: Optional[int] = None
+    kv_hash_seed: int = 0
+    kv_events_topic_filter: str = ""
+    kv_events_port: int = 5557
+    kv_events_endpoints: List[str] = dataclasses.field(default_factory=list)
+    kv_index_max_entries: int = 100_000
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
@@ -160,9 +173,31 @@ class RouterArgs:
                 "cache_aware",
                 "power_of_two",
                 "consistent_hash",
+                "kv_aware",
             ],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
+        parser.add_argument(
+            f"--{prefix}kv-input-backend", choices=["native", "vllm"],
+            default="native", help="Exact-input backend; vllm is optional and in-process",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-render-config", default=None,
+            help="Reviewed local vLLM render deployment JSON (requires the vllm backend)",
+        )
+        parser.add_argument(f"--{prefix}kv-tokenizer-path", default=None)
+        parser.add_argument(f"--{prefix}kv-model", default=None)
+        parser.add_argument(f"--{prefix}kv-hash-algo", choices=["sha256_cbor"], default=None)
+        parser.add_argument(f"--{prefix}kv-block-size", type=int, default=None)
+        parser.add_argument(f"--{prefix}kv-hash-seed", type=int, default=0)
+        parser.add_argument(f"--{prefix}kv-events-topic-filter", default="")
+        parser.add_argument(f"--{prefix}kv-events-port", type=int, default=5557)
+        parser.add_argument(
+            f"--{prefix}kv-events-endpoint", action="append", default=[],
+            dest=f"{prefix.replace('-', '_')}kv_events_endpoints",
+            help="Repeat WORKER_URL=KV_EVENT_ENDPOINT; existing port fallback remains supported",
+        )
+        parser.add_argument(f"--{prefix}kv-index-max-entries", type=int, default=100_000)
         parser.add_argument(
             f"--{prefix}prefill-policy",
             type=str,
@@ -565,6 +600,27 @@ class RouterArgs:
     def _validate_router_args(self):
         if self.wasm_middleware_sha256 and not self.wasm_middleware:
             raise ValueError("wasm_middleware_sha256 requires wasm_middleware")
+
+        if self.kv_input_backend not in ("native", "vllm"):
+            raise ValueError("kv_input_backend must be native or vllm")
+        if self.kv_input_backend == "vllm":
+            if self.policy != "kv_aware" or not self.kv_render_config:
+                raise ValueError("vllm input backend requires kv_aware and kv_render_config")
+        elif self.kv_render_config is not None:
+            raise ValueError("kv_render_config requires the vllm input backend")
+        if self.policy == "kv_aware":
+            if (self.mini_lb or self.vllm_pd_disaggregation or self.service_discovery
+                    or self.enable_igw or self.enable_program_scheduling
+                    or self.intra_node_data_parallel_size != 1 or not self.worker_urls):
+                raise ValueError("kv_aware requires static Regular HTTP workers with DP=1")
+            if self.kv_hash_algo != "sha256_cbor":
+                raise ValueError("kv_aware requires kv_hash_algo=sha256_cbor")
+            if self.kv_input_backend == "native" and not self.kv_tokenizer_path:
+                raise ValueError("native kv_aware requires kv_tokenizer_path")
+        elif (self.kv_tokenizer_path is not None or self.kv_model is not None
+              or self.kv_hash_algo is not None or self.kv_block_size is not None
+              or self.kv_events_endpoints):
+            raise ValueError("KV input/event options require policy=kv_aware")
 
         # Validate configuration based on mode
         if self.vllm_pd_disaggregation:
