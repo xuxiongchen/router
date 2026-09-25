@@ -169,7 +169,8 @@ impl<T: GenerationRequest> GenerationRequest for RawGenerationRequest<'_, T> {
 
 #[derive(Debug)]
 struct KvRuntime {
-    _pool: crate::kv_events::KVEventPool,
+    _pool: Option<crate::kv_events::KVEventPool>,
+    _capability_pool: Option<crate::kv_events::CapabilityEventPool>,
     tokenizer: Option<crate::prompt_tokens::PromptTokenizer>,
     render_bridge: Option<Arc<RenderBridge>>,
     model: String,
@@ -473,11 +474,11 @@ impl Router {
             &ctx.router_config.policy
         {
             let policy = ctx.policy_registry.get_default_policy();
-            let index = policy
+            let kv_policy = policy
                 .as_any()
                 .downcast_ref::<crate::policies::KvAwarePolicy>()
-                .ok_or("kv_aware policy was not initialized")?
-                .index();
+                .ok_or("kv_aware policy was not initialized")?;
+            let index = kv_policy.index();
             let mappings: Vec<_> = config
                 .worker_endpoints
                 .iter()
@@ -485,15 +486,43 @@ impl Router {
                 .collect();
             let endpoints =
                 crate::kv_events::resolve_endpoints(&worker_urls, &mappings, config.default_port)?;
-            let pool = crate::kv_events::KVEventPool::start(
-                endpoints,
-                config.topic.clone(),
-                config.block_size,
-                index.clone(),
-            )?;
+            let (pool, capability_pool) = if let Some((bridge, cohort)) =
+                ctx.render_bridge.as_ref().and_then(|bridge| {
+                    bridge
+                        .capability_cohort
+                        .as_ref()
+                        .map(|cohort| (bridge, cohort))
+                }) {
+                if !config.topic.is_empty() {
+                    return Err("automatic capabilities use the effective Worker epoch topic; remove the explicit topic override".into());
+                }
+                cohort.validate(
+                    &endpoints,
+                    config.block_size,
+                    config.hash_seed,
+                    &config.model,
+                )?;
+                kv_policy.enable_dense_reuse();
+                let pool = crate::kv_events::CapabilityEventPool::start(
+                    endpoints,
+                    index.clone(),
+                    cohort.clone(),
+                    bridge.clone(),
+                )?;
+                (None, Some(pool))
+            } else {
+                let pool = crate::kv_events::KVEventPool::start(
+                    endpoints,
+                    config.topic.clone(),
+                    config.block_size,
+                    index.clone(),
+                )?;
+                (Some(pool), None)
+            };
             ctx.worker_registry.bind_kv_index(&index);
             Some(KvRuntime {
                 _pool: pool,
+                _capability_pool: capability_pool,
                 tokenizer: kv_tokenizer,
                 render_bridge: ctx.render_bridge.clone(),
                 model: config.model.clone(),
@@ -3373,7 +3402,8 @@ mod tests {
             bridge.wait_ready(Duration::from_secs(1)).await.unwrap();
             let mut router = create_test_regular_router();
             router.kv_runtime = Some(KvRuntime {
-                _pool: pool,
+                _pool: Some(pool),
+                _capability_pool: None,
                 tokenizer: None,
                 render_bridge: Some(bridge.clone()),
                 model: "known-model".into(),
@@ -3505,7 +3535,8 @@ mod tests {
         .unwrap();
         router.worker_registry.bind_kv_index(&index);
         router.kv_runtime = Some(KvRuntime {
-            _pool: pool,
+            _pool: Some(pool),
+            _capability_pool: None,
             tokenizer: Some(crate::prompt_tokens::PromptTokenizer::synthetic_for_test()),
             render_bridge: None,
             model: config.model.clone(),

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "mechanism": "normal_single_group_full_attention_terminal_recompute_v1",
+  "scope": "Fresh text generation, prefix reads enabled, CP=1, speculation disabled; equal logical hash, spec, manager and reuse block units. Expected values are explicit source-oracle fixtures, not universal Hybrid/MTP rules.",
+  "cases": [
+    {"name": "below_one_block", "query_tokens": 15, "block_size": 16, "cached_blocks": [], "expected_matched_blocks": 0, "expected_reusable_tokens": 0},
+    {"name": "exactly_one_block", "query_tokens": 16, "block_size": 16, "cached_blocks": [0], "expected_matched_blocks": 1, "expected_reusable_tokens": 0},
+    {"name": "one_block_plus_one", "query_tokens": 17, "block_size": 16, "cached_blocks": [0], "expected_matched_blocks": 1, "expected_reusable_tokens": 16},
+    {"name": "below_two_blocks", "query_tokens": 31, "block_size": 16, "cached_blocks": [0], "expected_matched_blocks": 1, "expected_reusable_tokens": 16},
+    {"name": "exactly_two_blocks", "query_tokens": 32, "block_size": 16, "cached_blocks": [0, 1], "expected_matched_blocks": 2, "expected_reusable_tokens": 16},
+    {"name": "two_blocks_plus_one", "query_tokens": 33, "block_size": 16, "cached_blocks": [0, 1], "expected_matched_blocks": 2, "expected_reusable_tokens": 32},
+    {"name": "long_exact_gpu_464_tokens", "query_tokens": 464, "block_size": 16, "cached_blocks": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28], "expected_matched_blocks": 29, "expected_reusable_tokens": 448},
+    {"name": "long_exact_minus_one", "query_tokens": 463, "block_size": 16, "cached_blocks": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27], "expected_matched_blocks": 28, "expected_reusable_tokens": 448},
+    {"name": "long_exact_plus_one", "query_tokens": 465, "block_size": 16, "cached_blocks": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28], "expected_matched_blocks": 29, "expected_reusable_tokens": 464},
+    {"name": "cold", "query_tokens": 65, "block_size": 16, "cached_blocks": [], "expected_matched_blocks": 0, "expected_reusable_tokens": 0},
+    {"name": "missing_first_block", "query_tokens": 65, "block_size": 16, "cached_blocks": [1, 2, 3], "expected_matched_blocks": 0, "expected_reusable_tokens": 0},
+    {"name": "hole_in_prefix", "query_tokens": 65, "block_size": 16, "cached_blocks": [0, 2, 3], "expected_matched_blocks": 1, "expected_reusable_tokens": 16},
+    {"name": "removed_middle_block", "query_tokens": 65, "block_size": 16, "cached_blocks": [0, 1, 2, 3], "removed_blocks": [1], "expected_matched_blocks": 1, "expected_reusable_tokens": 16},
+    {"name": "removed_first_block", "query_tokens": 65, "block_size": 16, "cached_blocks": [0, 1, 2, 3], "removed_blocks": [0], "expected_matched_blocks": 0, "expected_reusable_tokens": 0},
+    {"name": "removed_last_block", "query_tokens": 65, "block_size": 16, "cached_blocks": [0, 1, 2, 3], "removed_blocks": [3], "expected_matched_blocks": 3, "expected_reusable_tokens": 48},
+    {"name": "all_cleared", "query_tokens": 65, "block_size": 16, "cached_blocks": [0, 1, 2, 3], "removed_blocks": [0, 1, 2, 3], "expected_matched_blocks": 0, "expected_reusable_tokens": 0},
+    {"name": "larger_block_exact", "query_tokens": 64, "block_size": 32, "cached_blocks": [0, 1], "expected_matched_blocks": 2, "expected_reusable_tokens": 32},
+    {"name": "larger_block_plus_one", "query_tokens": 65, "block_size": 32, "cached_blocks": [0, 1], "expected_matched_blocks": 2, "expected_reusable_tokens": 64}
+  ]
+}

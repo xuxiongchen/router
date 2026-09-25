@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 pub mod core;
 pub mod data_connector;
+pub mod kv_capabilities;
 pub mod kv_events;
 pub mod kv_index;
 pub mod metrics;
@@ -565,7 +566,7 @@ impl Router {
         })
     }
 
-    #[pyo3(signature = (*, render_facade=None, render_contract_id=None, render_contract_epoch=1, render_limits=None))]
+    #[pyo3(signature = (*, render_facade=None, render_contract_id=None, render_contract_epoch=1, render_limits=None, kv_capabilities_json=None))]
     fn start(
         &self,
         py: Python<'_>,
@@ -573,6 +574,7 @@ impl Router {
         render_contract_id: Option<String>,
         render_contract_epoch: u64,
         render_limits: Option<HashMap<String, u64>>,
+        kv_capabilities_json: Option<String>,
     ) -> PyResult<()> {
         let render_input =
             match (render_facade, render_contract_id) {
@@ -589,6 +591,21 @@ impl Router {
                 )),
             };
         let bridge_limits = render_bridge_limits(render_limits)?;
+        if kv_capabilities_json.is_some() && render_input.is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "worker capabilities require the vllm render backend",
+            ));
+        }
+        let capability_cohort = kv_capabilities_json
+            .map(|value| {
+                if value.len() > 16 * 1024 * 1024 {
+                    return Err("capability cohort exceeds size limit".to_string());
+                }
+                serde_json::from_str::<kv_capabilities::CapabilityCohort>(&value)
+                    .map_err(|_| "invalid capability cohort".to_string())
+            })
+            .transpose()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         // Convert to RouterConfig and validate
         let router_config = self.to_router_config().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {}", e))
@@ -662,6 +679,7 @@ impl Router {
             let bridge = render_input
                 .map(|(facade, contract)| {
                     prompt_tokens::bridge::RenderBridge::new(facade, contract, bridge_limits)
+                        .map(|bridge| bridge.with_capabilities(capability_cohort))
                         .map(std::sync::Arc::new)
                 })
                 .transpose()?;

@@ -391,6 +391,8 @@ fn parse_python_result(
 }
 
 pub struct RenderBridge {
+    /// Optional, verified control-plane input for the separate Dense event path.
+    pub capability_cohort: Option<crate::kv_capabilities::CapabilityCohort>,
     shared: Arc<Shared>,
     sender: SyncSender<Job>,
     closed: watch::Receiver<bool>,
@@ -429,6 +431,14 @@ impl std::fmt::Debug for RenderBridge {
 }
 
 impl RenderBridge {
+    pub fn with_capabilities(
+        mut self,
+        cohort: Option<crate::kv_capabilities::CapabilityCohort>,
+    ) -> Self {
+        self.capability_cohort = cohort;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test<F>(contract: RenderContract, limits: BridgeLimits, render: F) -> Self
     where
@@ -516,6 +526,7 @@ impl RenderBridge {
             })
             .map_err(|_| "could not start render bridge thread".to_string())?;
         Ok(Self {
+            capability_cohort: None,
             shared,
             sender,
             closed,

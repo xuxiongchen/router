@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "vllm_version": "0.29.0",
+  "mechanism": "normal_full_attention",
+  "mechanism_version": 1,
+  "namespace": {
+    "model": "/synthetic-public-fixture", "served_model_names": ["public-test"],
+    "revision": null, "dtype": "torch.bfloat16", "quantization": null,
+    "cache_dtype": "auto", "weight_version": "default"
+  },
+  "groups": [{"group_id": 0, "kind": "full_attention", "layer_count": 24,
+              "allocation_block_tokens": 16, "effective_block_tokens": 16}],
+  "hash": {"algorithm": "sha256_cbor", "width_bytes": 32, "representation": "bytes",
+           "seed": 0, "root_hex": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+           "extra_keys": "none", "block_tokens": 16},
+  "reuse": {"alignment_tokens": 16, "terminal_recompute_tokens": 1},
+  "execution": {"mode": "normal", "dp": 1, "tp": 1, "pp": 1, "dcp": 1, "pcp": 1,
+                "prefix_caching": true, "speculation": false, "connector": false, "offload": false},
+  "events": {"publisher": "zmq", "epoch": "0123456789abcdef0123456789abcdef",
+             "topic": "kv.0123456789abcdef0123456789abcdef", "configured_endpoint": "tcp://*:5557",
+             "resolved_endpoint": "tcp://0.0.0.0:5557", "dp_rank": 0,
+             "sequence": "u64_be_monotonic_per_epoch", "next_sequence": 0,
+             "payload": "vllm_kv_events_v1"}
+}

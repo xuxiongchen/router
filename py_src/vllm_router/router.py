@@ -107,6 +107,7 @@ class Router:
         """
         self._render_facade = None
         self._render_started = False
+        self._capability_cohort = None
         if router is not None:
             self._router = router
         else:
@@ -130,6 +131,15 @@ class Router:
                 declared = {url.rstrip("/") for url in facade.worker_urls}
                 if not workers or workers != declared:
                     raise ValueError("render configuration worker URLs differ from Router workers")
+                if facade.capability_cohort is not None:
+                    # Registry/endpoint mappings retain configured URL spelling;
+                    # conformance URLs are normalized separately. Preserve both
+                    # contracts without mutating the facade's metadata snapshot.
+                    self._capability_cohort = {
+                        **facade.capability_cohort,
+                        "workers": {url: facade.capability_cohort["workers"][url.rstrip("/")]
+                                    for url in kwargs["worker_urls"]},
+                    }
                 configured_path = kwargs.get("kv_tokenizer_path")
                 if (configured_path is not None
                         and Path(configured_path).resolve() != Path(facade.tokenizer_path).resolve()):
@@ -137,12 +147,18 @@ class Router:
                 for key, effective in (("kv_model", facade.model),
                                        ("kv_block_size", facade.block_size)):
                     if kwargs.get(key) is not None and kwargs[key] != effective:
-                        raise ValueError(f"{key} conflicts with the render configuration")
+                        raise ValueError(f"{key} requested={kwargs[key]!r} effective={effective!r}")
                     kwargs[key] = effective
-                if kwargs.get("kv_hash_algo") != facade.hash_algorithm:
-                    raise ValueError("kv_hash_algo conflicts with the render configuration")
-                if kwargs.get("kv_hash_seed", 0) != facade.hash_seed:
-                    raise ValueError("kv_hash_seed conflicts with the render configuration")
+                for key, effective in (("kv_hash_algo", facade.hash_algorithm),
+                                       ("kv_hash_seed", facade.hash_seed)):
+                    requested = kwargs.get(key)
+                    if not facade.worker_capabilities and requested is None:
+                        requested = 0 if key == "kv_hash_seed" else None
+                    if requested is not None and requested != effective:
+                        raise ValueError(f"{key} requested={requested!r} effective={effective!r}")
+                    if key == "kv_hash_algo" and requested is None and not facade.worker_capabilities:
+                        raise ValueError("kv_hash_algo conflicts with the render configuration")
+                    kwargs[key] = effective
                 kwargs["kv_tokenizer_path"] = facade.tokenizer_path
                 self._render_facade = facade
             elif render_config is not None:
@@ -153,6 +169,8 @@ class Router:
                 kwargs.pop("kv_model", None)
             if kwargs.get("kv_block_size") is None:
                 kwargs.pop("kv_block_size", None)
+            if kwargs.get("kv_hash_seed") is None:
+                kwargs.pop("kv_hash_seed", None)
             self._router = _Router(**kwargs)
 
     @staticmethod
@@ -194,9 +212,14 @@ class Router:
             raise RuntimeError("a render-backed Router cannot be restarted after shutdown")
         self._render_started = True
         facade = self._render_facade
+        capability_args = {}
+        if self._capability_cohort is not None:
+            import json
+            capability_args["kv_capabilities_json"] = json.dumps(self._capability_cohort)
         self._router.start(
             render_facade=facade,
             render_contract_id=facade.contract_id,
             render_contract_epoch=facade.epoch,
             render_limits=facade.limits,
+            **capability_args,
         )

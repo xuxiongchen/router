@@ -158,6 +158,19 @@ impl KVBlockIndex {
             .contains(worker)
             .then(|| state.generations[worker])
     }
+
+    /// Publish an external lifecycle consequence only while the observed
+    /// generation remains current. The callback MUST NOT call this index: the
+    /// read guard deliberately prevents concurrent replacement/retirement.
+    pub(crate) fn with_current_generation<T>(
+        &self,
+        worker: &str,
+        expected_generation: u64,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let state = self.state.read();
+        is_current(&state, worker, expected_generation).then(action)
+    }
 }
 
 fn is_current(state: &IndexState, worker: &str, generation: u64) -> bool {
@@ -329,5 +342,23 @@ mod tests {
         index.begin_worker("w0");
         assert!(!index.apply_batch("w0", generation, &events));
         assert_eq!(index.ownership_count(), 0);
+    }
+
+    #[test]
+    fn kv_capability_stale_metadata_cannot_publish_lifecycle_consequences() {
+        let index = KVBlockIndex::new(4);
+        let old = index.begin_worker("w");
+        let current = index.roll_worker("w", old).unwrap();
+        let mut invalidated = false;
+        assert_eq!(
+            index.with_current_generation("w", old, || invalidated = true),
+            None
+        );
+        assert!(!invalidated);
+        assert_eq!(
+            index.with_current_generation("w", current, || invalidated = true),
+            Some(())
+        );
+        assert!(invalidated);
     }
 }

@@ -22,8 +22,10 @@ import os
 from pathlib import Path
 import re
 import threading
+import time
 from types import SimpleNamespace
 from urllib.parse import urlsplit
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
@@ -220,7 +222,7 @@ class _CaptureRenderer:
         return result
 
 
-def _load_runtime(argv):
+def _load_runtime(argv, *, worker_capabilities=False):
     """vLLM 0.29's launchers/render/entry.py and app_state.py, without HTTP.
 
     The same official CLI parser resolves defaults; the same EngineArgs builds
@@ -253,7 +255,8 @@ def _load_runtime(argv):
     _validate_template_determinism(Path(args.tokenizer or args.model))
     model_config = AsyncEngineArgs.from_cli_args(args).create_model_config()
     _require(not model_config.trust_remote_code, "remote_code_not_supported")
-    _validate_layout(model_config.hf_config.to_dict())
+    if not worker_capabilities:
+        _validate_layout(model_config.hf_config.to_dict())
     model_config.quantization = None
     config = VllmConfig(model_config=model_config)
     renderer = renderer_from_config(config)
@@ -306,6 +309,8 @@ def _request_cache_reason(request, raw_object, kind):
         return "unknown_request_fields"
     if any(raw_object.get(k) is not None for k in _UNSAFE_REQUEST_KEYS):
         return "unsupported_cache_identity"
+    if raw_object.get("skip_reading_prefix_cache"):
+        return "prefix_cache_read_disabled"
     if raw_object.get("use_beam_search"):
         # Generation supports beams, the official Chat Render API does not.
         return "beam_render_not_supported"
@@ -336,7 +341,7 @@ class RenderFacade:
         config = _read_json(self._config_path)
         _require(isinstance(config, dict) and not set(config) - {
             "serving_args", "worker_urls", "cache_layout", "bridge_limits",
-            "worker_api_key_env", "conformance_timeout_seconds",
+            "worker_api_key_env", "conformance_timeout_seconds", "kv_capabilities",
         }, "unsupported_render_configuration")
         self._argv = config.get("serving_args")
         options = _serving_options(self._argv)
@@ -350,19 +355,25 @@ class RenderFacade:
                  "nondeterministic_tokenizer")
         self.model = options["--served-model-name"]
         self.tokenizer_path = str(tokenizer_dir / "tokenizer.json")
-        _validate_layout(_read_json(model_dir / "config.json"))
-        layout = config.get("cache_layout", {})
-        _require(isinstance(layout, dict) and set(layout) == {
-            "kind", "block_size", "hash_algorithm", "hash_seed"
-        }, "invalid_cache_layout_contract")
-        _require(layout["kind"] == _LAYOUT
-                 and layout["hash_algorithm"] == "sha256_cbor"
-                 and type(layout["hash_seed"]) is int and 0 <= layout["hash_seed"] < 2**32
-                 and type(layout["block_size"]) is int and layout["block_size"] > 0,
-                 "unsupported_cache_layout_contract")
-        self.block_size = layout["block_size"]
-        self.hash_algorithm = layout["hash_algorithm"]
-        self.hash_seed = layout["hash_seed"]
+        self.worker_capabilities = config.get("kv_capabilities") == "worker"
+        _require(config.get("kv_capabilities") in (None, "worker"),
+                 "unsupported_capability_source")
+        _require(not self.worker_capabilities or "cache_layout" not in config,
+                 "automatic_capabilities_conflict_with_manual_layout")
+        if not self.worker_capabilities:
+            _validate_layout(_read_json(model_dir / "config.json"))
+            layout = config.get("cache_layout", {})
+            _require(isinstance(layout, dict) and set(layout) == {
+                "kind", "block_size", "hash_algorithm", "hash_seed"
+            }, "invalid_cache_layout_contract")
+            _require(layout["kind"] == _LAYOUT
+                     and layout["hash_algorithm"] == "sha256_cbor"
+                     and type(layout["hash_seed"]) is int and 0 <= layout["hash_seed"] < 2**32
+                     and type(layout["block_size"]) is int and layout["block_size"] > 0,
+                     "unsupported_cache_layout_contract")
+            self.block_size = layout["block_size"]
+            self.hash_algorithm = layout["hash_algorithm"]
+            self.hash_seed = layout["hash_seed"]
         urls = config.get("worker_urls")
         _require(isinstance(urls, list) and urls and all(isinstance(u, str) for u in urls),
                  "missing_conformance_workers")
@@ -385,8 +396,21 @@ class RenderFacade:
         _require(type(self._timeout) in (int, float) and 0 < self._timeout <= 60,
                  "invalid_conformance_timeout")
         self._api_key_env = config.get("worker_api_key_env")
-        _require(self._api_key_env is None or isinstance(self._api_key_env, str),
+        _require(self._api_key_env is None or (isinstance(self._api_key_env, str)
+                 and re.fullmatch(r"[A-Za-z0-9_]{1,256}", self._api_key_env) is not None),
                  "invalid_worker_api_key_env")
+        self.capability_cohort = None
+        if self.worker_capabilities:
+            descriptors = {worker: _remote_capabilities(worker, self._timeout, self._api_key_env)
+                           for worker in self.worker_urls}
+            contracts = [_capability_contract(value, self.model) for value in descriptors.values()]
+            _require(all(value == contracts[0] for value in contracts),
+                     "incompatible_worker_capability_cohort")
+            effective = next(iter(descriptors.values()))["hash"]
+            self.block_size = effective["block_tokens"]
+            self.hash_algorithm = effective["algorithm"]
+            self.hash_seed = effective["seed"]
+            self.capability_cohort = {"workers": descriptors, "api_key_env": self._api_key_env}
         self._asset_directories = (model_dir, tokenizer_dir)
         self._paths = [self._config_path, *_asset_files(model_dir, tokenizer_dir)]
         assets = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in self._paths}
@@ -399,6 +423,8 @@ class RenderFacade:
                          "nondeterministic_template")
         identity = {"adapter": 1, "vllm": VLLM_VERSION, "configuration": config,
                     "assets": assets}
+        if self.capability_cohort:
+            identity["capabilities"] = contracts[0]
         self.contract_id = hashlib.sha256(json.dumps(
             identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode()).hexdigest()
@@ -466,9 +492,20 @@ class RenderFacade:
 
     async def _initialize(self):
         # Official app initialization runs within a live event loop, too.
-        self._runtime = _load_runtime(self._argv)
+        self._runtime = (_load_runtime(self._argv, worker_capabilities=True)
+                         if self.worker_capabilities else _load_runtime(self._argv))
         self.effective_config = self._runtime.effective
         await self._verify_workers()
+        if self.capability_cohort:
+            # Fence a Worker replacement during token conformance. This is a
+            # control-plane read, never a request-time metadata/render call.
+            for worker, before in self.capability_cohort["workers"].items():
+                after = _remote_capabilities(worker, self._timeout, self._api_key_env)
+                _require(_capability_contract(after, self.model)
+                         == _capability_contract(before, self.model)
+                         and after["events"]["epoch"] == before["events"]["epoch"]
+                         and after["events"]["topic"] == before["events"]["topic"],
+                         "worker_changed_during_conformance")
 
     async def _render(self, kind, raw):
         runtime = self._runtime
@@ -580,6 +617,112 @@ class RenderFacade:
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise RenderConfigurationError("conformance_redirect_refused")
+
+
+def _remote_capabilities(worker, timeout, api_key_env):
+    """Proposed linked Worker export, NOT a stock vLLM 0.29 endpoint."""
+    headers = {}
+    if api_key_env:
+        key = os.environ.get(api_key_env)
+        _require(bool(key), "missing_worker_api_key")
+        headers["Authorization"] = "Bearer " + key
+    request = Request(worker + "/v1/kv-cache/capabilities", headers=headers, method="GET")
+    try:
+        deadline = time.monotonic() + timeout
+        with build_opener(_NoRedirect()).open(request, timeout=timeout) as response:
+            chunks, size = [], 0
+            while True:
+                # read1 performs at most one underlying read. Check wall time
+                # between reads, bounding trickled bodies as well as their size.
+                _require(time.monotonic() < deadline, "capabilities_read_deadline")
+                part = response.read1(min(8192, 65_537 - size))
+                if not part:
+                    break
+                size += len(part)
+                _require(size <= 65_536, "capabilities_response_too_large")
+                chunks.append(part)
+            payload = b"".join(chunks)
+        return json.loads(payload, object_pairs_hook=_config_object)
+    except HTTPError as exc:
+        code = {404: "capabilities_endpoint_unavailable", 409: "worker_mechanism_unsupported",
+                401: "capabilities_authentication_failed", 403: "capabilities_authentication_failed"}
+        raise RenderConfigurationError(code.get(exc.code, "capabilities_http_error")) from None
+    except (URLError, TimeoutError, OSError):
+        raise RenderConfigurationError("capabilities_endpoint_unavailable") from None
+    except (UnicodeError, ValueError):
+        raise RenderConfigurationError("invalid_worker_capabilities") from None
+
+
+def _capability_contract(value, model):
+    """Startup validation; Rust independently checks the wire and endpoint binding.
+
+    Only declared semantic fields participate in compatibility. Unknown optional
+    extensions neither grant support nor split a compatible static cohort.
+    """
+    try:
+        _require(type(value["schema_version"]) is int and value["schema_version"] == 1
+                 and value["vllm_version"].split("+")[0] == VLLM_VERSION
+                 and value["mechanism"] == "normal_full_attention"
+                 and type(value["mechanism_version"]) is int and value["mechanism_version"] == 1,
+                 "unsupported_worker_capability_semantics")
+        namespace = {key: value["namespace"][key] for key in (
+            "model", "served_model_names", "revision", "dtype", "quantization",
+            "cache_dtype", "weight_version")}
+        _require(isinstance(namespace["served_model_names"], list)
+                 and namespace["served_model_names"] == [model]
+                 and all(isinstance(namespace[key], str) and namespace[key]
+                         for key in ("model", "dtype", "cache_dtype", "weight_version"))
+                 and (namespace["revision"] is None or isinstance(namespace["revision"], str))
+                 and namespace["quantization"] is None, "invalid_worker_namespace")
+        groups = value["groups"]
+        _require(isinstance(groups, list) and len(groups) == 1, "incomplete_worker_group_inventory")
+        group = {key: groups[0][key] for key in (
+            "group_id", "kind", "layer_count", "allocation_block_tokens", "effective_block_tokens")}
+        hashes = {key: value["hash"][key] for key in (
+            "algorithm", "width_bytes", "representation", "seed", "root_hex", "extra_keys", "block_tokens")}
+        reuse = {key: value["reuse"][key] for key in ("alignment_tokens", "terminal_recompute_tokens")}
+        block = hashes["block_tokens"]
+        _require(type(block) is int and 0 < block <= 65_536
+                 and type(group["group_id"]) is int and group["group_id"] == 0
+                 and group["kind"] == "full_attention"
+                 and type(group["layer_count"]) is int and 0 < group["layer_count"] <= 1_000_000
+                 and all(type(v) is int and v == block for v in (
+                     group["allocation_block_tokens"], group["effective_block_tokens"], reuse["alignment_tokens"]))
+                 and type(reuse["terminal_recompute_tokens"]) is int
+                 and reuse["terminal_recompute_tokens"] == 1,
+                 "unsupported_worker_block_units")
+        seed = hashes["seed"]
+        _require(hashes["algorithm"] == "sha256_cbor" and type(hashes["width_bytes"]) is int
+                 and hashes["width_bytes"] == 32 and hashes["representation"] == "bytes"
+                 and hashes["extra_keys"] == "none" and type(seed) is int and 0 <= seed < 2**32,
+                 "unsupported_worker_hash_domain")
+        # Canonical CBOR text length is <=10 for the supported unsigned seed.
+        text = str(seed).encode("ascii")
+        _require(hashes["root_hex"] == hashlib.sha256(bytes([0x60 + len(text)]) + text).hexdigest(),
+                 "worker_hash_root_mismatch")
+        execution = {key: value["execution"][key] for key in (
+            "mode", "dp", "tp", "pp", "dcp", "pcp", "prefix_caching", "speculation", "connector", "offload")}
+        _require(execution["mode"] == "normal" and execution["prefix_caching"] is True
+                 and all(type(execution[key]) is int and execution[key] == 1
+                         for key in ("dp", "tp", "pp", "dcp", "pcp"))
+                 and all(execution[key] is False for key in ("speculation", "connector", "offload")),
+                 "unsupported_worker_execution")
+        events = value["events"]
+        _require(events["publisher"] == "zmq" and isinstance(events["epoch"], str)
+                 and re.fullmatch("[0-9a-f]{32}", events["epoch"]) is not None
+                 and isinstance(events["topic"], str) and len(events["topic"].encode()) <= 512
+                 and events["topic"].endswith("." + events["epoch"])
+                 and events["sequence"] == "u64_be_monotonic_per_epoch"
+                 and events["payload"] == "vllm_kv_events_v1"
+                 and type(events["dp_rank"]) is int and events["dp_rank"] == 0
+                 and type(events["next_sequence"]) is int and 0 <= events["next_sequence"] < 2**64
+                 and all(isinstance(events[key], str) and events[key].startswith("tcp://")
+                         for key in ("configured_endpoint", "resolved_endpoint")),
+                 "unsupported_worker_event_source")
+        return {"namespace": namespace, "groups": [group], "hash": hashes,
+                "reuse": reuse, "execution": execution}
+    except (KeyError, TypeError, AttributeError, IndexError):
+        raise RenderConfigurationError("invalid_worker_capabilities") from None
 
 
 def _remote_render(worker, kind, raw, timeout, api_key_env):

@@ -1,0 +1,2 @@
+# Unified diff context lines intentionally contain a single leading space.
+docs/dependencies/vllm-0.29-kv-capabilities.patch -whitespace

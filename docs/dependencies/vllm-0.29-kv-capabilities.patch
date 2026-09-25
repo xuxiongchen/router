@@ -1,0 +1,554 @@
+diff --git a/vllm/config/kv_events.py b/vllm/config/kv_events.py
+index d618bc9..da456db 100644
+--- a/vllm/config/kv_events.py
++++ b/vllm/config/kv_events.py
+@@ -47,6 +47,12 @@ class KVEventsConfig:
+     this topic to receive events.
+     """
+ 
++    enable_capabilities: bool = False
++    """Opt in to the proposed fixed read-only KV capabilities export and
++    boot-unique ZMQ topic. Requires full Worker restart when changed. This
++    experimental v1 protocol is not a cache inventory or replay guarantee.
++    """
++
+     def __post_init__(self):
+         if self.publisher is None:
+             self.publisher = "zmq" if self.enable_kv_cache_events else "null"
+diff --git a/vllm/distributed/kv_events.py b/vllm/distributed/kv_events.py
+index f55c563..f5881bf 100644
+--- a/vllm/distributed/kv_events.py
++++ b/vllm/distributed/kv_events.py
+@@ -4,6 +4,7 @@
+ import queue
+ import threading
+ import time
++import uuid
+ from abc import ABC, abstractmethod
+ from collections import Counter, deque
+ from collections.abc import Callable
+@@ -330,6 +331,7 @@ class ZmqEventPublisher(EventPublisher):
+         hwm: int = 100_000,
+         max_queue_size: int = 100_000,
+         topic: str = "",
++        enable_capabilities: bool = False,
+     ) -> None:
+         # Storage
+         super().__init__(data_parallel_rank)
+@@ -342,6 +344,13 @@ class ZmqEventPublisher(EventPublisher):
+         self._replay: zmq.Socket | None = None
+         self._dp_rank = data_parallel_rank
+ 
++        self._capability_lock = threading.Lock()
++        self._capability_next_sequence = 0
++        self._capability_epoch = uuid.uuid4().hex if enable_capabilities else None
++        self._resolved_endpoint: str | None = None
++        if self._capability_epoch is not None:
++            topic = f"{topic}.{self._capability_epoch}"
++
+         self._endpoint = self.offset_endpoint_port(endpoint, self._dp_rank)
+         self._replay_endpoint = self.offset_endpoint_port(
+             replay_endpoint, self._dp_rank
+@@ -356,6 +365,7 @@ class ZmqEventPublisher(EventPublisher):
+             hwm=hwm,
+             max_queue_size=max_queue_size,
+             topic=topic,
++            enable_capabilities=enable_capabilities,
+         )
+         self._hwm = hwm
+         self._socket_setup()
+@@ -376,6 +386,23 @@ class ZmqEventPublisher(EventPublisher):
+     def get_publisher_config(self) -> KVEventsConfig:
+         return self._publisher_config
+ 
++    def get_capability_binding(self) -> dict[str, Any]:
++        """Snapshot wire identity/watermark, never the cache or queue contents."""
++        with self._capability_lock:
++            if self._capability_epoch is None or not self._running:
++                raise ValueError("capability publisher is not active")
++            return {
++                "publisher": "zmq",
++                "epoch": self._capability_epoch,
++                "topic": self._topic_bytes.decode("utf-8"),
++                "configured_endpoint": self._endpoint,
++                "resolved_endpoint": self._resolved_endpoint,
++                "dp_rank": self._dp_rank,
++                "sequence": "u64_be_monotonic_per_epoch",
++                "next_sequence": self._capability_next_sequence,
++                "payload": "vllm_kv_events_v1",
++            }
++
+     def publish(self, events: EventBatch) -> None:
+         if not self._running:
+             raise RuntimeError("Publisher is closed")
+@@ -432,6 +459,10 @@ class ZmqEventPublisher(EventPublisher):
+                 self._pub.bind(self._endpoint)
+             elif self._endpoint is not None:
+                 self._pub.connect(self._endpoint)
++            # Capture while this thread owns setup; metadata must not access
++            # the socket from the EngineCore thread after publishing begins.
++            if self._capability_epoch is not None:
++                self._resolved_endpoint = self._pub.getsockopt_string(zmq.LAST_ENDPOINT)
+ 
+         # Set up replay socket: use ROUTER
+         # 1) handles multiple REQ clients (identities)
+@@ -464,7 +495,12 @@ class ZmqEventPublisher(EventPublisher):
+                 continue
+ 
+             try:
+-                seq = next(self._seq_gen)
++                if self._capability_epoch is None:
++                    seq = next(self._seq_gen)
++                else:
++                    with self._capability_lock:
++                        seq = next(self._seq_gen)
++                        self._capability_next_sequence = seq + 1
+ 
+                 payload = self._pack.encode(event)
+                 seq_bytes = seq.to_bytes(8, "big")
+@@ -560,8 +596,13 @@ class EventPublisherFactory:
+ 
+         kind = config_dict.pop("publisher")
+         config_dict.pop("enable_kv_cache_events")
++        enable_capabilities = config_dict.pop("enable_capabilities")
+         try:
+             constructor = cls._registry[kind]
+         except KeyError as exc:
+             raise ValueError(f"Unknown event publisher '{kind}'") from exc
++        if enable_capabilities:
++            if constructor is not ZmqEventPublisher:
++                raise ValueError("capabilities require the stock ZMQ publisher")
++            config_dict["enable_capabilities"] = True
+         return constructor(data_parallel_rank=data_parallel_rank, **config_dict)
+diff --git a/vllm/engine/protocol.py b/vllm/engine/protocol.py
+index 63f6970..41e33b0 100644
+--- a/vllm/engine/protocol.py
++++ b/vllm/engine/protocol.py
+@@ -243,6 +243,10 @@ class EngineClient(ABC):
+         """Scale the engine"""
+         raise NotImplementedError
+ 
++    async def get_kv_cache_capabilities(self) -> dict[str, Any]:
++        """Return the proposed fixed KV reuse descriptor when enabled."""
++        raise NotImplementedError
++
+     async def collective_rpc(
+         self,
+         method: str,
+diff --git a/vllm/entrypoints/serve/__init__.py b/vllm/entrypoints/serve/__init__.py
+index c358b9a..3c3aec0 100644
+--- a/vllm/entrypoints/serve/__init__.py
++++ b/vllm/entrypoints/serve/__init__.py
+@@ -39,6 +39,10 @@ def register_vllm_serve_api_routers(app: FastAPI):
+ 
+     attach_tokenize_router(app)
+ 
++    from .kv_capabilities.api_router import attach_router as attach_capabilities_router
++
++    attach_capabilities_router(app)
++
+ 
+ def register_vllm_dev_api_routers(app: FastAPI):
+     logger.warning(
+diff --git a/vllm/entrypoints/serve/kv_capabilities/__init__.py b/vllm/entrypoints/serve/kv_capabilities/__init__.py
+new file mode 100644
+index 0000000..208f01a
+--- /dev/null
++++ b/vllm/entrypoints/serve/kv_capabilities/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/entrypoints/serve/kv_capabilities/api_router.py b/vllm/entrypoints/serve/kv_capabilities/api_router.py
+new file mode 100644
+index 0000000..ba73bc7
+--- /dev/null
++++ b/vllm/entrypoints/serve/kv_capabilities/api_router.py
+@@ -0,0 +1,34 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Proposed fixed control-plane API, not an arbitrary utility-RPC proxy."""
++
++import asyncio
++
++from fastapi import APIRouter, FastAPI, Request
++from fastapi.responses import JSONResponse
++
++router = APIRouter()
++
++
++@router.get("/v1/kv-cache/capabilities", include_in_schema=False)
++async def get_kv_cache_capabilities(request: Request):
++    config = request.app.state.vllm_config.kv_events_config
++    if config is None or not config.enable_capabilities:
++        return JSONResponse({"error": "capability export is disabled"}, status_code=404)
++    try:
++        result = await asyncio.wait_for(
++            request.app.state.engine_client.get_kv_cache_capabilities(), timeout=5.0
++        )
++    except TimeoutError:
++        # The deadline abandons this HTTP response, not the engine operation.
++        return JSONResponse({"error": "capability export timed out"}, status_code=503)
++    except NotImplementedError:
++        return JSONResponse({"error": "unsupported engine client"}, status_code=409)
++    if "unsupported" in result:
++        return JSONResponse(result, status_code=409)
++    return JSONResponse(result)
++
++
++def attach_router(app: FastAPI):
++    # /v1 is covered by the existing bearer middleware when API keys are set.
++    app.include_router(router)
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 0a7263e..66a923a 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -1082,6 +1082,9 @@ class AsyncLLM(EngineClient):
+         """Prevent an adapter from being evicted."""
+         return await self.engine_core.pin_lora_async(lora_id)
+ 
++    async def get_kv_cache_capabilities(self) -> dict[str, Any]:
++        return await self.engine_core.call_utility_async("get_kv_cache_capabilities")
++
+     async def collective_rpc(
+         self,
+         method: str,
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index c734e67..a68bff9 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -329,6 +329,19 @@ class EngineCore:
+         if max_model_len_after != max_model_len_before:
+             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
+ 
++        if (
++            vllm_config.kv_events_config is not None
++            and vllm_config.kv_events_config.enable_capabilities
++        ):
++            # Scheduler normalization replaces UniformTypeKVCacheSpecs by its
++            # first member. Retain the complete initialized worker inventory
++            # for the opt-in capability adapter, before that information loss.
++            self._kv_capability_source_groups = tuple(
++                tuple(
++                    (tuple(g.layer_names), g.kv_cache_spec) for g in cfg.kv_cache_groups
++                )
++                for cfg in kv_cache_configs
++            )
+         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
+         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
+@@ -430,6 +443,12 @@ class EngineCore:
+             supported_pooling_tasks,
+         )
+ 
++    def get_kv_cache_capabilities(self) -> dict[str, Any]:
++        """Fixed initialized-runtime export; no allocator or cache mutations."""
++        from vllm.v1.engine.kv_capabilities import export_kv_cache_capabilities
++
++        return export_kv_cache_capabilities(self)
++
+     def get_kv_cache_group_metadata(self) -> list[dict[str, int | str | None]]:
+         """Return msgspec-serializable metadata for scheduler KV cache groups."""
+         kv_cache_config = getattr(self.scheduler, "kv_cache_config", None)
+diff --git a/vllm/v1/engine/kv_capabilities.py b/vllm/v1/engine/kv_capabilities.py
+new file mode 100644
+index 0000000..5239dcb
+--- /dev/null
++++ b/vllm/v1/engine/kv_capabilities.py
+@@ -0,0 +1,297 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Proposed v1 capability adapter for an initialized, static, local Dense cache.
++
++This is deliberately not a model catalogue. Unsupported effective mechanisms
++are denied. Online model/config/weight mutations require full Worker and Router
++restart; a publisher boot epoch is not an online mutation detector.
++"""
++
++import inspect
++from typing import Any
++
++
++class UnsupportedCapability(ValueError):
++    pass
++
++
++def _require(condition: bool, reason: str) -> None:
++    if not condition:
++        raise UnsupportedCapability(reason)
++
++
++def export_kv_cache_capabilities(engine: Any) -> dict[str, Any]:
++    """Return serializable effective facts or an explicit unsupported result.
++
++    Never scans cached blocks, calls hit lookup, or mutates allocator/LRU state.
++    The utility RPC preserves this result shape across process boundaries.
++    """
++    try:
++        return _export(engine)
++    except (UnsupportedCapability, AttributeError, TypeError, ValueError):
++        # Do not expose paths/config contents through exception messages.
++        return {"unsupported": "effective runtime is outside normal_full_attention v1"}
++
++
++def _export(engine: Any) -> dict[str, Any]:
++    # Lazy imports avoid the EngineCore/Scheduler import cycle. Identity checks
++    # intentionally do not grant custom classes their base class's semantics.
++    from vllm import envs
++    from vllm.distributed.kv_events import ZmqEventPublisher
++    from vllm.utils.hashing import sha256_cbor
++    from vllm.v1.core import kv_cache_utils
++    from vllm.v1.core.kv_cache_coordinator import UnitaryKVCacheCoordinator
++    from vllm.v1.core.kv_cache_manager import KVCacheManager
++    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
++    from vllm.v1.core.sched.scheduler import Scheduler
++    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
++    from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
++    from vllm.version import __version__
++
++    _require(__version__.split("+")[0] == "0.29.0", "unsupported package API")
++    config = engine.vllm_config
++    _require(config.kv_events_config.enable_capabilities, "disabled")
++    scheduler = engine.scheduler
++    _require(type(scheduler) in (Scheduler, AsyncScheduler), "unknown scheduler")
++    cache = scheduler.kv_cache_manager
++    _require(type(cache) is KVCacheManager, "unknown cache manager")
++    coordinator = cache.coordinator
++    _require(type(coordinator) is UnitaryKVCacheCoordinator, "unknown coordinator")
++    groups = scheduler.kv_cache_config.kv_cache_groups
++    metadata = engine.get_kv_cache_group_metadata()
++    _require(
++        len(groups) == len(metadata) == len(coordinator.single_type_managers) == 1,
++        "incomplete group inventory",
++    )
++    group = groups[0]
++    manager = coordinator.single_type_managers[0]
++    spec = group.kv_cache_spec
++    _require(type(manager) is FullAttentionManager, "unknown manager")
++    _require(type(spec) is FullAttentionSpec, "unknown spec")
++    _require(
++        manager.kv_cache_spec is spec and coordinator.kv_cache_spec is spec,
++        "contradictory spec",
++    )
++    _require(
++        group.layer_names and len(set(group.layer_names)) == len(group.layer_names),
++        "empty/incomplete layers",
++    )
++    _require(
++        not group.is_eagle_group
++        and spec.sliding_window is None
++        and spec.attention_chunk_size is None
++        and not spec.non_causal,
++        "non-ordinary attention",
++    )
++    _require(
++        metadata
++        == [
++            {
++                "group_idx": 0,
++                "kind": "full_attention",
++                "block_size": spec.block_size,
++                "sliding_window": None,
++            }
++        ],
++        "contradictory group export",
++    )
++    block = spec.block_size
++    # The scheduler config has discarded all but the first member of a uniform
++    # wrapper. Confirm every original worker leaf before granting semantics.
++    source_groups = engine._kv_capability_source_groups
++    _require(
++        len(source_groups) == 1 and len(source_groups[0]) == 1,
++        "incomplete worker inventory",
++    )
++    source_names, source_spec = source_groups[0][0]
++    _require(source_names == tuple(group.layer_names), "inconsistent worker layers")
++    if type(source_spec) is UniformTypeKVCacheSpecs:
++        _require(
++            set(source_spec.kv_cache_specs) == set(source_names),
++            "incomplete uniform inventory",
++        )
++        leaves = tuple(source_spec.kv_cache_specs.values())
++    else:
++        leaves = (source_spec,)
++    _require(
++        leaves
++        and all(
++            type(leaf) is FullAttentionSpec
++            and leaf.block_size == block
++            and leaf.sliding_window is None
++            and leaf.attention_chunk_size is None
++            and not leaf.non_causal
++            for leaf in leaves
++        ),
++        "unsupported hidden worker leaf",
++    )
++    units = (
++        manager.block_size,
++        manager.scheduler_block_size,
++        manager.cache_hit_alignment_tokens,
++        coordinator.block_size,
++        coordinator.scheduler_block_size,
++        scheduler.block_size,
++        scheduler.hash_block_size,
++        coordinator.block_pool.hash_block_size,
++    )
++    _require(
++        type(block) is int and 1 <= block <= 65536 and all(x == block for x in units),
++        "unsupported units",
++    )
++    _require(
++        manager.kv_cache_group_id == 0
++        and manager.block_pool is cache.block_pool
++        and coordinator.block_pool is cache.block_pool,
++        "inconsistent ownership",
++    )
++    _require(
++        cache.enable_caching
++        and coordinator.enable_caching
++        and manager.enable_caching
++        and config.cache_config.enable_prefix_caching
++        and cache.enable_kv_cache_events
++        and scheduler.enable_kv_cache_events,
++        "cache/events disabled",
++    )
++    _require(
++        not cache.use_eagle
++        and not coordinator.eagle_group_ids
++        and not manager.use_eagle
++        and not scheduler.use_eagle
++        and scheduler.num_prefill_lookahead == 0
++        and coordinator.num_reprefillable_tokens == 0
++        and not engine.use_spec_decode
++        and config.speculative_config is None,
++        "speculation",
++    )
++    parallel = config.parallel_config
++    parallel_sizes = (
++        parallel.data_parallel_size,
++        parallel.tensor_parallel_size,
++        parallel.pipeline_parallel_size,
++        parallel.decode_context_parallel_size,
++        parallel.prefill_context_parallel_size,
++        manager.dcp_world_size,
++        manager.pcp_world_size,
++        scheduler.dcp_world_size,
++        scheduler.pcp_world_size,
++    )
++    _require(
++        all(x == 1 for x in parallel_sizes) and parallel.data_parallel_index == 0,
++        "parallel execution",
++    )
++    _require(
++        scheduler.connector is None
++        and scheduler.ec_connector is None
++        and config.kv_transfer_config is None
++        and config.ec_transfer_config is None
++        and config.cache_config.kv_offloading_size in (None, 0),
++        "transfer/offload",
++    )
++    _require(
++        config.offload_config.uva.cpu_offload_gb == 0
++        and config.offload_config.prefetch.offload_group_size == 0,
++        "weight offload",
++    )
++    model = config.model_config
++    _require(
++        model.runner_type == "generate"
++        and not model.is_encoder_decoder
++        and not model.is_diffusion
++        and model.multimodal_config is None
++        and config.lora_config is None
++        and config.weight_transfer_config is None
++        and engine._weight_version == "default",
++        "non-static text serving",
++    )
++    _require(
++        config.cache_config.prefix_caching_hash_algo == "sha256_cbor"
++        and not envs.VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES,
++        "hash representation",
++    )
++    seed_text = kv_cache_utils.get_none_hash_seed()
++    _require(
++        seed_text.isascii()
++        and seed_text.isdecimal()
++        and str(int(seed_text)) == seed_text
++        and 0 <= int(seed_text) <= 0xFFFFFFFF,
++        "unsupported hash seed",
++    )
++    root = kv_cache_utils.NONE_HASH
++    _require(
++        type(root) is bytes and len(root) == 32 and root == sha256_cbor(seed_text),
++        "root seed mismatch",
++    )
++    hasher = engine.request_block_hasher
++    _require(inspect.isfunction(hasher), "unknown hasher")
++    reference = kv_cache_utils.get_request_block_hasher(block, sha256_cbor)
++    closure = inspect.getclosurevars(hasher).nonlocals
++    _require(
++        hasher.__code__ is reference.__code__
++        and closure.get("caching_hash_fn") is sha256_cbor
++        and closure.get("hash_block_size") == block,
++        "unknown hasher",
++    )
++    publisher = scheduler.kv_event_publisher
++    _require(type(publisher) is ZmqEventPublisher, "unknown publisher")
++    binding = publisher.get_capability_binding()
++    _require(
++        binding["dp_rank"] == parallel.data_parallel_index, "publisher rank mismatch"
++    )
++    names = model.served_model_name or [model.model]
++    if isinstance(names, str):
++        names = [names]
++    _require(
++        names and all(type(x) is str and x for x in names), "empty served namespace"
++    )
++    return {
++        "schema_version": 1,
++        "vllm_version": __version__.split("+")[0],
++        "mechanism": "normal_full_attention",
++        "mechanism_version": 1,
++        "namespace": {
++            "model": model.model,
++            "served_model_names": names,
++            "revision": model.revision,
++            "dtype": str(model.dtype),
++            "quantization": model.quantization,
++            "cache_dtype": config.cache_config.cache_dtype,
++            "weight_version": engine._weight_version,
++        },
++        "groups": [
++            {
++                "group_id": 0,
++                "kind": "full_attention",
++                "layer_count": len(group.layer_names),
++                "allocation_block_tokens": block,
++                "effective_block_tokens": manager.block_size,
++            }
++        ],
++        "hash": {
++            "algorithm": "sha256_cbor",
++            "width_bytes": 32,
++            "representation": "bytes",
++            "seed": int(seed_text),
++            "root_hex": root.hex(),
++            "extra_keys": "none",
++            "block_tokens": scheduler.hash_block_size,
++        },
++        "reuse": {
++            "alignment_tokens": coordinator.block_size,
++            "terminal_recompute_tokens": 1,
++        },
++        "execution": {
++            "mode": "normal",
++            "dp": 1,
++            "tp": 1,
++            "pp": 1,
++            "dcp": 1,
++            "pcp": 1,
++            "prefix_caching": True,
++            "speculation": False,
++            "connector": False,
++            "offload": False,
++        },
++        "events": binding,
++    }

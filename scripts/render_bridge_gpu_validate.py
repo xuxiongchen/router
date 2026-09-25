@@ -19,9 +19,11 @@ import http.client
 import importlib.metadata
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import platform
+import random
 import signal
 import subprocess
 import sys
@@ -34,6 +36,14 @@ import kv_aware_cuda_validate as prior
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = "13b04aa2c3e811b9937abb3dbb3bd60f49a118c0"
+CAPABILITIES_BASE = "f0f02adb64a26d819b0e6e9e501a37b8a9d71f09"
+CAPABILITY_REFRESH_SECONDS = 30
+PATCHED_WORKER_FILES = (
+    "config/kv_events.py", "distributed/kv_events.py", "engine/protocol.py",
+    "v1/engine/core.py", "v1/engine/async_llm.py", "v1/engine/kv_capabilities.py",
+    "entrypoints/serve/__init__.py", "entrypoints/serve/kv_capabilities/__init__.py",
+    "entrypoints/serve/kv_capabilities/api_router.py",
+)
 
 
 def require(condition, message):
@@ -44,13 +54,14 @@ def save(path, value):
     prior.save(path, value)
 
 
-def source_identity(source, candidate):
+def source_identity(source, candidate, automatic_capabilities=False):
     source = Path(source).resolve()
     require(source == ROOT, "runner must belong to the candidate source")
     require(prior.command(["git", "rev-parse", "HEAD"], source) == candidate,
             "candidate SHA does not match source HEAD")
     require(not prior.command(["git", "status", "--porcelain"], source), "candidate source is dirty")
-    prior.command(["git", "merge-base", "--is-ancestor", BASE, candidate], source)
+    base = CAPABILITIES_BASE if automatic_capabilities else BASE
+    prior.command(["git", "merge-base", "--is-ancestor", base, candidate], source)
     return {"candidate_sha": candidate, "tree_sha": prior.command(
         ["git", "rev-parse", "HEAD^{tree}"], source), "source": str(source)}
 
@@ -110,7 +121,10 @@ def child(manifest_path):
     args = RouterArgs(
         host="127.0.0.1", port=config["router_port"], worker_urls=config["workers"],
         policy="kv_aware", kv_input_backend="vllm", kv_render_config=config["render_config"],
-        kv_hash_algo="sha256_cbor", kv_hash_seed=0, kv_events_topic_filter="kv",
+        # Automatic mode must obtain hash/unit defaults from actual Workers,
+        # and each verified subscriber obtains its epoch-bound exact topic.
+        **({"kv_events_topic_filter": ""} if config["automatic_capabilities"] else {
+            "kv_hash_algo": "sha256_cbor", "kv_hash_seed": 0, "kv_events_topic_filter": "kv"}),
         kv_events_endpoints=[worker + "=" + endpoint for worker, endpoint in
                              zip(config["workers"], config["event_endpoints"])],
         worker_startup_timeout_secs=180, worker_startup_check_interval=1,
@@ -141,6 +155,7 @@ def child(manifest_path):
                     "contract_id": facade.contract_id, "effective_config": facade.effective_config,
                     "startup_failure": facade.startup_failure,
                     "conformance": getattr(facade, "conformance", None),
+                    "capability_cohort": getattr(facade, "capability_cohort", None),
                     "python_module": str(Path(sys.modules[facade.__class__.__module__].__file__).resolve()),
                 })
 
@@ -191,6 +206,70 @@ def render_access_count(paths):
                 for line in Path(path).read_text(errors="replace").splitlines()) for path in paths]
 
 
+def metadata_access_count(paths):
+    return [sum('GET /v1/kv-cache/capabilities HTTP/' in line
+                for line in Path(path).read_text(errors="replace").splitlines()) for path in paths]
+
+
+def worker_capabilities(workers, model):
+    """Two bounded control-plane snapshots; never called by routed()."""
+    spec = importlib.util.spec_from_file_location(
+        "gpu_capability_bridge", ROOT / "py_src/vllm_router/render_bridge.py")
+    bridge = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bridge)
+    descriptors = {url: bridge._remote_capabilities(url, 10, None) for url in workers}
+    contracts = [bridge._capability_contract(value, model) for value in descriptors.values()]
+    require(contracts[0] == contracts[1], "Workers have incompatible actual capability contracts")
+    require(len({value["events"]["epoch"] for value in descriptors.values()}) == 2,
+            "independent Workers must have distinct publisher/engine epochs")
+    return descriptors
+
+
+def worker_source_evidence(root):
+    root = Path(root).resolve()
+    files = {name: prior.sha256(root / name) for name in PATCHED_WORKER_FILES}
+    return {"package_directory": str(root), "files_sha256": files,
+            "linked_proposal_sha256": prior.sha256(
+                ROOT / "docs/dependencies/vllm-0.29-kv-capabilities.patch"),
+            "classification": "ON_DISK_SOURCE_PROVENANCE_NOT_LOADED_PYTHON_MODULE_ATTESTATION",
+            "requires": "Record Worker interpreter/package locations at fresh authorized deployment; fully restart after patching. No installed-source allowlist is imposed."}
+
+
+def verify_dense_decision(decision, token_count, block_size, unsupported=False):
+    require(decision.get("score_kind") == "reusable_prefix_tokens",
+            "automatic capability policy did not enable Dense reuse scoring")
+    require(decision.get("query_tokens") == (0 if unsupported else token_count),
+            "decision N differs from actual prepared generation input")
+    for score in [decision, *decision["scores"]]:
+        matched = score.get("prefix_blocks")
+        reused = score.get("reusable_prefix_tokens")
+        require(type(matched) is int and matched >= 0 and type(reused) is int,
+                "missing separate stored/reusable score evidence")
+        expected = 0 if unsupported else block_size * min(
+            matched, max(token_count - 1, 0) // block_size)
+        require(reused == expected, "Dense reusable prediction differs from terminal-recompute rule")
+
+
+def boundary_lengths(block_size):
+    require(type(block_size) is int and 1 < block_size <= 512,
+            "finite boundary fixture supports block sizes 2..512")
+    return sorted({block_size - 1, block_size, block_size + 1,
+                   2 * block_size - 1, 2 * block_size, 2 * block_size + 1,
+                   464, 29 * block_size})
+
+
+def valid_fixture_vocabulary(serving_args):
+    option = "--tokenizer" if "--tokenizer" in serving_args else "--model"
+    root = Path(serving_args[serving_args.index(option) + 1])
+    tokenizer = json.loads((root / "tokenizer.json").read_text())
+    vocab = tokenizer["model"]["vocab"]
+    values = vocab.values() if isinstance(vocab, dict) else range(len(vocab))
+    special = {item["id"] for item in tokenizer.get("added_tokens", []) if item.get("special")}
+    values = sorted({value for value in values if type(value) is int and value >= 0} - special)
+    require(len(values) >= 256, "finite synthetic boundary corpus requires at least 256 ordinary token IDs")
+    return values
+
+
 def prefix_metrics(values):
     return {name: sum(value for (key, _), value in values.items() if key == name)
             for name, _ in values if "prefix_cache_" in name}
@@ -234,6 +313,7 @@ class Validation(prior.Validation):
         self.observations = out / "facade-observations.jsonl"
         self.model = args.model
         self.worker_logs = [args.worker0_log, args.worker1_log]
+        self.automatic_capabilities = args.automatic_capabilities
 
     def case(self, name, callback):
         require(time.monotonic() < self.args.deadline, "finite GPU matrix budget exhausted")
@@ -254,7 +334,7 @@ class Validation(prior.Validation):
         require(values[0] == values[1], "real Workers disagree on complete token IDs")
         return raw, values[0], route
 
-    def routed(self, name, payload, expected=None, unsupported=False):
+    def routed(self, name, payload, expected=None, unsupported=False, cold=False):
         self.idle()
         payload = {**payload, "return_token_ids": True}
         raw, tokens, route = self.oracle(payload, name)
@@ -263,6 +343,8 @@ class Validation(prior.Validation):
         before_prefix = [prefix_metrics(prior.metrics(worker)) for worker in self.workers]
         before_observation = len(read_observations(self.observations))
         before_access = render_access_count(self.worker_logs)
+        before_metadata = metadata_access_count(self.worker_logs)
+        request_started = time.monotonic()
         offset = Path(self.args.router_log).stat().st_size
         status, headers, body = raw_request(self.args.router, route, raw)
         (self.out / f"{name}.response.bin").write_bytes(body)
@@ -289,6 +371,8 @@ class Validation(prior.Validation):
         require(observed["raw_sha256"] == hashlib.sha256(raw).hexdigest(), "facade did not receive original bytes")
         scores = {item["worker"].rstrip("/"): item["prefix_blocks"] for item in decision["scores"]}
         require(set(scores) == set(self.workers), "decision lacks both worker scores")
+        if self.automatic_capabilities:
+            verify_dense_decision(decision, len(tokens), self.args.block_size, unsupported)
         if unsupported:
             require(observed["result"]["status"] == "unsupported", "cache salt was not rejected from exact path")
             require(decision["token_ids_sha256"] is None and all(score == 0 for score in scores.values()),
@@ -302,15 +386,37 @@ class Validation(prior.Validation):
             require(actual == expected and scores[self.workers[expected]] > 0
                     and scores[self.workers[1 - expected]] == 0,
                     "real-event positive ownership did not select the uniquely warmed Worker")
+            if self.automatic_capabilities:
+                require(decision["reusable_prefix_tokens"] > 0,
+                        "warmed-owner proof has stored coverage but zero reusable prefix")
         after_access = render_access_count(self.worker_logs)
         require(after_access == before_access, "generation unexpectedly used request-level Worker /render HTTP")
         after_prefix = [prefix_metrics(prior.metrics(worker)) for worker in self.workers]
         prefix_delta = [{key: after.get(key, 0) - before.get(key, 0) for key in set(before) | set(after)}
                         for before, after in zip(before_prefix, after_prefix)]
+        hits = prefix_delta[actual].get("vllm:prefix_cache_hits_total", 0)
+        queries = prefix_delta[actual].get("vllm:prefix_cache_queries_total", 0)
+        if self.automatic_capabilities and not unsupported:
+            require(queries == len(tokens) and 0 <= hits <= queries,
+                    "exclusive Worker hit/query metric delta does not match prepared input N")
+            require(decision["reusable_prefix_tokens"] <= hits,
+                    "Router reusable prediction exceeds actual backend cache reuse")
+        if cold:
+            require(all(score == 0 for score in scores.values()) and hits == 0,
+                    "fresh cold boundary unexpectedly had cache ownership or backend hits")
         if expected is not None:
             hits = prefix_delta[expected].get("vllm:prefix_cache_hits_total", 0)
             queries = prefix_delta[expected].get("vllm:prefix_cache_queries_total", 0)
             require(0 < hits <= queries, "positive routing lacks a valid backend prefix-cache token hit/query delta")
+        after_metadata = metadata_access_count(self.worker_logs)
+        elapsed = time.monotonic() - request_started
+        if self.automatic_capabilities:
+            # Periodic/revalidation control-plane reads may coincide with a
+            # request; do not misreport every observed access as per-request RPC.
+            budget = 2 + math.ceil(elapsed / CAPABILITY_REFRESH_SECONDS)
+            require(all(0 <= after - before <= budget for before, after in
+                        zip(before_metadata, after_metadata)),
+                    "unexpected metadata access burst during stable finite request")
         result = {"name": name, "status": "PASS", "actual_backend": actual,
                   "request": payload, "http_status": status, "response_sha256": hashlib.sha256(body).hexdigest(),
                   "decision": decision, "completed_request_deltas": delta,
@@ -322,7 +428,11 @@ class Validation(prior.Validation):
                       if value.get("vllm:prefix_cache_queries_total", 0) > 0 else None
                       for value in prefix_delta],
                   "worker_render_access_counts_before": before_access,
-                  "worker_render_access_counts_after": after_access}
+                  "worker_render_access_counts_after": after_access,
+                  "worker_metadata_access_counts_before": before_metadata,
+                  "worker_metadata_access_counts_after": after_metadata,
+                  "metadata_access_scope": "Includes allowed background control-plane refresh; CPU source/integration tests establish no request-path metadata call.",
+                  "reusable_prediction_scope": "Observed-subset lower bound, not complete cached inventory or guaranteed future work savings."}
         save(self.out / f"{name}.json", result)
         return result
 
@@ -364,6 +474,53 @@ class Validation(prior.Validation):
         return {"name": "salt_fairness", "status": "PASS", "backends": observed,
                 "scope": "four sequential idle unsupported requests; not general load-balancing performance"}
 
+    def dense_boundary(self, token_count, target):
+        """Separate fresh cold and direct-only-warmed prefixes; never reset KV."""
+        name = f"boundary-n{token_count}-w{target}"
+        rng = random.Random(uuid.uuid4().hex)
+        vocabulary = self.args.fixture_vocabulary
+        cold_ids = rng.choices(vocabulary, k=token_count)
+        warm_ids = rng.choices(vocabulary, k=token_count)
+        require(cold_ids != warm_ids, "boundary fixture prefixes must be independent")
+        base = {"model": self.model, "max_tokens": 1, "temperature": 0,
+                "add_special_tokens": False, "return_token_ids": True}
+        cold = self.routed(name + "-cold", {**base, "prompt": cold_ids}, cold=True)
+        payload = {**base, "prompt": warm_ids}
+        raw, tokens, route = self.oracle(payload, name + "-direct-warm")
+        require(tokens == warm_ids and len(tokens) == token_count,
+                "actual public preprocessing changed the exact boundary N")
+        self.idle()
+        before = self.counters()
+        status, _, body = raw_request(self.workers[target], route, raw)
+        require(status == 200 and generation_tokens(body, False, False) == warm_ids,
+                "direct boundary warm generation did not preserve exact input IDs")
+        actual, warm_delta = self.observed_backend(before)
+        require(actual == target, "boundary direct warm went to the wrong Worker")
+        time.sleep(self.args.event_wait)
+        reusable = self.args.block_size * ((token_count - 1) // self.args.block_size)
+        warm = self.routed(name + "-warm", payload, expected=target if reusable else None)
+        require(warm["actual_generation_token_ids"] == warm_ids,
+                "routed generation changed boundary input IDs")
+        raw_scores = {entry["worker"].rstrip("/"): entry["prefix_blocks"]
+                      for entry in warm["decision"]["scores"]}
+        require(raw_scores[self.workers[target]] == token_count // self.args.block_size
+                and raw_scores[self.workers[1 - target]] == 0,
+                "boundary needs the direct-warm complete stored coverage observed in real events")
+        require(warm["decision"]["reusable_prefix_tokens"] == reusable,
+                "boundary terminal recompute prediction mismatch")
+        hits = warm["prefix_cache_metric_deltas"][warm["actual_backend"]].get(
+            "vllm:prefix_cache_hits_total", 0)
+        require(hits == reusable, "controlled fully-warmed boundary hit count differs from prediction")
+        result = {"name": name, "status": "PASS", "query_tokens": token_count,
+                  "block_tokens": self.args.block_size, "direct_warm_target": target,
+                  "raw_matched_blocks_on_warm_owner": raw_scores[self.workers[target]],
+                  "predicted_reusable_tokens": reusable, "actual_hit_tokens": hits,
+                  "cold_result": cold["name"], "warm_result": warm["name"],
+                  "direct_warm_completed_request_deltas": warm_delta,
+                  "scope": "Cold and warm use separate fresh prefixes: a completed cold probe would itself populate cache. Warm prefix reaches only its explicit Worker before first Router dispatch."}
+        save(self.out / f"{name}.json", result)
+        return result
+
 
 def verify_workers(args, config):
     processes = [prior.process(pid) for pid in (args.worker0_pid, args.worker1_pid,
@@ -377,15 +534,30 @@ def verify_workers(args, config):
         require(flags.get("--data-parallel-size") == ["1"]
                 and flags.get("--tensor-parallel-size") == ["1"]
                 and flags.get("--pipeline-parallel-size") == ["1"], "expected explicit DP/TP/PP=1")
-        require(flags.get("--block-size") == ["16"]
+        descriptor = config.get("capabilities", {}).get(config["workers"][index])
+        block_size = descriptor["hash"]["block_tokens"] if descriptor else 16
+        seed = descriptor["hash"]["seed"] if descriptor else 0
+        require(flags.get("--block-size") == [str(block_size)]
                 and flags.get("--prefix-caching-hash-algo") == ["sha256_cbor"], "Worker hash contract mismatch")
-        require(env.get("PYTHONHASHSEED") == "0" and env.get("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES") == "0",
+        require(env.get("PYTHONHASHSEED") == str(seed) and env.get("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES") == "0",
                 "Worker hash seed/full-byte events mismatch")
         require(env.get("VLLM_SERVER_DEV_MODE") in (None, "0"), "development mode is not allowed")
         kv = json.loads(flags["--kv-events-config"][0])
         require(kv.get("enable_kv_cache_events") and kv.get("publisher") == "zmq"
-                and kv.get("endpoint") == config["publisher_endpoints"][index] and kv.get("topic") == "kv",
+                and kv.get("endpoint") == config["publisher_endpoints"][index],
                 "Worker publisher does not match declared Router event endpoint")
+        if descriptor:
+            events = descriptor["events"]
+            require(kv.get("enable_capabilities") is True,
+                    "Worker was not explicitly restarted with enable_capabilities=true")
+            require(events["configured_endpoint"] == kv["endpoint"]
+                    and events["topic"] == kv.get("topic", "") + "." + events["epoch"],
+                    "effective descriptor is not bound to configured publisher/epoch topic")
+            require(urllib.parse.urlsplit(events["resolved_endpoint"]).port
+                    == urllib.parse.urlsplit(config["event_endpoints"][index]).port,
+                    "resolved Worker publisher port differs from subscriber endpoint")
+        else:
+            require(kv.get("topic") == "kv", "legacy Worker topic must be kv")
         require(prior.vllm_publisher_mode(kv["endpoint"]) == "bind", "Worker publisher must bind")
         options = config["serving_args"]
         model_path = str(Path(options[options.index("--model") + 1]).resolve())
@@ -431,13 +603,17 @@ def run(args):
     args.deadline = time.monotonic() + args.budget_seconds
     try:
         require(platform.system() == "Linux", "run in the authorized GPU process /proc namespace")
-        identity = source_identity(args.source, args.candidate)
+        identity = source_identity(args.source, args.candidate, args.automatic_capabilities)
         native_hash = prior.sha256(args.native)
         build = json.loads(Path(args.build_manifest).read_text())
         require(build.get("status") == "PASS" and build.get("candidate_sha") == args.candidate
                 and build.get("native_sha256") == native_hash,
                 "native build manifest must bind exact candidate and actual .so SHA")
         deployment = json.loads(Path(args.render_config).read_text())
+        require((deployment.get("kv_capabilities") == "worker") == args.automatic_capabilities,
+                "--automatic-capabilities must agree with render configuration")
+        require(not deployment.get("worker_api_key_env"),
+                "finite GPU harness requires unauthenticated exclusive loopback Workers; authenticated route is CPU-tested separately")
         workers = [loopback_url(args.worker0), loopback_url(args.worker1)]
         require(deployment["worker_urls"] == workers and len(set(workers)) == 2, "deployment Worker URLs differ")
         config = {"native": str(Path(args.native).resolve()), "native_sha256": native_hash,
@@ -446,8 +622,17 @@ def run(args):
                   "router_port": args.router_port, "metrics_port": args.metrics_port,
                   "render_config": str(Path(args.render_config).resolve()),
                   "serving_args": deployment["serving_args"],
+                  "automatic_capabilities": args.automatic_capabilities,
                   "observations": str(out / "facade-observations.jsonl"),
                   "facade_identity": str(out / "facade-identity.json")}
+        if args.automatic_capabilities:
+            require(args.worker_vllm_root, "automatic evidence requires --worker-vllm-root")
+            config["capabilities"] = worker_capabilities(workers, args.model)
+            args.block_size = next(iter(config["capabilities"].values()))["hash"]["block_tokens"]
+            args.fixture_vocabulary = valid_fixture_vocabulary(config["serving_args"])
+            boundary_lengths(args.block_size)  # Reject unbounded fixture units before Router launch.
+            report["capabilities_before"] = config["capabilities"]
+            report["worker_source_provenance"] = worker_source_evidence(args.worker_vllm_root)
         worker_processes = verify_workers(args, config)
         report.update(identity, native_sha256=native_hash, native=str(Path(args.native).resolve()),
                       build_manifest_sha256=prior.sha256(args.build_manifest),
@@ -466,11 +651,22 @@ def run(args):
             report["mapped_native"] = mapped_native(process.pid, args.native)
             save(out / "summary.json", report)
             validation = Validation(args, out)
+            metadata_before = metadata_access_count(validation.worker_logs)
+            if args.automatic_capabilities:
+                require(all(value > 0 for value in metadata_before),
+                        "Worker access logs must expose actual startup metadata reads")
+            matrix_started = time.monotonic()
             # Reuse the public, independently reviewed shape corpus. This imports
             # definitions only; it never launches the CPU/mock render service.
             sys.path.insert(0, str(ROOT / "py_test"))
-            from test_render_bridge_vllm import actual_cases
-            for name, _, payload in actual_cases(args.model):
+            if args.automatic_capabilities:
+                sys.path.insert(0, str(ROOT))
+                from test_kv_capabilities_vllm import request_cases
+                shape_cases = request_cases(args.model)
+            else:
+                from test_render_bridge_vllm import actual_cases
+                shape_cases = actual_cases(args.model)
+            for name, _, payload in shape_cases:
                 validation.case("tokens-" + name, lambda name=name, payload=payload:
                                 validation.routed("tokens-" + name, payload))
             for kind in ("completion", "chat"):
@@ -479,12 +675,42 @@ def run(args):
                         name = f"positive-{kind}-w{target}-{'sse' if stream else 'json'}"
                         validation.case(name, lambda name=name, kind=kind, target=target, stream=stream:
                                         validation.positive(name, kind, target, stream))
+            if args.automatic_capabilities:
+                for index, token_count in enumerate(boundary_lengths(args.block_size)):
+                    validation.case(f"boundary-n{token_count}",
+                                    lambda token_count=token_count, target=index % 2:
+                                    validation.dense_boundary(token_count, target))
             validation.case("salt_fairness", validation.salt_fairness)
             # Existing helper has full first-record/active-before-close checks,
             # log/PID/ID correlation and no natural completion masquerading as abort.
             prior.MODEL = args.model
             validation.case("stream_cancel_cleanup", validation.cancel_cleanup)
             validation.idle()
+            if args.automatic_capabilities:
+                metadata_after = metadata_access_count(validation.worker_logs)
+                elapsed = time.monotonic() - matrix_started
+                allowed = 2 + math.ceil(elapsed / CAPABILITY_REFRESH_SECONDS)
+                require(all(0 <= after - before <= allowed for before, after in
+                            zip(metadata_before, metadata_after)),
+                        "metadata calls exceeded stable finite background-refresh budget")
+                report["metadata_access_audit"] = {
+                    "before": metadata_before, "after": metadata_after,
+                    "elapsed_seconds": elapsed, "allowed_delta_per_worker": allowed,
+                    "scope": "Observed HTTP access logs, allowing 30-second control-plane refresh and two revalidation calls. Not a zero-total-RPC assertion; no request-path call is established separately by CPU tests."}
+                after_capabilities = worker_capabilities(workers, args.model)
+                for url, before_descriptor in config["capabilities"].items():
+                    after_descriptor = after_capabilities[url]
+                    # Watermarks may advance as this matrix publishes events;
+                    # a replacement/contract change is not accepted mid-run.
+                    before_copy, after_copy = json.loads(json.dumps(before_descriptor)), json.loads(json.dumps(after_descriptor))
+                    before_copy["events"].pop("next_sequence")
+                    after_copy["events"].pop("next_sequence")
+                    require(before_copy == after_copy, "Worker capability/epoch changed during finite matrix")
+                    require(after_descriptor["events"]["next_sequence"] >= before_descriptor["events"]["next_sequence"],
+                            "Worker publisher watermark regressed")
+                report["capabilities_after"] = after_capabilities
+                require(worker_source_evidence(args.worker_vllm_root) == report["worker_source_provenance"],
+                        "on-disk Worker source changed during matrix")
             require(mapped_native(process.pid, args.native) == report["mapped_native"],
                     "mapped extension changed during validation")
             for before in worker_processes:
@@ -492,7 +718,8 @@ def run(args):
                             if key != "verified_preprocessing_arguments"}
                 require(prior.process(before["pid"]) == expected, "Worker process identity changed during matrix")
             report["cases"] = validation.results
-        require(source_identity(args.source, args.candidate) == identity, "source changed during validation")
+        require(source_identity(args.source, args.candidate, args.automatic_capabilities) == identity,
+                "source changed during validation")
         require(prior.sha256(args.native) == native_hash, "native artifact changed during validation")
         report["status"] = "PASS" if all(case["status"] == "PASS" for case in report["cases"]) else "FAIL"
     except (Exception, KeyboardInterrupt) as error:
@@ -527,7 +754,26 @@ def self_check():
         except RuntimeError:
             continue
         raise RuntimeError("invalid token evidence was accepted")
-    print("PASS render bridge GPU evidence parsers (11 checks; no hardware)")
+    dense = {"score_kind": "reusable_prefix_tokens", "query_tokens": 464,
+             "prefix_blocks": 29, "reusable_prefix_tokens": 448,
+             "scores": [{"prefix_blocks": 28, "reusable_prefix_tokens": 448},
+                        {"prefix_blocks": 29, "reusable_prefix_tokens": 448}]}
+    verify_dense_decision(dense, 464, 16)
+    short = {"score_kind": "reusable_prefix_tokens", "query_tokens": 16,
+             "prefix_blocks": 1, "reusable_prefix_tokens": 0,
+             "scores": [{"prefix_blocks": 1, "reusable_prefix_tokens": 0}]}
+    verify_dense_decision(short, 16, 16)
+    require(boundary_lengths(16) == [15, 16, 17, 31, 32, 33, 464],
+            "Dense finite boundary corpus lost required lengths")
+    for key, value in (("reusable_prefix_tokens", 464), ("query_tokens", 465),
+                       ("score_kind", "stored_prefix_blocks"), ("prefix_blocks", True)):
+        invalid_dense = {**dense, key: value}
+        try:
+            verify_dense_decision(invalid_dense, 464, 16)
+        except RuntimeError:
+            continue
+        raise RuntimeError("invalid Dense score evidence was accepted")
+    print("PASS render bridge GPU evidence parsers (18 checks; no hardware)")
     return 0
 
 
@@ -540,6 +786,10 @@ def main():
     parser.add_argument("--native")
     parser.add_argument("--build-manifest")
     parser.add_argument("--render-config")
+    parser.add_argument("--automatic-capabilities", action="store_true",
+                        help="Require proposed Worker capabilities, generic shapes and Dense boundary evidence")
+    parser.add_argument("--worker-vllm-root",
+                        help="Explicit shared Worker vllm package directory for on-disk source hashes, not loaded-module attestation")
     parser.add_argument("--output")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--worker0", default="http://127.0.0.1:8100")
@@ -567,7 +817,14 @@ def main():
     def interrupted(_signal, _frame):
         raise KeyboardInterrupt("supervised matrix interrupted")
     signal.signal(signal.SIGTERM, interrupted)
-    return run(args)
+    # Reserve the existing bounded child shutdown window inside the total
+    # budget. A hung request cannot defeat the between-case deadline checks.
+    signal.signal(signal.SIGALRM, interrupted)
+    signal.setitimer(signal.ITIMER_REAL, args.budget_seconds - 45)
+    try:
+        return run(args)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
 
 
 if __name__ == "__main__":

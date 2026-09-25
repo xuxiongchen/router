@@ -58,6 +58,8 @@ def _facade():
         contract_id="reviewed-contract",
         epoch=1,
         limits={"max_pending_jobs": 4, "execution_timeout_ms": 1000},
+        worker_capabilities=False,
+        capability_cohort=None,
     )
 
 
@@ -148,11 +150,45 @@ class TestKvRenderEntrypoint(unittest.TestCase):
             {"policy": "round_robin"}, {"mini_lb": True},
             {"vllm_pd_disaggregation": True}, {"service_discovery": True},
             {"intra_node_data_parallel_size": 2}, {"enable_igw": True},
-            {"enable_program_scheduling": True}, {"kv_hash_algo": None},
+            {"enable_program_scheduling": True},
         ):
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 self.module.Router.from_args(self.args(**overrides))
         self.render_module.create_facade.assert_not_called()
+
+    def test_legacy_hash_algorithm_remains_explicit(self):
+        with self.assertRaisesRegex(ValueError, "kv_hash_algo"):
+            self.module.Router.from_args(self.args(kv_hash_algo=None))
+
+    def test_automatic_defaults_use_observed_values_and_pass_cohort_to_native(self):
+        import json
+        self.facade.worker_capabilities = True
+        self.facade.hash_seed = 42
+        self.facade.block_size = 32
+        self.facade.capability_cohort = {
+            "workers": {url: {} for url in self.facade.worker_urls}, "api_key_env": None}
+        router = self.module.Router.from_args(self.args(kv_hash_algo=None))
+        self.assertEqual(router._router.kwargs["kv_hash_seed"], 42)
+        self.assertEqual(router._router.kwargs["kv_block_size"], 32)
+        self.assertEqual(router._router.kwargs["kv_hash_algo"], "sha256_cbor")
+        router.start()
+        self.assertEqual(json.loads(router._router.start_calls[0]["kv_capabilities_json"]),
+                         self.facade.capability_cohort)
+        for override in ({"kv_hash_seed": 0}, {"kv_block_size": 16}, {"kv_model": "other"}):
+            with self.subTest(override=override), self.assertRaisesRegex(ValueError, "requested=.*effective="):
+                self.module.Router.from_args(self.args(**override))
+
+    def test_automatic_cohort_preserves_registry_trailing_slash_keys(self):
+        import json
+        self.facade.worker_capabilities = True
+        self.facade.capability_cohort = {
+            "workers": {url: {} for url in self.facade.worker_urls}, "api_key_env": None}
+        configured = [url + "/" for url in self.facade.worker_urls]
+        router = self.module.Router.from_args(self.args(worker_urls=configured))
+        router.start()
+        cohort = json.loads(router._router.start_calls[0]["kv_capabilities_json"])
+        self.assertEqual(set(cohort["workers"]), set(configured))
+        self.assertEqual(set(self.facade.capability_cohort["workers"]), set(self.facade.worker_urls))
 
     def test_native_rejects_render_config_or_missing_tokenizer(self):
         for overrides in (

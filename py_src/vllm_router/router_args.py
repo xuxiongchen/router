@@ -33,7 +33,7 @@ class RouterArgs:
     kv_model: Optional[str] = None
     kv_hash_algo: Optional[str] = None
     kv_block_size: Optional[int] = None
-    kv_hash_seed: int = 0
+    kv_hash_seed: Optional[int] = None
     kv_events_topic_filter: str = ""
     kv_events_port: int = 5557
     kv_events_endpoints: List[str] = dataclasses.field(default_factory=list)
@@ -189,7 +189,7 @@ class RouterArgs:
         parser.add_argument(f"--{prefix}kv-model", default=None)
         parser.add_argument(f"--{prefix}kv-hash-algo", choices=["sha256_cbor"], default=None)
         parser.add_argument(f"--{prefix}kv-block-size", type=int, default=None)
-        parser.add_argument(f"--{prefix}kv-hash-seed", type=int, default=0)
+        parser.add_argument(f"--{prefix}kv-hash-seed", type=int, default=None)
         parser.add_argument(f"--{prefix}kv-events-topic-filter", default="")
         parser.add_argument(f"--{prefix}kv-events-port", type=int, default=5557)
         parser.add_argument(
@@ -613,7 +613,8 @@ class RouterArgs:
                     or self.enable_igw or self.enable_program_scheduling
                     or self.intra_node_data_parallel_size != 1 or not self.worker_urls):
                 raise ValueError("kv_aware requires static Regular HTTP workers with DP=1")
-            if self.kv_hash_algo != "sha256_cbor":
+            if (self.kv_hash_algo != "sha256_cbor"
+                    and not (self.kv_input_backend == "vllm" and self.kv_hash_algo is None)):
                 raise ValueError("kv_aware requires kv_hash_algo=sha256_cbor")
             if self.kv_input_backend == "native" and not self.kv_tokenizer_path:
                 raise ValueError("native kv_aware requires kv_tokenizer_path")
