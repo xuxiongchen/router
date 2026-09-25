@@ -5,8 +5,10 @@
 This is a separate increment based on PR1 candidate
 `624d8408b2610046db40e48f6d512b3f0741fc02`, on branch
 `codex/cmb-render-bridge-1`. PR1's historical CPU/CUDA results do not validate
-these changes. No public push, PR, maintainer-approved API, or new GPU result is
-claimed here. Publication and any new GPU operation require separate approval.
+these changes. No public push, PR, maintainer-approved API, or GPU PASS result is
+claimed by this document. Actual results are attached separately and must bind
+the tested candidate and native artifact. Publication requires approval, and
+each new GPU run requires fresh authorization, a dedicated directory and budget.
 
 The optional Python-launched Router reuses installed vLLM text preprocessing
 in-process. The native Rust input path remains the default. The cache matcher
@@ -258,77 +260,124 @@ HEAD must not change during the run. Tail percentiles from the deliberately
 small samples have low statistical confidence. Unsupported native request shapes
 and model-length-invalid cases are explicitly NOT_RUN, not measured fallbacks.
 
-## Optional finite GPU extension (not authorized or executed here)
+## Finite GPU validation of the Python-hosted extension
 
-Obtain fresh GPU authorization and a user-owned isolated directory first. Use
-two independently addressable vLLM 0.29 workers, not aliases for one process.
-Record candidate/extension hashes and the real Worker HTTP/EngineCore PIDs before
-running. Start workers sequentially so memory profiling does not overlap; size
-memory limits for the selected device. These commands are examples to execute
-only after that approval, with the same local assets and preprocessing settings
-as the JSON above:
+Obtain fresh authorization and use two exclusive, independently addressable
+vLLM 0.29 DP=1 Workers. Start them sequentially, with the same reviewed
+preprocessing arguments as `render-deployment.json`, explicit DP/TP/PP=1,
+`PYTHONHASHSEED=0`, `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0`,
+`VLLM_USE_RUST_FRONTEND=0`, prefix caching, block size 16, `sha256_cbor`, and
+`--enable-log-requests`. Size memory limits for the actual device. Do not enable
+development mode, reset caches, modify vLLM or reuse another candidate's native
+artifact. Keep both Worker HTTP endpoints on loopback. This example uses ports
+`8100`/`8101`; set the deployment JSON's `worker_urls` to those same URLs.
 
-```sh
-CUDA_VISIBLE_DEVICES=0 PYTHONHASHSEED=0 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0 \
-VLLM_USE_RUST_FRONTEND=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_PLUGINS='' \
-vllm serve /absolute/path/to/Qwen3-0.6B \
-  --tokenizer /absolute/path/to/Qwen3-0.6B \
-  --served-model-name Qwen/Qwen3-0.6B --host 127.0.0.1 --port 8000 \
-  --data-parallel-size 1 --tensor-parallel-size 1 --pipeline-parallel-size 1 \
-  --gpu-memory-utilization 0.40 --max-model-len 4096 --enforce-eager \
-  --generation-config vllm --enable-auto-tool-choice \
-  --tool-call-parser hermes --reasoning-parser qwen3 --enable-log-requests \
-  --enable-prefix-caching --prefix-caching-hash-algo sha256_cbor --block-size 16 \
-  --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv"}'
+The inspected vLLM 0.29 publisher supports a dynamic **loopback-only** bind:
+
+```json
+{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://127.0.0.1:*","topic":"kv"}
 ```
 
-Use a second terminal/process with HTTP port `8001` and KV port `5558`. In this
-vLLM publisher, a fixed `tcp://127.0.0.1:PORT` endpoint means **connect**, not bind;
-two connecting sockets do not establish event delivery. The wildcard publisher
-example is permitted only on an explicitly authorized host whose firewall or
-network namespace blocks public access to KV ports. Confirm that protection
-before launch. HTTP stays loopback-only. Do not enable broad development mode or
-clear live caches as part of these steps.
+Here `*` means a dynamic port, not a wildcard interface. Each independent Worker
+can use this configuration. A fixed `tcp://127.0.0.1:PORT` would instead mean
+connect in this implementation. The Router needs each actual resolved port,
+not `*`; this avoids opening a publisher on a public interface.
 
-Then start the Python Router above. This bounded sequence uses one public prompt
-long enough for several 16-token blocks:
+`discover_publisher.py` is a reviewed **external evidence helper**, not a
+production API or part of the candidate package. Preserve its source/hash with
+the run. Given a task-owned EngineCore PID and recorded Linux start ticks, it
+inspects only that process's loopback listening sockets and performs one public
+direct warm. Success identifies exactly one typed KV publisher whose stored
+blocks match the real generation prompt tokens; it does not select the first
+open port or modify the engine. Run once per Worker, using a new output directory:
 
 ```sh
-CMB_GPU_CHAT='{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"Public render bridge validation prefix. Explain how rain forms, how clouds move, and why rivers flow downhill. Use ordinary words and compare evaporation, condensation, precipitation, and collection. This synthetic prompt contains no private information."}],"max_tokens":8,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}'
-curl --fail-with-body --max-time 30 -H 'Content-Type: application/json' \
-  --data-binary "$CMB_GPU_CHAT" http://127.0.0.1:8000/v1/chat/completions/render
-curl --fail-with-body --max-time 30 -H 'Content-Type: application/json' \
-  --data-binary "$CMB_GPU_CHAT" http://127.0.0.1:8001/v1/chat/completions/render
-curl --fail-with-body --max-time 60 -H 'Content-Type: application/json' \
-  --data-binary "$CMB_GPU_CHAT" http://127.0.0.1:8000/v1/chat/completions
-curl --fail-with-body --max-time 60 -H 'Content-Type: application/json' \
-  --data-binary "$CMB_GPU_CHAT" http://127.0.0.1:3001/v1/chat/completions
+"$CMB_PYTHON" -B "$CMB_EVIDENCE_TOOLS/discover_publisher.py" \
+  --engine-pid "$CMB_ENGINE0_PID" --start-ticks "$CMB_ENGINE0_START_TICKS" \
+  --worker-url http://127.0.0.1:8100 \
+  --output "$CMB_EVIDENCE/discovery0" --wait-seconds 30
 ```
 
-The first two calls are explicit validation oracles, not production per-request
-rendering. For acceptance, preserve raw requests/responses and Router/Worker log
-offsets; HTTP success alone is insufficient. Complete this finite matrix, with
-at most one request per listed warm/direction/response-mode cell and bounded
-event waits (no unlimited retries):
+Repeat for Worker 1 at port `8101`. Set `CMB_EVENT0` and `CMB_EVENT1` to the
+successful `discovery.json.resolved_endpoint` values. Preserve discovery,
+supervision, Worker logs and model snapshot evidence outside source. Re-discover
+after a Worker restart: PID/start-tick identity must remain unchanged.
 
-1. Compare complete local facade IDs with both Worker public-render results for
-   Completion text/IDs, Chat thinking on/off, ordered tools/history reasoning,
-   text parts/unicode and an output constraint. Do not compare only lengths.
-2. Warm W0 then route once, and use a fresh public prefix to warm W1 then route
-   once; perform JSON and SSE variants. Require a real event-derived positive
-   score on the first routed attempt, matching token digest and backend counters.
-3. Send a non-null cache-salt request once. Require non-affinity fallback and
-   unchanged original generation request, never a guessed cache key.
-4. Cancel one queued render request and one active stream. For the stream, require
-   a nonterminal first frame, active-before and idle-after observations, and an
-   exact request-ID-linked abort counter/log with Worker PID identity. Merely
-   observing running=0 is not cancellation proof.
+Build the extension against the actual environment's Python ABI. The build
+manifest must truthfully bind the clean full candidate SHA to the resulting
+`.so` SHA-256, with the build command, toolchain/Python versions, cwd and log.
+Its minimum machine-checked fields are:
 
-The existing `scripts/kv_aware_cuda_validate.py` binds its evidence to a native
-CLI executable/process. It is **not** an unchanged acceptance runner for the
-Python-hosted extension: adapt/review its source-and-process identity checks
-before claiming its matrix for this backend. The steps above are a finite plan,
-not a claim that a new full GPU harness or result already exists.
+```json
+{
+  "status": "PASS",
+  "candidate_sha": "REPLACE_WITH_EXACT_40_HEX_SHA",
+  "native_sha256": "REPLACE_WITH_ACTUAL_64_HEX_SHA256"
+}
+```
+
+The `CMB_*` variables below are explicit absolute paths or observed identities
+from the authorized deployment. Set `CMB_CANDIDATE` to the reviewed build-manifest
+SHA. Use a new output directory; the runner refuses to overwrite evidence.
+Do not start another Router separately: the runner starts and stops only its
+own Python-hosted Router child, attaching the already-running Workers.
+
+```sh
+"$CMB_PYTHON" -B "$CMB_SOURCE/scripts/render_bridge_gpu_validate.py" --self-check
+
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_PLUGINS='' \
+"$CMB_PYTHON" -B "$CMB_SOURCE/scripts/render_bridge_gpu_validate.py" \
+  --source "$CMB_SOURCE" --candidate "$CMB_CANDIDATE" \
+  --native "$CMB_NATIVE" --build-manifest "$CMB_BUILD_MANIFEST" \
+  --render-config "$CMB_RENDER_CONFIG" --output "$CMB_EVIDENCE/matrix" \
+  --worker0 http://127.0.0.1:8100 --worker1 http://127.0.0.1:8101 \
+  --worker0-pid "$CMB_WORKER0_PID" --worker1-pid "$CMB_WORKER1_PID" \
+  --engine0-pid "$CMB_ENGINE0_PID" --engine1-pid "$CMB_ENGINE1_PID" \
+  --worker0-log "$CMB_EVIDENCE/worker0.log" \
+  --worker1-log "$CMB_EVIDENCE/worker1.log" \
+  --event0 "$CMB_EVENT0" --event1 "$CMB_EVENT1" \
+  --publisher0 'tcp://127.0.0.1:*' --publisher1 'tcp://127.0.0.1:*' \
+  --router-port 3101 --metrics-port 29101 \
+  --event-wait 2 --budget-seconds 1200
+```
+
+The runner checks source/build identity, actual executable mappings of the
+extension, API/EngineCore ancestry, preprocessing arguments, Worker versions and
+log/PID identity, then rechecks source/artifact/processes afterward. Its matrix
+budget is checked between cases; individual HTTP/idle waits are also bounded,
+but this is not an instantaneous hard process deadline. The enclosing authorized
+run must enforce its overall budget.
+
+The finite acceptance matrix covers:
+
+- Sixteen Completion/Chat shapes, including text/IDs, thinking, reasoning,
+  ordered tools/history, Unicode/text parts and output constraints. Compare
+  **full IDs** from the actual facade, both Worker `/render` APIs and the actual
+  generation response's stock `return_token_ids` output. Test-only observation
+  records original raw-byte digests and facade results without changing them.
+- Eight first-attempt positive-ownership cells: Completion/Chat × W0/W1 ×
+  JSON/SSE, with fresh direct warms, real-event positive scores, matching Rust
+  token digests, independent backend counts, and actual
+  `prefix_cache_hits_total` / `prefix_cache_queries_total` token deltas.
+- Four non-null cache-salt requests must use non-affinity fallback and split
+  2/2 across idle Workers. This is not a production-load balancing benchmark;
+  synthetic token-hit ratios are not production request-hit rates.
+- One active stream must show a complete nonterminal first frame, active state
+  before explicit socket shutdown, exact request-ID/Worker-PID-correlated abort
+  evidence, and healthy idle cleanup. Running=0 alone is insufficient.
+
+Queued render cancellation, overload, deadlines, late results and retry-once
+behavior retain their separate CPU evidence; this GPU matrix does not inject
+artificial delays or fail/restart Workers. Stock generation does not export
+original HTTP bytes, so GPU token equality is not byte-for-byte forwarding
+proof; retain the CPU raw-forwarding tests. GPU TTFT, tokens-in/out, additional
+cache layouts and wider model families are not covered by this runner. Workers
+still receive original generation requests and preprocess them again.
+
+Commands are not PASS results. Attach the actual SHA/artifact-bound summary,
+individual cases, request/response artifacts, startup conformance, process
+records and logs; mark unexecuted or failed cases explicitly. No earlier
+CPU/CUDA report validates a changed native artifact.
 
 ## Draft PR proposal for #295 / #294
 
