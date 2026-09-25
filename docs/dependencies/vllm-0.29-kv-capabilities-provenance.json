@@ -1,0 +1,40 @@
+{
+  "base_revision": "98dff2a81d747d1dba01a47f939f48c3526d4206",
+  "audited_distribution": "vllm 0.29.0+cpu",
+  "package_commit_id": "g98dff2a81",
+  "original_byte_comparison": "all 16 files match pinned Git checkout",
+  "patch_sha256": "c3898a75488608b8286f8707a8b8f92211fb3da273c81b5bf024f0d1f5367b08",
+  "patch_applicability": "git apply --check passed against preserved originals",
+  "installed_worker_modified": false,
+  "gpu_tested": false,
+  "focused_cpu_tests_passed": 39,
+  "original_sha256": {
+    "vllm/config/kv_events.py": "b1dbaee3e6830e381e9157fe3bab0d65c357da88ff7cdf8b1e4b3a4e75c82a87",
+    "vllm/distributed/kv_events.py": "b1b0e99292790b39e05b27a2800294cd00821bbc1cc8bec8e05279fab72ad6c2",
+    "vllm/engine/protocol.py": "9be92767b2a92bc5522c14b00750c0636950c7b99f82b99ed2bc2780bd3eae7b",
+    "vllm/v1/engine/core.py": "f990e260cebf0826d08cfd30955c0c7a85b9af00504841b91759ca5bc7b036f6",
+    "vllm/v1/engine/async_llm.py": "46b1df9cb7466552e9ebd52f896eecc7e9e81bbf966077171f320366b7fcbbad",
+    "vllm/entrypoints/serve/__init__.py": "bac4ffa8440759d9a244acc25bf28ce6700d7106a2b35eff90c35e70a7519f52",
+    "vllm/v1/core/kv_cache_coordinator.py": "43883199a6230b4d9efd98b9702007862e2cfa5466a2dc0326bfd1e69b3e7617",
+    "vllm/v1/core/kv_cache_manager.py": "2213a68ea1a2f05b1d99de25a3f1daf4040d8d7fdd0e271d80b7ba9e1977a08d",
+    "vllm/v1/core/single_type_kv_cache_manager.py": "3038a12b187453a5e1a3b2fd4f5cb4f5be08b23108f8352263032d9179472d55",
+    "vllm/v1/core/block_pool.py": "daf37f8c3e85d6debac02df2ac2356f5500555b613a369e8efdc66a0db94286b",
+    "vllm/v1/core/kv_cache_utils.py": "5294bef00c2f127f672a37eda9acbe440418f01622ef49b9be57761c54ebd7f6",
+    "vllm/v1/core/sched/scheduler.py": "abca7134821e2fb5cc8572df5c4a0b570ecf702646254327bc786fc452074983",
+    "vllm/v1/core/sched/async_scheduler.py": "e586a0ef3c6778be56a93e7f9bb712d4de9de6e7d7fe7e3e1d51dae83ecfc508",
+    "vllm/v1/kv_cache_interface.py": "5d0470fff3c10ab5eadbae56302d36cb6a07c6b5617e4ad4b5e8f4f1dc21423c",
+    "vllm/v1/request.py": "da610d5203e72d2d524adc5fb39df11502a23520f2f31d9a44cf13d343f9c25d",
+    "vllm/v1/engine/core_client.py": "969832582303057621f5c3ced4561a6bcc2ecc73d4d79b4dd97da0e84cb43e6c"
+  },
+  "proposed_sha256": {
+    "vllm/config/kv_events.py": "9f77bac8c199a0f21fddd9de1693cd3de58ce0aa73d84d7dfd7e84a34712ff7a",
+    "vllm/distributed/kv_events.py": "6e2d8a32e8c4c3656495c022b48540d92669554596fd930a779d4924a31d80f4",
+    "vllm/engine/protocol.py": "8caae3edf61997bccdce9bfa51b68493e4a6c4de3c5b58265e492ced50ad8ed1",
+    "vllm/v1/engine/core.py": "19a4c2e0b8c72ec97bd225186ac4632c7ceffa7b0341458573b6a0c27b93cf58",
+    "vllm/v1/engine/async_llm.py": "8d3d6e575bdbe94bc82915499dd2eb66bd95da56e02964e9c99f779811436561",
+    "vllm/v1/engine/kv_capabilities.py": "24ec0ce3f911cba61ac66d753bdfa46f1f794106940fc7f94d79841469a232d6",
+    "vllm/entrypoints/serve/__init__.py": "165227513976683a4097acb8a7be5ec605dcb397b39cf33c3aeb1b30ea1f3104",
+    "vllm/entrypoints/serve/kv_capabilities/__init__.py": "e3c55cbb0d7a8bd47df6f3378835644645f5d3bc89b45793b5d5a02d013e5c58",
+    "vllm/entrypoints/serve/kv_capabilities/api_router.py": "a19c4e22762fac665b005732827f794de0eb0ef5b1bd0833fd45628d773c888c"
+  }
+}

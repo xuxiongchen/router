@@ -3,8 +3,11 @@
 Base: vLLM `0.29.0`, source revision
 `98dff2a81d747d1dba01a47f939f48c3526d4206`.
 The actual audited CPU wheel is `0.29.0+cpu`; its `_version.py` reports
-`g98dff2a81`. `base/` preserves selected unmodified installed source files;
-`modified/` contains the proposed changes. No installed package was edited.
+`g98dff2a81`. All six modified original files and ten supporting runtime source
+files were byte-compared with that pinned Git checkout and matched. The patch
+was generated from preserved original/modified source trees, not installed
+Worker edits. See the adjacent provenance JSON for exact original and proposed
+file hashes; these are reproducibility evidence, not a production allowlist.
 
 `vllm-0.29-kv-capabilities.patch` is an independent engine proposal, not the old
 six-patch stack, a published PR, or a maintainer-approved interface. Apply it
@@ -107,7 +110,7 @@ global cache reset is required.
 From the new isolated Router worktree, with the pinned vLLM dependencies:
 
 ```sh
-VLLM_KV_PROPOSAL_SOURCE=/path/to/modified \
+VLLM_KV_PROPOSAL_SOURCE=/path/to/patched-vllm-checkout \
   python -m pytest -q py_test/test_kv_worker_export.py
 ```
 
@@ -120,3 +123,27 @@ real FastAPI route and existing auth middleware over a fake utility transport.
 ZMQ tests exercise the actual proposed publisher on loopback. This proves the
 adapter/transport slice, **not** full GPU EngineCore initialization. Hardware
 acceptance remains separately authorized work.
+
+Observed focused result: **39 passed** (CPU, 24.12 seconds). Ruff checks for new
+exporter/API/test code and patch applicability passed. No GPU result is claimed.
+
+## Compact field provenance (original pinned source)
+
+| Fact | Actual source | Meaning / external availability before proposal |
+|---|---|---|
+| Group metadata | `v1/engine/core.py:433` | Initialized scheduler inventory; private utility only |
+| Complete original groups | `core.py:319–332`, `core/kv_cache_utils.py:1988` | Worker specs precede scheduler first-leaf normalization; missing from old export |
+| Effective manager | `core/kv_cache_coordinator.py:139`, `:510` | Actual manager objects and effective block tokens, not model names |
+| Allocation / hash / alignment | `single_type_kv_cache_manager.py:76`, `kv_cache_coordinator.py:510`, `sched/scheduler.py:286` | Separate token units; all equal only in accepted Dense subset |
+| Terminal recompute | `kv_cache_manager.py:258`, `single_type_kv_cache_manager.py:746` | At most `N-1`, block aligned, first hole terminates prefix |
+| Actual N / read exclusions | `v1/request.py:288`, `kv_cache_manager.py:213` | Prepared request token count; cache-read-disabled requests excluded |
+| Hash root / representation | `kv_cache_utils.py:83`, `:134`, `:621`; `core.py:224` | Resolved seed/root, full bytes, chained tuple with extra keys |
+| Speculation / CP / connectors | `sched/scheduler.py:138–185`, `:257–299` | Effective initialized objects/config, not renderer assumptions |
+| Event group annotation | `kv_cache_manager.py:666` | Group kind/window added to actual stored events |
+| Publisher sequence | `distributed/kv_events.py:453` | Stock monotonic per-boot sequence, but no wire boot epoch |
+| Fixed internal RPC | `v1/engine/core_client.py:1129` | Existing utility chain, not an existing public capabilities endpoint |
+| Existing HTTP auth | `entrypoints/serve/middleware/authenticate.py:12` | `/v1` is guarded when API keys are configured |
+
+There is no stock public HTTP endpoint with these complete facts. The DEV_MODE
+`/server_info` endpoint is not an alternative: it is configuration-oriented,
+lacks initialized manager/epoch evidence, and requires broad development mode.
