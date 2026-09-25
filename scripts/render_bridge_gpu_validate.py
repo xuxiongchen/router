@@ -10,6 +10,11 @@ request bodies are synthetic public fixtures. The observer is test-only, not a
 production telemetry API. Worker generation does not export original raw bytes:
 raw forwarding is separately covered by the CPU integration suite, not claimed
 as byte-for-byte GPU proof here.
+
+--automatic-capabilities adds actual linked-export discovery and a family-neutral
+corpus plus exact Dense block boundaries. It requires opted-in, fully restarted
+Workers; it never installs the linked patch. Metadata counters allow bounded
+background refresh rather than asserting zero total metadata HTTP traffic.
 """
 
 import argparse
@@ -627,6 +632,12 @@ def run(args):
                   "facade_identity": str(out / "facade-identity.json")}
         if args.automatic_capabilities:
             require(args.worker_vllm_root, "automatic evidence requires --worker-vllm-root")
+            for endpoint in config["event_endpoints"]:
+                parsed = urllib.parse.urlsplit(endpoint)
+                require(parsed.scheme == "tcp" and parsed.hostname == "127.0.0.1"
+                        and parsed.port and not parsed.path and not parsed.username
+                        and not parsed.query and not parsed.fragment,
+                        "automatic finite fixture requires resolved loopback-only KV subscriber endpoints")
             config["capabilities"] = worker_capabilities(workers, args.model)
             args.block_size = next(iter(config["capabilities"].values()))["hash"]["block_tokens"]
             args.fixture_vocabulary = valid_fixture_vocabulary(config["serving_args"])
