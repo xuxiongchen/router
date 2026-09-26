@@ -18,6 +18,10 @@ Use an isolated Linux environment and the existing `setup.py`/PEP 517 build,
 not just the Rust executable. For the measured environment, build dependencies
 are setuptools 80.9.0, setuptools-rust 1.13.0 and wheel 0.48.0. An older
 setuptools 66.1.1 rejects this repository's SPDX license metadata before build.
+Keep build tooling separate from the runtime: the actual vLLM 0.29.0+cpu wheel
+pins runtime setuptools 77.0.3. The baseline and candidate runtime environments
+use that pin; retain both build and runtime dependency records rather than
+silently ignoring the dependency conflict from using 80.9.0 at runtime.
 The optional renderer remains vLLM 0.29.0; no new Worker patch is needed beyond
 the already documented capabilities dependency.
 
