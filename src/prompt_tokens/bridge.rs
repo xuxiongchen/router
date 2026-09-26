@@ -9,6 +9,7 @@
 //! process alive; a GIL deadlock/native crash has no hard recovery guarantee.
 
 use std::{
+    borrow::Cow,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
@@ -439,7 +440,10 @@ fn parse_python_result(
     // Identity evidence applies to every status, including an unavailable or
     // unsupported reply. It must not be converted into safe fair fallback.
     if let Some(id) = result.get_item("contract_id")? {
-        if id.extract::<&str>().map_or(true, |id| id != contract.id) {
+        if id
+            .extract::<Cow<'_, str>>()
+            .map_or(true, |id| id.as_ref() != contract.id.as_str())
+        {
             return Ok(PythonReply::Invalidated);
         }
     }
@@ -454,7 +458,7 @@ fn parse_python_result(
     let Some(status) = result.get_item("status")? else {
         return Ok(PythonReply::Prepared(PreparedResult::Unavailable));
     };
-    let prepared = match status.extract::<&str>()? {
+    let prepared = match status.extract::<Cow<'_, str>>()?.as_ref() {
         "invalidated" => return Ok(PythonReply::Invalidated),
         "unsupported" => PreparedResult::Unsupported,
         "invalid" => PreparedResult::Invalid {
@@ -475,7 +479,7 @@ fn parse_python_result(
                 return Ok(PythonReply::Prepared(PreparedResult::Unavailable));
             };
             let tokens = tokens.cast::<PyList>()?;
-            let id = id.extract::<&str>()?;
+            let id = id.extract::<Cow<'_, str>>()?;
             if tokens.is_empty() || tokens.len() > limit || id.is_empty() || id.len() > 256 {
                 return Ok(PythonReply::Prepared(PreparedResult::Unsupported));
             }
@@ -488,7 +492,7 @@ fn parse_python_result(
             PreparedResult::Exact(PreparedTokens {
                 token_ids: token_ids.into(),
                 contract: RenderContract {
-                    id: id.to_owned(),
+                    id: id.into_owned(),
                     epoch: epoch.extract()?,
                 },
                 cache_eligible: eligible.extract()?,
