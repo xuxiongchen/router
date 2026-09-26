@@ -4061,7 +4061,13 @@ mod tests {
         assert_eq!(index.prefix_score(worker0.url(), &keys), 0);
         assert_eq!(index.current_generation(worker0.url()), None);
         assert_eq!(index.prefix_score(worker1.url(), &keys), 1);
-        // Without exact tokens, the retry would prefer low-load W0 again.
+        // This final negative control exercises the production KV policy,
+        // not the A/B RR override used by the completed request above.
+        #[cfg(feature = "kv-perf")]
+        {
+            router.kv_perf = None;
+        }
+        // Without exact tokens, the production retry would prefer low-load W0.
         assert_eq!(
             router
                 .select_worker_for_model(None, None, None)
