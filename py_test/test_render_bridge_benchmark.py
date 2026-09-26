@@ -16,8 +16,12 @@ class _FakeFacade:
     def __init__(self):
         self.contract_id, self.epoch = "test-contract", 1
         self.effective_config = {"test_double": True}
-        self._runtime = SimpleNamespace(renderer=SimpleNamespace(
-            model_config=SimpleNamespace(renderer_num_workers=1)), capture=object())
+        self._runtime = SimpleNamespace(
+            renderer=SimpleNamespace(
+                model_config=SimpleNamespace(renderer_num_workers=1)
+            ),
+            capture=object(),
+        )
         self._loop = None
         self.owner = None
         self.closed = False
@@ -28,8 +32,13 @@ class _FakeFacade:
     def render(self, kind, raw):
         if threading.get_ident() != self.owner:
             raise AssertionError("wrong test owner")
-        return {"status": "exact", "cache_eligible": True, "token_ids": json.loads(raw),
-                "contract_id": self.contract_id, "epoch": self.epoch}
+        return {
+            "status": "exact",
+            "cache_eligible": True,
+            "token_ids": json.loads(raw),
+            "contract_id": self.contract_id,
+            "epoch": self.epoch,
+        }
 
     def startup(self):
         self.owner = threading.get_ident()
@@ -46,19 +55,30 @@ class _FakeFacade:
 
 class FacadeBenchmarkHarnessTests(unittest.TestCase):
     def case(self, ids=(3, 7)):
-        return {"name": "test-only", "kind": "completion", "target_tokens": len(ids),
-                "raw": json.dumps(ids).encode(), "ids": list(ids)}
+        return {
+            "name": "test-only",
+            "kind": "completion",
+            "target_tokens": len(ids),
+            "raw": json.dumps(ids).encode(),
+            "ids": list(ids),
+        }
 
     def test_build_identity_preserves_full_manifest_and_separate_candidate(self):
-        manifest = {"status": "PASS", "candidate_sha": "1" * 40, "native_sha256": "2" * 64,
-                    "build_profile": {"opt_level": 3}}
+        manifest = {
+            "status": "PASS",
+            "candidate_sha": "1" * 40,
+            "native_sha256": "2" * 64,
+            "build_profile": {"opt_level": 3},
+        }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "build.json"
             path.write_text(json.dumps(manifest))
             report = benchmark._build_manifest_identity(path, "2" * 64)
             self.assertEqual(report["native_source_candidate_sha"], "1" * 40)
             self.assertEqual(report["native_build_manifest"], manifest)
-            self.assertEqual(report["native_build_manifest_sha256"], benchmark.sha256(path))
+            self.assertEqual(
+                report["native_build_manifest_sha256"], benchmark.sha256(path)
+            )
             benchmark._assert_build_manifest_stable(report)
             path.write_text(json.dumps({**manifest, "extra": "changed"}))
             with self.assertRaisesRegex(RuntimeError, "manifest_changed"):
@@ -66,8 +86,14 @@ class FacadeBenchmarkHarnessTests(unittest.TestCase):
 
     def test_build_manifest_rejects_failed_missing_or_mismatched_native(self):
         valid = {"status": "PASS", "candidate_sha": "1" * 40, "native_sha256": "2" * 64}
-        for value in (None, {}, {**valid, "status": "FAIL"}, {**valid, "candidate_sha": "short"},
-                      {**valid, "native_sha256": "3" * 64}, {**valid, "native_sha256": "bad"}):
+        for value in (
+            None,
+            {},
+            {**valid, "status": "FAIL"},
+            {**valid, "candidate_sha": "short"},
+            {**valid, "native_sha256": "3" * 64},
+            {**valid, "native_sha256": "bad"},
+        ):
             with self.subTest(value=value), self.assertRaises(RuntimeError):
                 benchmark._validate_native_build_manifest(value, "2" * 64)
         benchmark._validate_native_build_manifest(valid, "2" * 64)
@@ -81,30 +107,38 @@ class FacadeBenchmarkHarnessTests(unittest.TestCase):
 
     def test_independent_owner_threads_close_their_own_facades(self):
         created = []
+
         def create(_):
             facade = _FakeFacade()
             created.append(facade)
             return facade
+
         module = SimpleNamespace(create_facade=create)
         cases = [self.case([index]) for index in range(6)]
         with benchmark._FacadePool(module, "unused", cases, 4) as pool:
             replies = [(case, pool.submit(case["kind"], case["raw"])) for case in cases]
             for case, future in replies:
-                benchmark._validate_facade_reply(future.result(timeout=2)[0], case, pool.identity)
+                benchmark._validate_facade_reply(
+                    future.result(timeout=2)[0], case, pool.identity
+                )
             self.assertEqual(len({facade.owner for facade in created}), 4)
         self.assertTrue(all(facade.closed for facade in created))
         self.assertTrue(all(not thread.is_alive() for thread in pool.threads))
 
     def test_shared_oracle_mismatch_refuses_startup_and_closes(self):
         created = []
+
         def create(_):
             facade = _FakeFacade()
             created.append(facade)
             return facade
+
         case = self.case()
         case["ids"] = [99]
         with self.assertRaisesRegex(RuntimeError, "shared_oracle_mismatch"):
-            with benchmark._FacadePool(SimpleNamespace(create_facade=create), "unused", [case], 1):
+            with benchmark._FacadePool(
+                SimpleNamespace(create_facade=create), "unused", [case], 1
+            ):
                 self.fail("oracle failure admitted")
         self.assertTrue(created[0].closed)
 
@@ -114,26 +148,41 @@ class FacadeBenchmarkHarnessTests(unittest.TestCase):
         with benchmark._FacadePool(module, "unused", cases, 4) as pool:
             result = benchmark._mixed_facade_probe(pool, cases)
         self.assertEqual(result["full_array_and_epoch_checks"], 18)
-        self.assertEqual(result["case_counts"], {f"case-{index}": 3 for index in range(6)})
+        self.assertEqual(
+            result["case_counts"], {f"case-{index}": 3 for index in range(6)}
+        )
         self.assertEqual(result["client_concurrency"], 4)
         self.assertIs(result["timed"], False)
 
     def test_full_arrays_not_only_length_and_epoch_are_checked(self):
         case = self.case()
         identity = {"contract_id": "contract", "epoch": 2}
-        reply = {"status": "exact", "cache_eligible": True, "token_ids": case["ids"], **identity}
+        reply = {
+            "status": "exact",
+            "cache_eligible": True,
+            "token_ids": case["ids"],
+            **identity,
+        }
         benchmark._validate_facade_reply(reply, case, identity)
-        for replacement in ({"token_ids": [7, 3]}, {"epoch": 3}, {"contract_id": "changed"},
-                            {"cache_eligible": False}, {"status": "unsupported"}):
+        for replacement in (
+            {"token_ids": [7, 3]},
+            {"epoch": 3},
+            {"contract_id": "changed"},
+            {"cache_eligible": False},
+            {"status": "unsupported"},
+        ):
             with self.subTest(replacement=replacement), self.assertRaises(RuntimeError):
-                benchmark._validate_facade_reply({**reply, **replacement}, case, identity)
+                benchmark._validate_facade_reply(
+                    {**reply, **replacement}, case, identity
+                )
 
     def test_cell_has_complete_checks_and_explicit_non_rust_scope(self):
         case = self.case()
         module = SimpleNamespace(create_facade=lambda _: _FakeFacade())
         resource = {"pid": 1, "cpu_seconds": 1.0, "rss_bytes": 1000, "threads": 2}
-        with benchmark._FacadePool(module, "unused", [case], 2) as pool, \
-             patch.object(benchmark, "resources", return_value=[resource]):
+        with benchmark._FacadePool(module, "unused", [case], 2) as pool, patch.object(
+            benchmark, "resources", return_value=[resource]
+        ):
             result = benchmark._facade_cell(pool, case, 2, 10, False)
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(result["full_array_checks"], 14)
@@ -146,23 +195,31 @@ class FacadeBenchmarkHarnessTests(unittest.TestCase):
         case = self.case()
         module = SimpleNamespace(create_facade=lambda _: _FakeFacade())
         resource = {"pid": 1, "cpu_seconds": 1.0, "rss_bytes": 1000, "threads": 2}
-        with benchmark._FacadePool(module, "unused", [case], 1) as pool, \
-             patch.object(benchmark, "resources", return_value=[resource]), \
-             self.assertRaisesRegex(RuntimeError, "observer_mode_mismatch"):
+        with benchmark._FacadePool(module, "unused", [case], 1) as pool, patch.object(
+            benchmark, "resources", return_value=[resource]
+        ), self.assertRaisesRegex(RuntimeError, "observer_mode_mismatch"):
             benchmark._facade_cell(pool, case, 1, 10, True)
 
     def test_stage_metrics_are_filtered_without_relabeling_aggregate(self):
-        body = (b'# HELP ignored help\n'
-                b'vllm_router_kv_stage_duration_seconds_sum{stage="queue_wait"} 0.1\n'
-                b'vllm_router_kv_stage_duration_seconds_count{stage="queue_wait"} 4\n'
-                b'vllm_router_kv_bridge_usage{resource="active"} 0\n'
-                b'unrelated_total 29\n')
+        body = (
+            b"# HELP ignored help\n"
+            b'vllm_router_kv_stage_duration_seconds_sum{stage="queue_wait"} 0.1\n'
+            b'vllm_router_kv_stage_duration_seconds_count{stage="queue_wait"} 4\n'
+            b'vllm_router_kv_bridge_usage{resource="active"} 0\n'
+            b"unrelated_total 29\n"
+        )
         response = SimpleNamespace(status=200, read=lambda: body)
-        connection = SimpleNamespace(request=lambda *_: None, getresponse=lambda: response, close=lambda: None)
-        with patch.object(benchmark.http.client, "HTTPConnection", return_value=connection):
+        connection = SimpleNamespace(
+            request=lambda *_: None, getresponse=lambda: response, close=lambda: None
+        )
+        with patch.object(
+            benchmark.http.client, "HTTPConnection", return_value=connection
+        ):
             values = benchmark._stage_metrics(1234)
         self.assertEqual(len(values), 3)
-        self.assertEqual(values['vllm_router_kv_stage_duration_seconds_count{stage="queue_wait"}'], 4)
+        self.assertEqual(
+            values['vllm_router_kv_stage_duration_seconds_count{stage="queue_wait"}'], 4
+        )
         self.assertEqual(benchmark._stage_metrics(None), {})
 
     def test_metric_window_only_differences_cumulative_series(self):
