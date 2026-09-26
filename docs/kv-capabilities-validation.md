@@ -110,3 +110,40 @@ Acceptance requires:
 - If separately authorized, reset only an owned Worker cache and demonstrate old ownership is cleared. Restart one owned Worker: new epoch must invalidate the old Router contract; restarting Router repeats conformance and begins empty. These mutation cases are manual/exclusive and are not automatically performed by the runner.
 
 Stop only owned task processes on completion or budget expiry. Any cloud fix must be returned to this contribution branch and all final affected tests rerun against the new candidate/native SHA. No GPU PASS is claimed until these actual executions finish.
+
+## Optional finite performance comparison
+
+After correctness succeeds, `scripts/kv_capabilities_performance.py` compares
+`round_robin` and `kv_aware` with the same candidate/native and the same two
+exclusive DP=1 Workers. Supply the same source/build/model/Worker identity
+arguments as above, omit `--automatic-capabilities`, and use a fresh output
+directory. A bounded example adds:
+
+```sh
+--requests 32 --groups 4 --prompt-format text \
+--input-tokens 1024 --prefix-tokens 768 --output-tokens 32 \
+--scenarios locality cold --concurrencies 1 4 --budget-seconds 900
+```
+
+The default text mode forwards original Completion text and includes the
+actual in-process vLLM preparation cost in KV timings. Setup checks full tokens
+against both Worker `/render` endpoints outside the timed interval; generation
+must return the same full prompt IDs. Token lengths are measured, not assumed
+identical across the different phase nonces. The optional token-ID mode is a
+narrower diagnostic that does not measure text tokenization cost.
+
+Each phase has fresh first-block namespaces, the same logical trace and
+comparable target lengths. It does not claim byte-identical traffic. Direct
+warmup/startup are excluded, policy order is counterbalanced, and all-cold
+controls must have zero backend prefix hits. No cache reset or development mode
+is enabled by default. An optional reset flag requires separate explicit scope
+and an already available approved endpoint; it must not be used to enable DEV.
+
+Report TTFT from request send to the first nonempty generated text, end-to-end
+latency, throughput, actual backend prefix hit/query token deltas, per-Worker
+completed requests, fairness and sampled Router loads. RR bypasses Router
+preprocessing while KV includes it, so this is a finite end-to-end product
+comparison, not an isolated scoring benchmark. Two Workers on one GPU, a debug
+extension, short synthetic traces, client HTTP setup and token-ID response
+overhead limit extrapolation to production. Gains, neutral results and
+regressions must all be reported; no universal speedup is an acceptance rule.
