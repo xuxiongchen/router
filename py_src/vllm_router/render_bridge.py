@@ -281,8 +281,11 @@ def _validate_layout(model):
 
 
 def _stat_signature(paths, observer=None):
-    return tuple((str(p), _asset_stat(p, observer).st_size,
-                  _asset_stat(p, observer).st_mtime_ns) for p in paths)
+    signature = []
+    for path in paths:
+        stat = _asset_stat(path, observer)
+        signature.append((str(path), stat.st_size, stat.st_mtime_ns))
+    return tuple(signature)
 
 
 def _validate_template_determinism(tokenizer_dir):

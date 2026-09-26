@@ -108,10 +108,23 @@ The feature requires literal loopback HTTP Workers and Router bind, static
 Regular DP=1 and an active automatically verified capability bridge. No PD,
 discovery or program scheduling. A intentionally skips per-request facade
 asset/schema checks and relies on the original request's Worker validation;
-it is not a production policy. All three A/B/C arms retain active deployment/epoch fencing,
+it also skips bridge admission, copies, queueing and its provider timeout.
+It is not a production policy. All three A/B/C arms retain active deployment/epoch fencing,
 subscriptions, connection pools and retry/stream lifetime. B/C do not fabricate
 tokens or scores. B-A measures the changed preprocessing path under controlled
-conditions; C-B additionally includes Worker placement, not just scorer CPU.
+conditions, not isolated renderer CPU; C-B additionally includes Worker
+placement, not just scorer CPU.
+
+## Minimal asset metadata optimization
+
+The signature now reads one stat result per entry and uses both its size and
+mtime. Each request still enumerates assets and checks the same signature
+fields; order, duplicate entries, oversize checks and invalidation fences remain.
+No immutable asset cache, background detection window or token cache is added.
+The operation saving depends on the actual asset count. A concurrent mutation
+can be observed differently from two separate stat calls; neither version
+proves content integrity or eliminates TOCTOU. Performance is measured
+separately from this reduction in redundant operations.
 
 ## Measurement discipline and release gates
 

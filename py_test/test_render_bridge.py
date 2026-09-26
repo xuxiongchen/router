@@ -260,6 +260,47 @@ class RenderBridgeBoundaryTests(unittest.TestCase):
         self.assertNotIn("secret", str(result))
         self.assertTrue(facade._invalidated)
 
+    def test_stat_signature_stats_each_entry_once_on_every_call(self):
+        paths = [self.root / "z.json", self.root / "a.json", self.root / "z.json"]
+        metadata = [SimpleNamespace(st_size=11, st_mtime_ns=101),
+                    SimpleNamespace(st_size=12, st_mtime_ns=102),
+                    SimpleNamespace(st_size=11, st_mtime_ns=101)]
+        expected = ((str(paths[0]), 11, 101), (str(paths[1]), 12, 102),
+                    (str(paths[2]), 11, 101))
+        observer = bridge._StageObserver()
+        with patch.object(Path, "stat", autospec=True, side_effect=metadata * 2) as stat:
+            self.assertEqual(bridge._stat_signature(paths, observer), expected)
+            self.assertEqual(bridge._stat_signature(paths, observer), expected)
+        self.assertEqual([entry.args[0] for entry in stat.call_args_list], paths * 2)
+        self.assertEqual(observer.counters["asset_stat_calls"], 6)
+
+    def test_asset_size_change_with_same_mtime_fences_identity(self):
+        facade = self.ready()
+        path = self.root / "tokenizer.json"
+        initial = path.stat()
+        path.write_bytes(path.read_bytes() + b" ")
+        os.utime(path, ns=(initial.st_atime_ns, initial.st_mtime_ns))
+        current = path.stat()
+        self.assertNotEqual(current.st_size, initial.st_size)
+        self.assertEqual(current.st_mtime_ns, initial.st_mtime_ns)
+        result = facade.render("chat", b'{"messages":[]}')
+        self.assertEqual((result["status"], result["reason"], result["epoch"]),
+                         ("invalidated", "contract_changed", facade.epoch + 1))
+        self.assertEqual(self.runtime.seen, [])
+
+    def test_asset_mtime_change_with_same_size_fences_identity(self):
+        facade = self.ready()
+        path = self.root / "tokenizer.json"
+        initial = path.stat()
+        os.utime(path, ns=(initial.st_atime_ns, initial.st_mtime_ns + 1_000_000_000))
+        current = path.stat()
+        self.assertEqual(current.st_size, initial.st_size)
+        self.assertNotEqual(current.st_mtime_ns, initial.st_mtime_ns)
+        result = facade.render("chat", b'{"messages":[]}')
+        self.assertEqual((result["status"], result["reason"], result["epoch"]),
+                         ("invalidated", "contract_changed", facade.epoch + 1))
+        self.assertEqual(self.runtime.seen, [])
+
     def test_changed_assets_return_identity_fence_not_fallback(self):
         facade = self.ready()
         (self.root / "tokenizer.json").write_text('{"changed":true}')
@@ -386,7 +427,7 @@ class RenderBridgeTimingTests(unittest.TestCase):
         self.assertGreaterEqual(stages["python_total"], stages["serving"])
         self.assertEqual(counters, {
             "asset_scan_calls": 5, "asset_is_file_calls": 4, "asset_exists_calls": 1,
-            "asset_stat_calls": 14, "asset_read_calls": 0, "asset_read_bytes": 0,
+            "asset_stat_calls": 9, "asset_read_calls": 0, "asset_read_bytes": 0,
             "asset_hash_calls": 0, "asset_hash_bytes": 0,
         })
 
