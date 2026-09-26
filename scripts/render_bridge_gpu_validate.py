@@ -312,6 +312,28 @@ def public_render_tokens(body, chat):
     return tokens
 
 
+def positive_payload(model, name, kind, stream=False, *, nonce=None):
+    """Make the warmed prefix unique before any complete shared template block.
+
+    An explicit system message avoids a tokenizer's injected default system
+    prefix becoming cached on both Workers during earlier Chat shape cases.
+    This is a public test fixture, not a model-specific Router renderer.
+    """
+    nonce = nonce or uuid.uuid4().hex
+    text = (f"{nonce} Public GPU render bridge case {name}. " * 12
+            + "Explain the water cycle in ordinary words.")
+    payload = {"model": model, "max_tokens": 8, "temperature": 0, "stream": stream,
+               "return_token_ids": True}
+    if kind == "chat":
+        payload.update(messages=[
+            {"role": "system", "content": f"{nonce} Public isolated prefix fixture."},
+            {"role": "user", "content": text},
+        ], chat_template_kwargs={"enable_thinking": False})
+    else:
+        payload.update(prompt=text, add_special_tokens=True)
+    return payload
+
+
 class Validation(prior.Validation):
     def __init__(self, args, out):
         super().__init__(args, out)
@@ -442,15 +464,7 @@ class Validation(prior.Validation):
         return result
 
     def positive(self, name, kind, target, stream=False):
-        text = (f"{uuid.uuid4().hex} Public GPU render bridge case {name}. " * 12
-                + "Explain the water cycle in ordinary words.")
-        payload = {"model": self.model, "max_tokens": 8, "temperature": 0, "stream": stream,
-                   "return_token_ids": True}
-        if kind == "chat":
-            payload.update(messages=[{"role": "user", "content": text}],
-                           chat_template_kwargs={"enable_thinking": False})
-        else:
-            payload.update(prompt=text, add_special_tokens=True)
+        payload = positive_payload(self.model, name, kind, stream)
         raw, tokens, route = self.oracle(payload, name + "-warm")
         require(len(tokens) >= 48, "positive fixture is too short for several cache blocks")
         self.idle()
@@ -599,6 +613,10 @@ def verify_workers(args, config):
 
 
 def run(args):
+    # The shared helper includes MODEL in its filtered process identity and
+    # cancellation request. Bind it before the FIRST identity capture, not only
+    # before cancellation; otherwise a non-Qwen model changes that evidence.
+    prior.MODEL = args.model
     out = prior.output_directory(args.output, args.source)
     report = {"status": "RUNNING", "started_at_unix": time.time(), "command": sys.argv,
               "limitations": ["No tokens-in/out; generation repeats preprocessing.",
@@ -694,7 +712,6 @@ def run(args):
             validation.case("salt_fairness", validation.salt_fairness)
             # Existing helper has full first-record/active-before-close checks,
             # log/PID/ID correlation and no natural completion masquerading as abort.
-            prior.MODEL = args.model
             validation.case("stream_cancel_cleanup", validation.cancel_cleanup)
             validation.idle()
             if args.automatic_capabilities:
@@ -784,7 +801,42 @@ def self_check():
         except RuntimeError:
             continue
         raise RuntimeError("invalid Dense score evidence was accepted")
-    print("PASS render bridge GPU evidence parsers (18 checks; no hardware)")
+    nonce = "0123456789abcdef0123456789abcdef"
+    fixture = positive_payload("public-non-qwen", "self-check", "chat", True, nonce=nonce)
+    require(fixture["messages"][0]["role"] == "system"
+            and fixture["messages"][0]["content"].startswith(nonce + " ")
+            and fixture["messages"][1]["role"] == "user"
+            and fixture["messages"][1]["content"].startswith(nonce + " ")
+            and fixture["model"] == "public-non-qwen" and fixture["stream"] is True,
+            "positive Chat fixture lost its early unique system prefix")
+    completion_fixture = positive_payload("public-non-qwen", "self-check", "completion", nonce=nonce)
+    require("messages" not in completion_fixture
+            and completion_fixture["prompt"].startswith(nonce + " ")
+            and completion_fixture["add_special_tokens"] is True,
+            "positive Completion fixture changed unexpectedly")
+    # Exercise the real run entry ordering, stopping before its first filesystem
+    # operation. No process, network call or output directory is created.
+    from types import SimpleNamespace
+    class ModelProbeDone(Exception):
+        pass
+
+    def stop_before_output(*_args):
+        require(prior.MODEL == "public-non-qwen", "model bound after initial process evidence")
+        raise ModelProbeDone
+
+    original_model, original_output = prior.MODEL, prior.output_directory
+    try:
+        prior.MODEL = "unrelated-initial-model"
+        prior.output_directory = stop_before_output
+        try:
+            run(SimpleNamespace(model="public-non-qwen", output=None, source=None))
+        except ModelProbeDone:
+            pass
+        else:
+            raise RuntimeError("model ordering probe did not stop before filesystem access")
+    finally:
+        prior.MODEL, prior.output_directory = original_model, original_output
+    print("PASS render bridge GPU parsers/fixtures/bootstrap (21 checks; no hardware)")
     return 0
 
 
