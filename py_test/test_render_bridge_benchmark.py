@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+from pathlib import Path
+import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
@@ -46,6 +48,36 @@ class FacadeBenchmarkHarnessTests(unittest.TestCase):
     def case(self, ids=(3, 7)):
         return {"name": "test-only", "kind": "completion", "target_tokens": len(ids),
                 "raw": json.dumps(ids).encode(), "ids": list(ids)}
+
+    def test_build_identity_preserves_full_manifest_and_separate_candidate(self):
+        manifest = {"status": "PASS", "candidate_sha": "1" * 40, "native_sha256": "2" * 64,
+                    "build_profile": {"opt_level": 3}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "build.json"
+            path.write_text(json.dumps(manifest))
+            report = benchmark._build_manifest_identity(path, "2" * 64)
+            self.assertEqual(report["native_source_candidate_sha"], "1" * 40)
+            self.assertEqual(report["native_build_manifest"], manifest)
+            self.assertEqual(report["native_build_manifest_sha256"], benchmark.sha256(path))
+            benchmark._assert_build_manifest_stable(report)
+            path.write_text(json.dumps({**manifest, "extra": "changed"}))
+            with self.assertRaisesRegex(RuntimeError, "manifest_changed"):
+                benchmark._assert_build_manifest_stable(report)
+
+    def test_build_manifest_rejects_failed_missing_or_mismatched_native(self):
+        valid = {"status": "PASS", "candidate_sha": "1" * 40, "native_sha256": "2" * 64}
+        for value in (None, {}, {**valid, "status": "FAIL"}, {**valid, "candidate_sha": "short"},
+                      {**valid, "native_sha256": "3" * 64}, {**valid, "native_sha256": "bad"}):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                benchmark._validate_native_build_manifest(value, "2" * 64)
+        benchmark._validate_native_build_manifest(valid, "2" * 64)
+
+    def test_missing_build_manifest_never_infers_harness_commit(self):
+        report = benchmark._build_manifest_identity(None, "2" * 64)
+        self.assertIsNone(report["native_source_candidate_sha"])
+        self.assertIsNone(report["native_build_manifest"])
+        with self.assertRaisesRegex(RuntimeError, "verified_native"):
+            benchmark._build_manifest_identity("unused", None)
 
     def test_independent_owner_threads_close_their_own_facades(self):
         created = []

@@ -35,6 +35,7 @@ from pathlib import Path
 import platform
 from queue import Queue
 import random
+import re
 import shutil
 import socket
 import subprocess
@@ -71,6 +72,38 @@ def source_manifest():
         "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT)),
         "files": {p: sha256(ROOT / p) for p in sorted(set(paths)) if p and (ROOT / p).is_file()},
     }
+
+
+def _validate_native_build_manifest(value, actual_sha256):
+    if (not isinstance(value, dict) or value.get("status") != "PASS"
+            or not isinstance(value.get("candidate_sha"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", value["candidate_sha"]) is None
+            or not isinstance(value.get("native_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", value["native_sha256"]) is None):
+        raise RuntimeError("invalid_native_build_manifest")
+    if value["native_sha256"] != actual_sha256:
+        raise RuntimeError("native_build_manifest_artifact_mismatch")
+
+
+def _build_manifest_identity(path, actual_sha256):
+    if path is None:
+        return {"native_source_candidate_sha": None, "native_build_manifest": None,
+                "native_build_manifest_path": None, "native_build_manifest_sha256": None}
+    if actual_sha256 is None:
+        raise RuntimeError("build_manifest_requires_verified_native_import_or_artifact")
+    path = Path(path).resolve()
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    _validate_native_build_manifest(value, actual_sha256)
+    return {"native_source_candidate_sha": value["candidate_sha"], "native_build_manifest": value,
+            "native_build_manifest_path": str(path),
+            "native_build_manifest_sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def _assert_build_manifest_stable(report):
+    path = report["native_build_manifest_path"]
+    if path is not None and sha256(path) != report["native_build_manifest_sha256"]:
+        raise RuntimeError("native_build_manifest_changed_during_run")
 
 
 def free_port():
@@ -161,6 +194,8 @@ def _child(manifest_path):
     native_identity = _native_identity(native)
     if native_identity["native_sha256"] != config["native_sha256"]:
         raise RuntimeError("loaded_native_does_not_match_supplied_artifact")
+    if config.get("native_build_manifest") is not None:
+        _validate_native_build_manifest(config["native_build_manifest"], native_identity["native_sha256"])
     from vllm_router.router import Router
     from vllm_router.router_args import RouterArgs
 
@@ -587,10 +622,12 @@ def run_facade(args):
         active_bridge, wheel = _installed_wheel_identity()
         if args.native_library and sha256(args.native_library) != wheel["native_sha256"]:
             raise RuntimeError("specified_native_does_not_match_installed_import")
+    build_identity = _build_manifest_identity(args.build_manifest, wheel["native_sha256"] if wheel else None)
     model_dir = Path(args.model_directory).resolve()
     report = {
-        "source_head": manifest["head"], "source_dirty": manifest["dirty"],
-        "source_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "harness_source_head": manifest["head"], "harness_source_dirty": manifest["dirty"],
+        "harness_source_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        **build_identity,
         "python": sys.version, "python_executable": sys.executable, "platform": platform.platform(),
         "runtime_environment": _runtime_environment(),
         "packages": {name: importlib.metadata.version(name) for name in
@@ -663,11 +700,12 @@ def run_facade(args):
                             (output / "results.json").write_text(json.dumps(report, indent=2, sort_keys=True))
                             print(json.dumps({key: value for key, value in cell.items()
                                               if key != "samples_ns"}, sort_keys=True), flush=True)
-        report["source_stable_during_run"] = source_manifest() == manifest
-        if not report["source_stable_during_run"]:
+        report["harness_source_stable_during_run"] = source_manifest() == manifest
+        if not report["harness_source_stable_during_run"]:
             raise RuntimeError("source_changed_during_benchmark")
         if sha256(active_bridge.__file__) != report["render_module_sha256"]:
             raise RuntimeError("render_module_changed_during_benchmark")
+        _assert_build_manifest_stable(report)
         report["run_status"] = "PASS"
     except BaseException as exc:
         report.update(run_status="FAILED", failure_type=type(exc).__name__)
@@ -692,6 +730,7 @@ def run(args):
     native_source = Path(args.native_library).resolve()
     # Bind results to an immutable copy of the native artifact actually loaded.
     artifact_digest = sha256(native_source)
+    build_identity = _build_manifest_identity(args.build_manifest, artifact_digest)
     native_copy = output / "vllm_router_rs.so"
     shutil.copy2(native_source, native_copy)
     if sha256(native_copy) != artifact_digest or sha256(native_source) != artifact_digest:
@@ -700,12 +739,13 @@ def run(args):
     manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     (output / "source-manifest.json").write_bytes(manifest_bytes)
     report = {
-        "source_head": manifest["head"], "source_dirty": manifest["dirty"],
+        "harness_source_head": manifest["head"], "harness_source_dirty": manifest["dirty"],
+        **build_identity,
         "platform": platform.platform(), "python": sys.version,
         "runtime_environment": _runtime_environment(),
         "packages": {name: importlib.metadata.version(name) for name in
                      ("vllm", "torch", "transformers", "tokenizers", "pydantic", "jinja2")},
-        "source_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "harness_source_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "native_artifact": str(native_copy), "native_sha256": artifact_digest,
         "native_build_profile": "caller supplied; inspect build evidence, do not assume release",
         "model_directory": str(model_dir), "iterations_per_cell": args.iterations,
@@ -758,6 +798,7 @@ def run(args):
             for backend in ("native", "vllm"):
                 config = {"backend": backend, "native_library": str(native_copy),
                           "installed_wheel": args.installed_wheel,
+                          "native_build_manifest": build_identity["native_build_manifest"],
                           "native_sha256": artifact_digest, "model_directory": str(model_dir),
                           "model": model, "worker_url": worker, "render_config": str(render_config),
                           "router_port": free_port(), "telemetry_port": free_port(),
@@ -829,9 +870,10 @@ def run(args):
                         if result["status"] != "PASS":
                             raise RuntimeError("benchmark_cell_failed_stopping_bounded_run")
         final_manifest = json.dumps(source_manifest(), sort_keys=True, separators=(",", ":")).encode()
-        report["source_stable_during_run"] = final_manifest == manifest_bytes
-        if not report["source_stable_during_run"]:
+        report["harness_source_stable_during_run"] = final_manifest == manifest_bytes
+        if not report["harness_source_stable_during_run"]:
             raise RuntimeError("source_changed_during_benchmark")
+        _assert_build_manifest_stable(report)
         report["run_status"] = ("FAIL" if any(cell["status"].startswith("FAIL") for cell in report["cells"])
                                 else "PASS")
     except BaseException as exc:
@@ -850,6 +892,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--child", help=argparse.SUPPRESS)
     parser.add_argument("--native-library")
+    parser.add_argument("--build-manifest", help="PASS build record with candidate_sha and native_sha256; verified, never inferred from harness HEAD")
     parser.add_argument("--model-directory")
     parser.add_argument("--output", help="New task-owned directory; must not exist")
     parser.add_argument("--iterations", type=int, default=10, choices=range(10, 201))
