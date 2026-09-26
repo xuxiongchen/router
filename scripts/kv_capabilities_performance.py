@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Finite, opt-in GPU comparison: round_robin versus kv_aware + vLLM input.
+"""Finite product comparison and explicitly test-only KV performance ablations.
 
 Starts/stops only its own Router child. Two exclusive DP=1 Workers must already
-be running in a newly authorized environment. No packages, patches, models,
-Workers or cloud resources are installed/launched/changed. Default trace mode
+be running in a newly authorized environment. No packages, patches or models
+are installed. There is no built-in Worker/cloud management: only a separately
+authorized user-provided fresh-cohort hook may replace the specified Workers.
+Hook failure/timeout does not prove its Workers were cleaned up; the saved
+evidence must be handed to the user or their owning supervisor. Default trace mode
 uses fresh first-block namespaces per phase, preventing cache carry-over without
 clearing any Worker cache. Logical trace/order and target lengths are identical,
 NOT byte-identical prompts. Actual text token lengths can differ and are recorded.
@@ -11,16 +14,44 @@ Explicit --allow-test-worker-cache-reset instead requires an
 already-authorized working reset endpoint and reuses byte-identical traces.
 The runner never enables development mode or falls back after a failed reset.
 
-TTFT is request-send start to the first complete SSE record containing nonempty
-generated text, not response headers. Router start and direct warmup are excluded
-from timings. Round-robin bypasses Router token preparation while KV includes it:
-this is an end-to-end product comparison, not an isolated scorer microbenchmark.
+Product RR remains a separate baseline. Test-only A/B/C require the kv-perf
+native feature and respectively measure shared forwarding without render + RR,
+real render + RR, and real render + KV. C-B includes changed Worker placement,
+not just scorer time. The ordinary product_kv arm needs no experimental mode.
+
+Timed requests use warmed per-client keep-alive connections, omit prompt-ID
+echoes, and require actual usage and a complete SSE response. The full token
+oracle runs after the timing/counter window, never warming its measured cache.
+Headers, first SSE, first reasoning, first nonempty text and completion are
+separate durations. TTFT means first nonempty text, not response headers.
+
+Fresh-cohort hook contract (not supplied by this repository): the caller must
+obtain fresh authority for replacing only these test Workers, then pass an
+absolute executable with --cache-state fresh-cohort --cohort-preparation-hook
+/absolute/user-approved-script --allow-cohort-preparation. No shell is used.
+The script receives CMB_KV_PERF_WORKER_URLS as a JSON array of the two unchanged
+loopback URLs, and CMB_KV_PERF_PHASE_DIR as the evidence directory. It must print
+one JSON object, e.g. {"status":"PASS","state":"fresh_empty_cache",
+"worker0_pid":101,"worker1_pid":102,"engine0_pid":103,"engine1_pid":104}.
+PIDs above are schema examples, not real processes. The harness independently
+checks live PID/start identity, changed event epochs, semantic compatibility,
+and identical full prepared tokens; it never trusts that declaration alone.
+The hook may not change models/configuration, patch packages or reuse Engines.
+
+Public local check: python scripts/kv_capabilities_performance.py --self-check
+For an already bound GPU invocation, a final single-cell experiment adds:
+--arms product_rr A B C --rounds 3 --scenarios locality --concurrencies 4
+--max-seconds 3600 plus the explicitly authorized fresh-cohort options above.
+Always choose a smaller bound if the fresh GPU authorization has less time.
+The default namespaced mode is NON-STRICT exploration; unavailable stock reset
+is not enabled automatically or presented as a verified alternative.
 """
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import hashlib
+from functools import lru_cache
 import http.client
 import importlib.metadata
 import importlib.util
@@ -28,8 +59,11 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import random
+import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -43,6 +77,10 @@ import render_bridge_gpu_validate as acceptance
 
 ROOT = Path(__file__).resolve().parents[1]
 require, save = prior.require, prior.save
+BENCHMARK_ENV = "VLLM_ROUTER_KV_PERF_MODE"
+ARMS = {"product_rr": ("round_robin", None), "product_kv": ("kv_aware", None),
+        "A": ("kv_aware", "shared_rr"), "B": ("kv_aware", "render_rr"),
+        "C": ("kv_aware", "render_kv")}
 
 
 def percentiles(values):
@@ -79,17 +117,49 @@ def sse_events(response, clock=time.perf_counter):
     raise RuntimeError("SSE response exceeded finite byte budget")
 
 
-def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None, measure_ttft=True):
+def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None, measure_ttft=True,
+                     connection=None, require_token_ids=True, require_keepalive=False):
     parsed = urllib.parse.urlsplit(url)
-    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    owned_connection = connection is None
+    if owned_connection:
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
     raw = json.dumps(payload, separators=(",", ":")).encode()
-    row = {"request_id": request_id, "status": "ERROR", "request_sha256": hashlib.sha256(raw).hexdigest()}
+    correlation_id = "cmb-perf-" + uuid.uuid4().hex
+    row = {"request_id": request_id, "correlation_id": correlation_id, "status": "ERROR",
+           "request_sha256": hashlib.sha256(raw).hexdigest()}
     started = time.perf_counter()
-    first_text, usage, seen_ids, done, response_id = None, None, None, False, None
+    row.update(started_monotonic=started, connection_reused=connection.sock is not None)
+    first_text, first_event, first_reasoning = None, None, None
+    usage, seen_ids, done, response_id, finish_reason = None, None, False, None, None
+    active_socket = [connection.sock]
+    expired = threading.Event()
+
+    def expire():
+        # HTTPResponse.readline and chunk framing can otherwise be kept alive
+        # by a slow drip below each socket timeout. Shutdown interrupts those
+        # blocking reads at the absolute deadline, including tail draining.
+        expired.set()
+        value = active_socket[0]
+        if value is not None:
+            try:
+                value.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    watchdog = threading.Timer(max(0, started + timeout - time.perf_counter()), expire)
+    watchdog.daemon = True
+    watchdog.start()
     try:
-        connection.request("POST", "/v1/completions", raw, {"Content-Type": "application/json"})
+        require(not require_keepalive or connection.sock is not None,
+                "timed keep-alive connection was closed; automatic reconnect is not allowed")
+        if connection.sock is not None:
+            connection.sock.settimeout(timeout)
+        connection.request("POST", "/v1/completions", raw,
+                           {"Content-Type": "application/json", "X-Request-Id": correlation_id})
+        active_socket[0] = connection.sock
+        require(not expired.is_set(), "absolute request deadline expired while dispatching")
         response = connection.getresponse()
-        row["http_status"] = response.status
+        row.update(http_status=response.status, headers_ms=(time.perf_counter() - started) * 1000)
         if response.status != 200:
             raise RuntimeError(f"generation HTTP {response.status}: {response.read(400)!r}")
         require("text/event-stream" in response.getheader("Content-Type", ""), "response is not SSE")
@@ -102,11 +172,19 @@ def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None,
             if event is None:
                 done = True
                 break
+            if first_event is None:
+                first_event = arrived
             if response_id is None:
                 response_id = event.get("id")
             if event.get("usage"):
                 usage = event["usage"]
             for choice in event.get("choices", []):
+                if choice.get("finish_reason") is not None:
+                    require(choice["finish_reason"] in ("stop", "length"), "unsuccessful generation finish reason")
+                    finish_reason = choice["finish_reason"]
+                reasoning = choice.get("reasoning") or choice.get("reasoning_content")
+                if first_reasoning is None and isinstance(reasoning, str) and reasoning:
+                    first_reasoning = arrived
                 if first_text is None and isinstance(choice.get("text"), str) and choice["text"]:
                     first_text = arrived
                 ids = choice.get("prompt_token_ids")
@@ -114,22 +192,90 @@ def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None,
                     require(seen_ids is None or seen_ids == ids, "generation prompt IDs changed within SSE")
                     seen_ids = ids
         require(done, "SSE never produced completion")
+        require(finish_reason is not None, "SSE completed without a successful generation finish reason")
+        # Consume the HTTP framing after [DONE], so the same socket can serve
+        # another request. Never silently replay a failed/reconnected request.
+        tail = response.read(65537)
+        require(len(tail) <= 65536 and not tail.strip(), "unexpected response bytes after SSE completion")
+        require(not expired.is_set() and time.perf_counter() - started <= timeout,
+                "absolute request deadline expired")
         if measure_ttft:
             require(first_text is not None, "SSE never produced nonempty generated text")
         expected = payload["prompt"] if isinstance(payload["prompt"], list) else expected_tokens
-        require(expected and seen_ids == expected, "actual Worker prompt IDs differ from exact prepared trace")
+        require(expected, "exact prepared trace is missing")
+        if require_token_ids:
+            require(seen_ids == expected, "actual Worker prompt IDs differ from exact prepared trace")
+        else:
+            require(not payload.get("return_token_ids") and seen_ids is None,
+                    "timed response unexpectedly included diagnostic prompt IDs")
         require(usage is not None and usage.get("prompt_tokens") == len(expected),
                 "actual generation usage missing or prompt token length differs")
         require(usage.get("completion_tokens") == payload["max_tokens"],
                 "fixed-output trace did not generate the requested token count")
         row.update(status="PASS", ttft_ms=(first_text - started) * 1000 if first_text is not None else None,
+                   first_sse_ms=(first_event - started) * 1000 if first_event is not None else None,
+                   first_reasoning_ms=(first_reasoning - started) * 1000 if first_reasoning is not None else None,
                    end_to_end_ms=(time.perf_counter() - started) * 1000,
-                   prompt_tokens=len(seen_ids), output_tokens=usage["completion_tokens"], response_id=response_id)
+                   prompt_tokens=len(expected), output_tokens=usage["completion_tokens"],
+                   response_id=response_id, finish_reason=finish_reason)
     except Exception as error:
         row.update(error=f"{type(error).__name__}: {error}", end_to_end_ms=(time.perf_counter() - started) * 1000)
     finally:
-        connection.close()
+        watchdog.cancel()
+        watchdog.join(timeout=1)
+        if watchdog.is_alive():
+            row.update(status="ERROR", error="deadline watchdog did not quiesce before connection return")
+        row["deadline_exceeded"] = expired.is_set()
+        if owned_connection or row["status"] != "PASS":
+            connection.close()
     return row
+
+
+class KeepAliveClients:
+    """One exclusive warmed HTTP/1.1 connection per concurrent client slot."""
+
+    def __init__(self, url, concurrency):
+        self.url, self.connections = url, []
+        self.available = queue.Queue()
+        parsed = urllib.parse.urlsplit(url)
+        try:
+            for index in range(concurrency):
+                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=60)
+                self.connections.append(connection)
+                connection.request("GET", "/health")
+                response = connection.getresponse()
+                response.read()
+                require(response.status == 200 and connection.sock is not None,
+                        "Router did not preserve a warmed keep-alive connection")
+                self.available.put((index, connection))
+        except BaseException:
+            self.close()
+            raise
+
+    def request(self, payload, request_id, expected_tokens):
+        index, connection = self.available.get(timeout=60)
+        try:
+            row = streamed_request(self.url, payload, request_id, expected_tokens=expected_tokens,
+                                   connection=connection, require_token_ids=False, require_keepalive=True)
+            row["client_slot"] = index
+            return row
+        finally:
+            self.available.put((index, connection))
+
+    def close(self):
+        for connection in self.connections:
+            connection.close()
+
+
+def validate_benchmark_capabilities(info, arm):
+    mode = ARMS[arm][1]
+    require(isinstance(info, dict), "native benchmark capability response is not an object")
+    require(info.get("selected_mode") == mode, "native did not confirm the requested experimental mode")
+    if mode is not None:
+        require(info.get("enabled") is True and info.get("loopback_only") is True
+                and info.get("environment_variable") == BENCHMARK_ENV and mode in info.get("modes", []),
+                "A/B/C require an explicitly enabled loopback-only kv-perf build")
+    return info
 
 
 def counters(workers):
@@ -142,14 +288,16 @@ def counters(workers):
 def idle(workers, router=None, timeout=30):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        running = [prior.count(prior.metrics(worker), "vllm:num_requests_running") for worker in workers]
+        values = [prior.metrics(worker) for worker in workers]
+        running = [prior.count(value, "vllm:num_requests_running") for value in values]
+        waiting = [prior.count(value, "vllm:num_requests_waiting") for value in values]
         loads = [0, 0]
         if router:
             values = prior.json_request(router, "/workers")["workers"]
             selected = {item["url"].rstrip("/"): item for item in values if item["url"].rstrip("/") in workers}
             require(set(selected) == set(workers), "Router does not have exactly both fixture Workers")
             loads = [selected[worker]["load"] for worker in workers]
-        if running == [0, 0] and loads == [0, 0]:
+        if running == [0, 0] and waiting == [0, 0] and loads == [0, 0]:
             return
         time.sleep(0.1)
     raise RuntimeError("exclusive fixture Workers did not return to idle")
@@ -163,6 +311,9 @@ def child(path):
     native = importlib.util.module_from_spec(spec)
     sys.modules["vllm_router_rs"] = native
     spec.loader.exec_module(native)
+    capability = (native.kv_perf_capabilities() if hasattr(native, "kv_perf_capabilities")
+                  else {"enabled": False, "modes": [], "selected_mode": None})
+    save(config["benchmark_identity"], validate_benchmark_capabilities(capability, config["arm"]))
     sys.path.insert(0, str(ROOT / "py_src"))
     from vllm_router.router import Router
     from vllm_router.router_args import RouterArgs
@@ -170,7 +321,7 @@ def child(path):
                "worker_urls": config["workers"], "policy": config["policy"],
                "worker_startup_timeout_secs": 150, "worker_startup_check_interval": 1,
                "request_timeout_secs": 60, "health_check_interval_secs": 60,
-               "disable_retries": True, "log_level": "warn",
+               "disable_retries": True, "log_level": config["log_level"],
                "prometheus_host": "127.0.0.1", "prometheus_port": config["metrics_port"],
                # Client concurrency remains 1/4. Avoid measuring an implicit
                # small token-bucket refill limit or an artificial server queue.
@@ -200,9 +351,19 @@ def child(path):
 def owned_router(config, directory):
     manifest = directory / "router-child.json"
     save(manifest, config)
+    environment = os.environ.copy()
+    for key in (BENCHMARK_ENV, "VLLM_ROUTER_KV_STAGE_TIMING", "VLLM_ROUTER_KV_STAGE_TRACE"):
+        environment.pop(key, None)
+    if ARMS[config["arm"]][1] is not None:
+        environment[BENCHMARK_ENV] = ARMS[config["arm"]][1]
+    if config["stage_timing"]:
+        environment["VLLM_ROUTER_KV_STAGE_TIMING"] = "1"
+    if config["stage_trace"]:
+        environment["VLLM_ROUTER_KV_STAGE_TRACE"] = "1"
     with (directory / "router.log").open("wb") as log:
         process = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--child", str(manifest)],
-                                   cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                                   cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                                   env=environment)
         try:
             deadline = time.monotonic() + 180
             while time.monotonic() < deadline:
@@ -215,6 +376,8 @@ def owned_router(config, directory):
                 time.sleep(0.2)
             else:
                 raise RuntimeError("owned Router startup timeout")
+            validate_benchmark_capabilities(json.loads(Path(config["benchmark_identity"]).read_text()),
+                                            config["arm"])
             yield process
         finally:
             if process.poll() is None:
@@ -230,7 +393,8 @@ def owned_router(config, directory):
 def make_trace(args, vocabulary, scenario, namespace, trace_seed):
     """Same logical trace/target lengths; actual text lengths are independently recorded."""
     rng = random.Random(trace_seed)
-    prefix_count = args.groups if scenario == "locality" else args.requests
+    has_locality = scenario in ("locality", "shared")
+    prefix_count = args.groups if has_locality else args.requests
     prefixes = [rng.choices(vocabulary, k=args.prefix_tokens) for _ in range(prefix_count)]
     namespace_rng = random.Random(namespace)
     for prefix in prefixes:
@@ -239,18 +403,22 @@ def make_trace(args, vocabulary, scenario, namespace, trace_seed):
     # Fixed bursts deliberately include an owner/locality structure, not an
     # adversarial request-order search. Each locality prefix occurs equally.
     order = ([i // (args.requests // args.groups) for i in range(args.requests)]
-             if scenario == "locality" else list(range(args.requests)))
+             if has_locality else list(range(args.requests)))
+    if has_locality and getattr(args, "trace_order", "burst") == "interleaved":
+        order = [i % args.groups for i in range(args.requests)]
     base = {"model": args.model, "stream": True, "stream_options": {"include_usage": True},
             "max_tokens": args.output_tokens, "ignore_eos": True, "temperature": 0,
-            "add_special_tokens": False, "return_token_ids": True}
+            "add_special_tokens": False, "return_token_ids": False}
     trace = [{**base, "prompt": prefixes[group] + suffixes[i]} for i, group in enumerate(order)]
     warm = []
-    if scenario == "locality":
+    if has_locality:
         for group, prefix in enumerate(prefixes):
             # Distinct tail means warmup covers the intended reusable prefix,
             # not the entire timed query. Same full prompt length in both arms.
-            warm.append((group % 2, {**base, "max_tokens": 1,
-                         "prompt": prefix + rng.choices(vocabulary, k=args.input_tokens - args.prefix_tokens)}))
+            request = {**base, "max_tokens": 1,
+                       "prompt": prefix + rng.choices(vocabulary, k=args.input_tokens - args.prefix_tokens)}
+            for owner in ((0, 1) if scenario == "shared" else (group % 2,)):
+                warm.append((owner, dict(request)))
     if getattr(args, "prompt_format", "token_ids") == "text":
         words = ("forest river water city cloud light garden energy stone morning school "
                  "ocean paper music winter summer green blue animal people earth food").split()
@@ -266,7 +434,8 @@ def make_trace(args, vocabulary, scenario, namespace, trace_seed):
             request["prompt"] = (text_prefixes[order[index]] + "\n"
                                  + " ".join(text_rng.choices(words, k=tail_words))
                                  + "\nBriefly summarize the themes of these words.")
-        for group, (_owner, request) in enumerate(warm):
+        for index, (_owner, request) in enumerate(warm):
+            group = index // 2 if scenario == "shared" else index
             request["prompt"] = (text_prefixes[group] + "\n"
                                  + " ".join(text_rng.choices(words, k=tail_words))
                                  + "\nBriefly summarize the themes of these words.")
@@ -292,29 +461,194 @@ def prepare_trace(workers, trace):
 
 
 class LoadSampler:
-    def __init__(self, router, workers):
+    def __init__(self, router, workers, router_load_known=True, interval=0.5, router_pid=None):
         self.router, self.workers = router, workers
+        self.router_load_known, self.interval, self.router_pid = router_load_known, interval, router_pid
         self.stop = threading.Event()
         self.samples, self.errors = [], []
         self.thread = threading.Thread(target=self.run, name="owned-performance-load-sampler", daemon=True)
 
     def run(self):
-        while not self.stop.is_set():
+        while self.interval > 0 and not self.stop.is_set():
             try:
                 status, _, body = prior.request(self.router, "/workers", timeout=2)
                 require(status == 200, "load snapshot unavailable")
                 values = json.loads(body)["workers"]
                 by_url = {item["url"].rstrip("/"): item for item in values}
+                worker_values = [metric_snapshot(worker)[1] for worker in self.workers]
                 self.samples.append({"at_monotonic": time.monotonic(),
-                                     "router_loads": [by_url[worker]["load"] for worker in self.workers]})
+                    "router_loads": ([by_url[worker]["load"] for worker in self.workers]
+                                     if self.router_load_known else None),
+                    "worker_running": [optional_count(values, "vllm:num_requests_running")
+                                       for values in worker_values],
+                    "worker_waiting": [optional_count(values, "vllm:num_requests_waiting")
+                                       for values in worker_values],
+                    "router_process": process_resources(self.router_pid)})
             except Exception as error:
                 self.errors.append(type(error).__name__)
-            self.stop.wait(0.25)
+            self.stop.wait(self.interval)
 
     def close(self):
         self.stop.set()
-        self.thread.join(5)
+        self.thread.join(8)
         require(not self.thread.is_alive(), "load sampler failed to stop")
+
+
+def optional_count(values, name):
+    selected = [value for (metric, _labels), value in values.items() if metric == name]
+    return sum(selected) if selected else None
+
+
+def metric_snapshot(base):
+    """Preserve raw histogram windows; do not subtract or add quantiles."""
+    status, _, raw = prior.request(base, "/metrics", timeout=2)
+    require(status == 200, "metrics snapshot unavailable")
+    values = {}
+    for line in raw.splitlines():
+        match = re.fullmatch(r"([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+([^ ]+)(?:\s+.*)?", line)
+        if match:
+            name, labels, value = match.groups()
+            try:
+                values[(name, labels or "")] = float(value)
+            except ValueError:
+                pass
+    return raw, values
+
+
+def process_resources(pid):
+    if pid is None:
+        return None
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+        selected = {key: int(value.split()[0]) for key, value in
+                    (line.split(":", 1) for line in status.splitlines())
+                    if key in ("VmRSS", "VmHWM", "Threads")}
+        stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        selected.update(user_cpu_ticks=int(stat[11]), system_cpu_ticks=int(stat[12]),
+                        clock_ticks_per_second=os.sysconf("SC_CLK_TCK"))
+        return selected
+    except (OSError, ValueError, IndexError) as error:
+        return {"unavailable": type(error).__name__}
+
+
+def window_snapshot(config, pid):
+    workers = [metric_snapshot(worker) for worker in config["workers"]]
+    router_raw, _ = metric_snapshot(config["metrics"])
+    names = ("vllm:request_success_total", "vllm:prefix_cache_hits_total",
+             "vllm:prefix_cache_queries_total", "vllm:num_requests_running")
+    return {"at_monotonic": time.monotonic(), "worker_raw_prometheus": [raw for raw, _ in workers],
+            "router_raw_prometheus": router_raw, "router_process": process_resources(pid),
+            "worker_counters": [{name: prior.count(values, name) for name in names}
+                                for _, values in workers],
+            "histogram_scope": "Aggregate window only; not correlated to individual request IDs. "
+                               "Nested stage durations must not be summed or p95-subtracted."}
+
+
+def token_oracle_after_timing(config, trace, expected, evidence_path):
+    """Full generated prompt IDs for every trace on both Workers, after timing."""
+    rows = []
+    try:
+        for index, (request, tokens) in enumerate(zip(trace, expected)):
+            probe = {**request, "max_tokens": 1, "return_token_ids": True}
+            for owner, worker in enumerate(config["workers"]):
+                row = streamed_request(worker, probe, index, expected_tokens=tokens, measure_ttft=False)
+                rows.append({"worker_index": owner, **row})
+                require(row["status"] == "PASS", f"post-window actual Worker token oracle failed: {row}")
+        return rows
+    finally:
+        save(evidence_path, rows)
+
+
+def arm_order(arms, round_index, pair_index):
+    offset = (round_index + pair_index) % len(arms)
+    ordered = arms[offset:] + arms[:offset]
+    return ordered if round_index % 2 == 0 else list(reversed(ordered))
+
+
+def validate_cohort_options(args):
+    selected = args.cache_state == "fresh-cohort"
+    require(selected == bool(args.cohort_preparation_hook) == args.allow_cohort_preparation,
+            "fresh-cohort requires both an explicit user hook and current --allow-cohort-preparation authority")
+    if selected:
+        hook = Path(args.cohort_preparation_hook)
+        require(hook.is_absolute() and hook.is_file() and os.access(hook, os.X_OK),
+                "cohort hook must be an explicit existing executable file")
+    require(1 <= args.cohort_timeout <= 300, "cohort hook timeout must be bounded to at most 300 seconds")
+
+
+@lru_cache(maxsize=1)
+def capability_contract_function():
+    spec = importlib.util.spec_from_file_location("_cmb_perf_render_contract",
+                                                  ROOT / "py_src/vllm_router/render_bridge.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._capability_contract
+
+
+def validate_fresh_cohort(previous_descriptors, descriptors, previous_processes, processes):
+    require(set(previous_descriptors) == set(descriptors), "cohort hook changed Worker URLs")
+    contract = capability_contract_function()
+    for worker, descriptor in descriptors.items():
+        old_epoch = previous_descriptors[worker]["events"]["epoch"]
+        require(descriptor["events"]["epoch"] != old_epoch,
+                "cohort hook reused an old Worker event epoch")
+        model = previous_descriptors[worker]["namespace"]["served_model_names"][0]
+        require(contract(previous_descriptors[worker], model) == contract(descriptor, model),
+                "fresh cohort changed the semantic Worker capability contract")
+    previous = {(value["pid"], value["start_ticks"]) for value in previous_processes}
+    require(len(processes) == 4 and all((value["pid"], value["start_ticks"]) not in previous
+                                      for value in processes),
+            "cohort hook reused an old HTTP or EngineCore process; empty-cache claim is unproven")
+
+
+def prepare_fresh_cohort(args, common, directory):
+    """Execute only a caller-provided, explicitly authorized local script.
+
+    No built-in Worker deployment or kill/reset commands. The executable must
+    print one JSON object: status=PASS, state=fresh_empty_cache, worker0_pid,
+    worker1_pid, engine0_pid, engine1_pid. It receives the existing task URLs
+    and output directory via CMB_KV_PERF_WORKER_URLS / CMB_KV_PERF_PHASE_DIR.
+    A new Router is constructed only after actual epochs/processes are checked.
+    """
+    validate_cohort_options(args)
+    hook = Path(args.cohort_preparation_hook).resolve()
+    hook_sha = prior.sha256(hook)
+    observation = {"command": [str(hook)], "script_sha256": hook_sha,
+                   "status": "RUNNING", "authority": "explicit invocation flag; no inherited SSH authority",
+                   "previous_descriptors": common["capabilities"],
+                   "previous_processes": common["worker_processes"]}
+    save(directory / "cohort-preparation.json", observation)
+    try:
+        environment = os.environ.copy()
+        environment.update(CMB_KV_PERF_WORKER_URLS=json.dumps(common["workers"]),
+                           CMB_KV_PERF_PHASE_DIR=str(directory))
+        result = subprocess.run([str(hook)], capture_output=True, text=True, timeout=args.cohort_timeout,
+                                check=False, cwd=ROOT, env=environment)
+        observation.update(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
+        require(result.returncode == 0, "authorized cohort preparation hook failed")
+        require(prior.sha256(hook) == hook_sha, "cohort hook source changed while running")
+        declared = json.loads(result.stdout)
+        observation["hook_result"] = declared
+        require(isinstance(declared, dict) and declared.get("status") == "PASS"
+                and declared.get("state") == "fresh_empty_cache", "hook did not declare a fresh empty cohort")
+        for key in ("worker0_pid", "worker1_pid", "engine0_pid", "engine1_pid"):
+            require(type(declared.get(key)) is int and declared[key] > 0, "invalid hook process manifest")
+            setattr(args, key, declared[key])
+        descriptors = acceptance.worker_capabilities(common["workers"], args.model)
+        observation["observed_descriptors"] = descriptors
+        fresh_config = {**common, "capabilities": descriptors}
+        processes = acceptance.verify_workers(args, fresh_config)
+        observation["observed_processes"] = processes
+        validate_fresh_cohort(common["capabilities"], descriptors, common["worker_processes"], processes)
+        observation.update(status="PASS", hook_result=declared, verified_descriptors=descriptors,
+                           verified_processes=processes)
+        common.update(capabilities=descriptors, worker_processes=processes)
+        return observation
+    except BaseException as error:
+        observation.update(status="FAIL", error=f"{type(error).__name__}: {error}")
+        raise
+    finally:
+        save(directory / "cohort-preparation.json", observation)
 
 
 def validate_reset_response(decoded):
@@ -326,7 +660,7 @@ def validate_reset_response(decoded):
 
 def reset_exact_test_workers(args, config, directory):
     require(args.allow_test_worker_cache_reset, "cache reset is not authorized for this run")
-    idle(config["workers"], config["router"])
+    idle(config["workers"])
     results = []
     for worker in config["workers"]:
         status, _, response = prior.request(worker, "/reset_prefix_cache", {}, timeout=10)
@@ -337,12 +671,18 @@ def reset_exact_test_workers(args, config, directory):
     save(directory / "authorized-cache-resets.json", results)
 
 
-def phase(args, common, policy, scenario, concurrency, pair_seed, out):
-    name = f"{scenario}-c{concurrency}-{policy}"
+def phase(args, common, arm, scenario, concurrency, pair_seed, out, round_index=0):
+    policy, mode = ARMS[arm]
+    name = f"{scenario}-c{concurrency}-r{round_index + 1}-{arm}"
     directory = out / name
     directory.mkdir()
-    config = {**common, "policy": policy, "facade_identity": str(directory / "facade-identity.json")}
-    namespace = pair_seed if args.allow_test_worker_cache_reset else pair_seed + ":" + policy
+    if args.cache_state == "fresh-cohort":
+        prepare_fresh_cohort(args, common, directory)
+    config = {**common, "policy": policy, "arm": arm,
+              "facade_identity": str(directory / "facade-identity.json"),
+              "benchmark_identity": str(directory / "native-benchmark.json")}
+    strict_pair = args.cache_state in ("reset", "fresh-cohort")
+    namespace = pair_seed if strict_pair else pair_seed + ":" + arm
     trace, warm, order = make_trace(args, args.vocabulary, scenario, namespace, pair_seed)
     expected_trace = prepare_trace(config["workers"], trace)
     expected_warm = prepare_trace(config["workers"], [request for _owner, request in warm])
@@ -355,35 +695,40 @@ def phase(args, common, policy, scenario, concurrency, pair_seed, out):
          "direct_warm": [{"worker_index": owner, "request": request,
                           "expected_prompt_token_ids": expected_warm[index]}
                          for index, (owner, request) in enumerate(warm)]})
+    if args.cache_state == "reset":
+        # Clear before creating the Router, so no old event/index generation is
+        # carried across phases. This never enables an unavailable reset API.
+        reset_exact_test_workers(args, config, directory)
     with owned_router(config, directory) as process:
         process_before = prior.process(process.pid)
         native_before = acceptance.mapped_native(process.pid, args.native)
         idle(config["workers"], config["router"])
-        if args.allow_test_worker_cache_reset:
-            reset_exact_test_workers(args, config, directory)
         # Exclude subscription startup and direct warmup from measured latency.
         time.sleep(args.event_wait)
         warm_rows = []
         for index, (owner, request) in enumerate(warm):
-            result = streamed_request(config["workers"][owner], request, f"warm-{index}",
+            result = streamed_request(config["workers"][owner], {**request, "return_token_ids": True}, f"warm-{index}",
                                       expected_tokens=expected_warm[index], measure_ttft=False)
             require(result["status"] == "PASS", f"direct warm failed: {result}")
             warm_rows.append({"worker_index": owner, **result})
         save(directory / "warmup-results.json", warm_rows)
         idle(config["workers"], config["router"])
         time.sleep(args.event_wait)
-        before = counters(config["workers"])
+        before_window = window_snapshot(config, process.pid)
+        save(directory / "metrics-before.json", before_window)
+        before = before_window["worker_counters"]
         metadata_before = acceptance.metadata_access_count(config["worker_logs"])
         render_before = acceptance.render_access_count(config["worker_logs"])
-        sampler = LoadSampler(config["router"], config["workers"])
+        sampler = LoadSampler(config["router"], config["workers"], arm != "product_rr",
+                              args.sample_interval, process.pid)
         rows = []
+        clients = KeepAliveClients(config["router"], concurrency)
         sampler.thread.start()
         started = time.perf_counter()
         executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="owned-performance-client")
         futures = []
         try:
-            futures = [executor.submit(streamed_request, config["router"], request, i,
-                                       expected_tokens=expected_trace[i])
+            futures = [executor.submit(clients.request, request, i, expected_trace[i])
                        for i, request in enumerate(trace)]
             for future in as_completed(futures):
                 rows.append(future.result())
@@ -395,15 +740,38 @@ def phase(args, common, policy, scenario, concurrency, pair_seed, out):
             for future in futures:
                 future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
+            clients.close()
             sampler.close()
+            recorded = {row["request_id"] for row in rows}
+            unresolved = []
+            for index, future in enumerate(futures):
+                if index in recorded:
+                    continue
+                if future.cancelled():
+                    unresolved.append({"request_id": index, "state": "CANCELLED_BEFORE_START"})
+                elif future.done():
+                    try:
+                        rows.append(future.result())
+                    except Exception as error:
+                        rows.append({"request_id": index, "status": "ERROR",
+                                     "error": f"{type(error).__name__}: {error}"})
+                else:
+                    unresolved.append({"request_id": index, "state": "IN_FLIGHT_AT_INTERRUPTION"})
+            save(directory / "request-finalization.json", {"unresolved": unresolved,
+                 "scope": "Unresolved requests are not counted as successful or proved cancelled at the Worker."})
+            # Retain partial/error records even when the bounded run is interrupted.
+            save(directory / "requests.json", sorted(rows, key=lambda row: row["request_id"]))
+            save(directory / "load-samples.json", sampler.samples)
         idle(config["workers"], config["router"])
-        after = counters(config["workers"])
+        after_window = window_snapshot(config, process.pid)
+        save(directory / "metrics-after.json", after_window)
+        after = after_window["worker_counters"]
         deltas = [{key: current[key] - previous[key] for key in current} for previous, current in zip(before, after)]
         passed = [row for row in rows if row["status"] == "PASS"]
         request_counts = [row["vllm:request_success_total"] for row in deltas]
         prefix_hits = [row["vllm:prefix_cache_hits_total"] for row in deltas]
         prefix_queries = [row["vllm:prefix_cache_queries_total"] for row in deltas]
-        load_values = [sample["router_loads"] for sample in sampler.samples]
+        load_values = [sample["router_loads"] for sample in sampler.samples if sample["router_loads"] is not None]
         save(directory / "requests.json", sorted(rows, key=lambda row: row["request_id"]))
         save(directory / "load-samples.json", sampler.samples)
         require(sum(request_counts) == len(passed), "Worker counter deltas disagree with successful requests; Workers must be exclusive")
@@ -415,8 +783,18 @@ def phase(args, common, policy, scenario, concurrency, pair_seed, out):
         require(acceptance.render_access_count(config["worker_logs"]) == render_before,
                 "timed generation issued unexpected remote /render calls")
         require(acceptance.mapped_native(process.pid, args.native) == native_before, "mapped native changed during phase")
+        metadata_after = acceptance.metadata_access_count(config["worker_logs"])
+        render_after = acceptance.render_access_count(config["worker_logs"])
+        token_oracle_after_timing(config, trace, expected_trace, directory / "post-timing-token-oracle.json")
+        idle(config["workers"], config["router"])
+        for before_process in common["worker_processes"]:
+            expected_process = {key: value for key, value in before_process.items()
+                                if key != "verified_preprocessing_arguments"}
+            require(prior.process(before_process["pid"]) == expected_process,
+                    "Worker identity changed during a measured phase or its post-window oracle")
         result = {"name": name, "status": "PASS" if len(passed) == args.requests else "FAIL",
-                  "policy": policy, "scenario": scenario, "concurrency": concurrency,
+                  "policy": policy, "arm": arm, "benchmark_mode": mode, "round": round_index + 1,
+                  "scenario": scenario, "concurrency": concurrency,
                   "requested": args.requests, "successful": len(passed), "errors": len(rows) - len(passed),
                   "prompt_format": args.prompt_format,
                   "actual_prompt_tokens_min": min(map(len, expected_trace)),
@@ -425,6 +803,10 @@ def phase(args, common, policy, scenario, concurrency, pair_seed, out):
                   "elapsed_seconds": elapsed, "requests_per_second": len(passed) / elapsed,
                   "output_tokens_per_second": sum(row["output_tokens"] for row in passed) / elapsed,
                   "ttft_ms": percentiles([row["ttft_ms"] for row in passed]),
+                  "headers_ms": percentiles([row["headers_ms"] for row in passed]),
+                  "first_sse_ms": percentiles([row["first_sse_ms"] for row in passed]),
+                  "first_reasoning_ms": percentiles([row["first_reasoning_ms"] for row in passed
+                                                     if row["first_reasoning_ms"] is not None]),
                   "end_to_end_ms": percentiles([row["end_to_end_ms"] for row in passed]),
                   "per_worker_completed_requests": request_counts,
                   "request_jain_fairness": fairness(request_counts),
@@ -433,14 +815,29 @@ def phase(args, common, policy, scenario, concurrency, pair_seed, out):
                   "per_worker_prefix_hit_ratio": [hit / query if query else None for hit, query in zip(prefix_hits, prefix_queries)],
                   "per_worker_mean_sampled_router_load": [sum(row[i] for row in load_values) / len(load_values) for i in range(2)] if load_values else None,
                   "per_worker_max_sampled_router_load": [max(row[i] for row in load_values) for i in range(2)] if load_values else None,
-                  "load_samples": len(load_values), "load_sampling_errors": sampler.errors,
+                  "router_load_status": "UNKNOWN_UNMAINTAINED" if arm == "product_rr" else "ROUTER_INFLIGHT_NOT_GPU_QUEUE",
+                  "load_samples": len(sampler.samples), "load_sampling_errors": sampler.errors,
+                  "sample_interval_seconds": args.sample_interval,
                   "metadata_access_before": metadata_before,
-                  "metadata_access_after": acceptance.metadata_access_count(config["worker_logs"]),
+                  "metadata_access_after": metadata_after,
                   "remote_render_access_before": render_before,
-                  "remote_render_access_after": acceptance.render_access_count(config["worker_logs"]),
+                  "remote_render_access_after": render_after,
                   "router_process": process_before, "mapped_native": native_before,
                   "physical_trace_sha256": prior.sha256(directory / "trace.json"),
-                  "scope": "Warmup/startup excluded; fresh client HTTP connection per request included. Closed-loop client concurrency 1/4; Router burst128/refill100000 per second and queue0 avoid artificial server limiting. Return-token-IDs response overhead is equal in both policies. Text token counts may vary with fresh namespaces and are recorded."}
+                  "request_bodies_sha256": hashlib.sha256(json.dumps(trace, separators=(",", ":")).encode()).hexdigest(),
+                  "prepared_tokens_sha256": hashlib.sha256(json.dumps(expected_trace, separators=(",", ":")).encode()).hexdigest(),
+                  "client_connections": concurrency,
+                  "requests_using_existing_connection": sum(row.get("connection_reused", False) for row in rows),
+                  "initial_cache_state": args.cache_state,
+                  "strict_byte_identical_pair": strict_pair,
+                  "worker_processes": common["worker_processes"], "worker_descriptors": common["capabilities"],
+                  "stage_timing": args.stage_timing, "stage_trace": args.stage_trace,
+                  "scope": "Closed-loop warmed keep-alive clients; no prompt token-ID echo during timing. "
+                           "Full actual Worker prompt-ID oracle runs after all timed counters. "
+                           "Trace submission order is fixed; concurrent wire arrival interleavings are not serialized. "
+                           "C-B includes placement effects, not just scorer time. Router load is not GPU queue. "
+                           "One Timer thread per active request provides an absolute deadline; its CPU/thread cost is equal-arm client overhead. "
+                           "Strict identical-body claims require explicit successful reset or a freshly verified cohort hook."}
         save(directory / "result.json", result)
     return result
 
@@ -450,10 +847,10 @@ def run(args):
     out = prior.output_directory(args.output, args.source)
     report = {"status": "RUNNING", "started_at_unix": time.time(), "phases": [],
               "limitations": ["Finite synthetic product comparison; no universal improvement or production TTFT claim.",
-                "Round-robin bypasses CPU render; kv_aware includes its single render executor, queue and exact-token processing.",
-                "Prefix-hit counters are tokens, not request hit rates. Sampled load is not continuous GPU utilization.",
-                "No cache reset without explicit flag; default uses matched logical traces with different first-block namespaces.",
-                "No release portability or steady-state long-duration throughput claim."]}
+                "Product RR and shared-forward A are distinct baselines. C-B includes changed Worker placement.",
+                "Prefix-hit counters are tokens, not request hit rates. Router load is not GPU utilization or engine queue.",
+                "Without explicitly authorized supported reset, namespaces/initial caches differ and comparisons are not strict.",
+                "Closed-loop throughput is not production capacity; no p99 or SLO PASS is inferred."]}
     save(out / "summary.json", report)
     try:
         identity = acceptance.source_identity(args.source, args.candidate, True)
@@ -474,6 +871,8 @@ def run(args):
                   "render_config": str(Path(args.render_config).resolve()), "serving_args": deployment["serving_args"],
                   "workers": workers, "router_port": args.router_port, "metrics_port": args.metrics_port,
                   "router": f"http://127.0.0.1:{args.router_port}", "automatic_capabilities": True,
+                  "metrics": f"http://127.0.0.1:{args.metrics_port}", "log_level": args.log_level,
+                  "stage_timing": args.stage_timing, "stage_trace": args.stage_trace,
                   "event_endpoints": [args.event0, args.event1],
                   "publisher_endpoints": [args.publisher0, args.publisher1], "capabilities": descriptors,
                   "worker_logs": [args.worker0_log, args.worker1_log]}
@@ -483,6 +882,7 @@ def run(args):
                     and not parsed.path and not parsed.username and not parsed.query and not parsed.fragment,
                     "finite performance fixture requires resolved loopback-only KV subscriber endpoints")
         processes = acceptance.verify_workers(args, common)
+        common["worker_processes"] = processes
         prior.capture_worker_versions(workers, out / "worker-versions.json")
         report.update(identity, native_sha256=native_hash, native=str(Path(args.native).resolve()),
                       build_manifest_sha256=prior.sha256(args.build_manifest),
@@ -494,19 +894,37 @@ def run(args):
                       input_token_target=args.input_tokens, prefix_token_target=args.prefix_tokens,
                       output_tokens=args.output_tokens, prompt_format=args.prompt_format,
                       requests_per_phase=args.requests, groups=args.groups,
-                      trace_mode="byte_identical_with_explicit_cache_reset" if args.allow_test_worker_cache_reset else "same_logical_trace_fresh_first_block_namespaces",
+                      rounds=args.rounds, arms=args.arms, trace_order=args.trace_order,
+                      stage_timing=args.stage_timing, stage_trace=args.stage_trace,
+                      sample_interval_seconds=args.sample_interval, build_manifest=build,
+                      comparison_classification=("IDENTICAL_BODIES_EXPLICIT_" + args.cache_state.upper()
+                                                 if args.cache_state != "namespaced"
+                                                 else "EXPLORATORY_NAMESPACE_AND_INITIAL_STATE_DIFFER"),
+                      trace_mode=("byte_identical_with_explicit_" + args.cache_state if args.cache_state != "namespaced"
+                                  else "same_logical_trace_fresh_first_block_namespaces"),
+                      timing_definitions={"headers_ms": "client-observed response headers, not Rust upstream headers",
+                          "first_sse_ms": "first complete non-DONE SSE JSON record including empty-text records",
+                          "ttft_ms": "first complete SSE record with nonempty generated text",
+                          "first_reasoning_ms": "first nonempty reasoning field when present, otherwise null",
+                          "end_to_end_ms": "HTTP response fully drained after SSE DONE",
+                          "clock": "all client durations share perf_counter; no Rust/Python clocks subtracted"},
                       gpu=prior.command(["nvidia-smi", "--query-gpu=name,memory.total,driver_version,uuid", "--format=csv,noheader"]))
-        seed = uuid.uuid4().hex
+        seed = args.seed or uuid.uuid4().hex
         report["trace_seed"] = seed
-        for pair, (scenario, concurrency) in enumerate((s, c) for s in args.scenarios for c in args.concurrencies):
-            # Counterbalance coarse order across pairs; no selection of best run.
-            policies = ["round_robin", "kv_aware"] if pair % 2 == 0 else ["kv_aware", "round_robin"]
-            pair_seed = f"{seed}:{scenario}:c{concurrency}"
-            for policy in policies:
-                result = phase(args, common, policy, scenario, concurrency, pair_seed, out)
-                report["phases"].append(result)
-                save(out / "summary.json", report)
-        for before in processes:
+        for round_index in range(args.rounds):
+            for pair, (scenario, concurrency) in enumerate((s, c) for s in args.scenarios for c in args.concurrencies):
+                pair_seed = f"{seed}:{scenario}:c{concurrency}:r{round_index + 1}"
+                first_pair_identity = None
+                for arm in arm_order(args.arms, round_index, pair):
+                    result = phase(args, common, arm, scenario, concurrency, pair_seed, out, round_index)
+                    if args.cache_state != "namespaced":
+                        pair_identity = (result["request_bodies_sha256"], result["prepared_tokens_sha256"])
+                        first_pair_identity = first_pair_identity or pair_identity
+                        require(pair_identity == first_pair_identity,
+                                "paired experiment changed request bytes/order or actual prepared tokens")
+                    report["phases"].append(result)
+                    save(out / "summary.json", report)
+        for before in common["worker_processes"]:
             expected = {key: value for key, value in before.items() if key != "verified_preprocessing_arguments"}
             require(prior.process(before["pid"]) == expected, "Worker identity changed during performance comparison")
         require(acceptance.source_identity(args.source, args.candidate, True) == identity, "candidate source changed")
@@ -548,7 +966,7 @@ def self_check():
     require(all(isinstance(row["prompt"], str) for row in texts), "text trace was not preserved as raw text")
     payload = {"prompt": "public test", "max_tokens": 2}
     stream = (b'data: {"id":"test","choices":[{"text":"","prompt_token_ids":[1,2,3]}]}\n\n'
-              b'data: {"id":"test","choices":[{"text":"A"}]}\n\n'
+              b'data: {"id":"test","choices":[{"text":"A","finish_reason":"length"}]}\n\n'
               b'data: {"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
               b'data: [DONE]\n\n')
     class FakeResponse(BytesIO):
@@ -570,7 +988,7 @@ def self_check():
     # A one-token warmup can decode to no text (e.g. a special token). It is not
     # timed, but still must finish with exact prompt IDs and generation usage.
     payload = {"prompt": "public test", "max_tokens": 1}
-    stream = (b'data: {"id":"warm","choices":[{"text":"","prompt_token_ids":[1,2,3]}]}\n\n'
+    stream = (b'data: {"id":"warm","choices":[{"text":"","prompt_token_ids":[1,2,3],"finish_reason":"length"}]}\n\n'
               b'data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n'
               b'data: [DONE]\n\n')
     with patch.object(http.client, "HTTPConnection", return_value=FakeConnection()):
@@ -615,16 +1033,33 @@ def main():
     parser.add_argument("--router-port", type=int, default=3102)
     parser.add_argument("--metrics-port", type=int, default=29102)
     parser.add_argument("--requests", type=int, default=32)
-    parser.add_argument("--groups", type=int, default=8)
+    parser.add_argument("--groups", type=int, default=4)
     parser.add_argument("--input-tokens", type=int, default=1024)
     parser.add_argument("--prefix-tokens", type=int, default=768)
     parser.add_argument("--output-tokens", type=int, default=32)
     parser.add_argument("--prompt-format", choices=("text", "token_ids"), default="text",
                         help="Default real text exercises actual tokenization; token_ids is an explicitly narrower diagnostic")
+    parser.add_argument("--arms", nargs="+", choices=tuple(ARMS), default=["product_rr", "A", "B", "C"],
+                        help="A/B/C require the test-only kv-perf feature; product_rr remains the real baseline")
+    parser.add_argument("--rounds", type=int, default=3, help="Rotated/reversed arm order; never select only the best round")
+    parser.add_argument("--seed", help="Recorded deterministic trace seed; omitted generates a fresh run namespace")
+    parser.add_argument("--trace-order", choices=("burst", "interleaved"), default="burst")
     parser.add_argument("--concurrencies", nargs="+", type=int, default=[1, 4])
-    parser.add_argument("--scenarios", nargs="+", choices=("locality", "cold"), default=["locality", "cold"])
-    parser.add_argument("--budget-seconds", type=int, default=900)
+    parser.add_argument("--scenarios", nargs="+", choices=("locality", "cold", "shared"), default=["locality", "cold"])
+    parser.add_argument("--budget-seconds", "--max-seconds", dest="budget_seconds", type=int, default=900,
+                        help="Default 900; explicit maximum 3600, always within the caller's fresh authorized remaining budget")
     parser.add_argument("--event-wait", type=float, default=2)
+    parser.add_argument("--sample-interval", type=float, default=0.5,
+                        help="Same Worker running/waiting sampling in every arm; 0 disables sampling for overhead controls")
+    parser.add_argument("--log-level", choices=("warn", "info"), default="warn")
+    parser.add_argument("--stage-timing", action="store_true", help="Diagnostic low-cardinality stage histograms, off for headlines")
+    parser.add_argument("--stage-trace", action="store_true", help="Bounded correlated detailed trace; requires stage timing and info logging")
+    parser.add_argument("--cache-state", choices=("namespaced", "reset", "fresh-cohort"), default="namespaced",
+                        help="Default is NON-STRICT exploration. Fresh authorized hook or supported reset is required for controlled identical-byte pairs")
+    parser.add_argument("--cohort-preparation-hook", help="Absolute executable provided by the user; no bundled Worker deployment code")
+    parser.add_argument("--allow-cohort-preparation", action="store_true",
+                        help="Fresh authority to run that user hook before each arm; never inferred from old SSH access")
+    parser.add_argument("--cohort-timeout", type=int, default=180)
     parser.add_argument("--allow-test-worker-cache-reset", action="store_true",
                         help="Explicit fresh authority for clearing only these two idle Workers; requires approved available endpoint, never enables DEV_MODE")
     args = parser.parse_args()
@@ -645,14 +1080,23 @@ def main():
     require(args.concurrencies and len(args.concurrencies) == len(set(args.concurrencies))
             and set(args.concurrencies) <= {1, 4}, "concurrency must be 1 and/or 4, once each")
     require(len(args.scenarios) == len(set(args.scenarios)), "duplicate scenarios")
-    require(120 <= args.budget_seconds <= 900 and 0 <= args.event_wait <= 5, "finite budget exceeded")
+    require(args.arms and len(args.arms) == len(set(args.arms)) and "product_rr" in args.arms,
+            "include the true product_rr baseline exactly once; A is not its replacement")
+    require(1 <= args.rounds <= 3, "bounded experiment supports 1..3 rounds")
+    require(args.sample_interval == 0 or 0.1 <= args.sample_interval <= 5, "invalid bounded sample interval")
+    require(not args.stage_trace or (args.stage_timing and args.log_level == "info"),
+            "detailed trace requires --stage-timing --log-level info, and is not a headline window")
+    require((args.cache_state == "reset") == args.allow_test_worker_cache_reset,
+            "--cache-state reset and explicit --allow-test-worker-cache-reset must be supplied together")
+    validate_cohort_options(args)
+    require(120 <= args.budget_seconds <= 3600 and 0 <= args.event_wait <= 5, "finite budget exceeded")
     def interrupted(_signal, _frame):
         raise KeyboardInterrupt("finite performance deadline/interruption")
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGALRM, interrupted)
     # Request sockets timeout in <=60s; owned Router shutdown <=35s. Reserve
     # that cleanup window inside the finite wall-clock budget.
-    signal.setitimer(signal.ITIMER_REAL, args.budget_seconds - 100)
+    signal.setitimer(signal.ITIMER_REAL, args.budget_seconds - 110)
     try:
         return run(args)
     finally:
