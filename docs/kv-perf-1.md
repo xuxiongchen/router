@@ -249,7 +249,186 @@ Repository-wide Black/Ruff gates are not green: the base already has eleven
 formatting failures and an unused import in `test_kv_dense_source_oracle.py`.
 Do not treat focused checks as the unfiltered repository suite or hosted CI.
 
-GPU product-RR/A/B/C comparison, actual GPU-environment artifact loading,
-affected two-model checks, longer stability and publication approval remain
-outstanding. No new SSH/GPU authority was used. The existing Worker capability
-dependency is unchanged; no additional Worker patch is required by this diff.
+At the CPU-delivery cutoff, GPU comparisons/loading and two-model checks were
+outstanding; the subsequently authorized GPU evidence is recorded below.
+Longer stability and publication approval remain separate. The existing Worker
+capability dependency is unchanged; no additional Worker patch is required.
+
+## Bounded GPU follow-up (2026-09-26)
+
+The executed runtime remains `9a9d968952be05e061fa9b6805fd4b04a15b664b`,
+with the production/ablation wheel and native hashes above. Later documentation
+commits do not relabel those artifacts. Existing optimized CPU-built wheels
+were loaded, not rebuilt remotely, in isolated CPython 3.12.3 environments:
+vLLM 0.29.0, Torch 2.13.0+cu130, Transformers 5.17.0, tokenizers 0.23.2.
+The Conda C++ library lacked GLIBCXX_3.4.30; a process-local preload of the
+existing system libstdc++ resolved loading without replacing shared libraries.
+Actual installed package paths and live native mappings were verified.
+
+The measured setup is one 32760-MiB RTX 4080 SUPER, two separately addressable
+DP=TP=PP=1 Workers, eager execution, and the existing capabilities dependency.
+The container exposes 128 logical CPUs but has a shared 16-CPU quota. This is
+not evidence for balancing across independent GPUs. Initial preflight and
+actual test GPU UUIDs differ; test identities use their own recorded UUID,
+not an assumption of physical-device continuity from the initial preflight.
+
+### Three-round headline: locality, concurrency 4
+
+Each phase has 32 text Completion requests, approximately 1,050 actual prompt
+tokens and 32 generated tokens. All four arms share the same optimized
+**ablation** native. Each arm receives a fresh verified Worker cohort and a
+fresh Router, identical paired request bytes/order and exact prepared tokens,
+controlled owner-prefix warmup, and the same keep-alive clients. Full actual
+Worker token oracles execute after the timed window. Stage logging is off.
+Three rotated rounds completed 12 phases / 384 successful requests, no errors.
+Execution/correctness PASS is not a performance-improvement or SLO PASS.
+
+| Round | Arm | TTFT p50 ms | TTFT p95 ms | Requests/s |
+| --- | --- | ---: | ---: | ---: |
+| 1 | product RR | 58.001 | 104.441 | 6.3151 |
+| 1 | A: shared RR | 58.207 | 95.377 | 6.0864 |
+| 1 | B: render RR | 75.137 | 120.869 | 6.1204 |
+| 1 | C: render KV | 90.367 | 155.181 | 5.8552 |
+| 2 | product RR | 58.437 | 122.775 | 6.1617 |
+| 2 | A: shared RR | 64.029 | 162.989 | 6.2865 |
+| 2 | B: render RR | 75.598 | 104.239 | 6.1077 |
+| 2 | C: render KV | 90.680 | 150.908 | 5.7249 |
+| 3 | product RR | 54.021 | 108.360 | 6.2518 |
+| 3 | A: shared RR | 60.233 | 105.865 | 6.1917 |
+| 3 | B: render RR | 75.960 | 138.917 | 6.1430 |
+| 3 | C: render KV | 86.104 | 175.826 | 5.7282 |
+
+C versus product RR increased TTFT p50 by 32.1–32.4 ms (+55.2–59.4%),
+and reduced throughput by 7.1–8.4%, despite +9.27–9.33 percentage points of
+prefix-token hit ratio (approximately 65% to 74%). These are individual-round
+descriptive results, not pooled quantiles or a general model-family claim.
+B versus A adds 11.6–16.9 ms to p50, representing the complete prepare path
+and its effect on arrivals, not isolated tokenizer or GIL cost.
+
+Every phase completed 16 requests per Worker, but C had sampled running peaks
+of four on each Worker at different times. All its non-idle samples had only
+one Worker active; RR usually had both active. Worker waiting samples stayed
+zero, and aggregate queue means were only about 0.01–0.02 ms. Thus a large
+recorded Worker waiting queue does not explain the regression. C's actual
+prefill and decode wall times increased alongside temporal concentration;
+batching/device contention is a hypothesis, not a GPU-kernel profile result.
+Product-RR Router load is unmaintained/unknown, never a zero-load baseline.
+
+The production executor count remains one: mixed CPU pool results and unresolved
+shared dependency state do not justify adding a production pool. No load gate,
+forced round-robin selector change or safety-check removal was introduced to
+turn this negative performance result into a PASS.
+
+### Separate diagnostic window
+
+A further four-arm locality/C4 round enables stage timing, bounded trace and
+INFO logging together. It is not included in the headline table. For B/C,
+every observed stage has exactly 32 request-correlated records, matching the 32 measured
+request IDs one-for-one. Their sums agree with the post-window cumulative
+metrics. Lazy metric creation leaves pre-window series absent: a numerical
+Prometheus window delta is unavailable, not silently zero. The independently
+matched trace establishes the following finite-request means instead.
+
+| Interval (nested, not additive) | B mean ms | C mean ms |
+| --- | ---: | ---: |
+| Render queue wait | 2.616 | 8.642 |
+| Executor occupied wall time | 12.229 | 9.811 |
+| Python attach/entry, not pure GIL | 0.00784 | 0.00587 |
+| Python call | 11.803 | 9.474 |
+| Asset signature check | 1.117 | 0.849 |
+| Serving preprocessing | 9.636 | 7.829 |
+| Async tokenization, including offload wait | 8.611 | 7.061 |
+| Token conversion | 0.0711 | 0.0542 |
+| Block hash | unavailable | 0.0479 |
+| Index candidates | unavailable | 0.00910 |
+| KV selector total (`selector_total`) | unavailable | 0.1455 |
+
+The facade records 544 explicit stats / 32 requests = 17 per request, with
+zero facade asset content-read/hash calls. This is not a claim of zero internal
+Transformers/OS I/O. Config/schema parsing and normal validation remain.
+Neither tiny attach/entry nor selector durations support attributing the
+headline regression to pure GIL contention or hash computation. Queueing and
+actual preprocessing are measured contributions, not a complete additive TTFT
+decomposition; Worker generation still receives and preprocesses original bytes.
+
+Against matching round-one headline traces, diagnostic B/C throughput changed
+−6.01%/−2.97%, with p50 TTFT +3.96%/+0.52%. This single on/off comparison
+combines timing, trace, INFO logging and temporal noise; it is not a stable or
+pure-observer overhead estimate. Production observation remains disabled.
+
+### Remaining small Qwen cells (exploratory)
+
+The other three cold/locality × C1/C4 cells ran product RR and C only, one
+fresh-cohort round each: six phases / 192 successful requests, zero errors,
+the same artifact and strict within-pair request/token identity checks.
+They are not three-round A/B/C or production-capacity evidence.
+
+| Cell | RR / C TTFT p50 ms | RR / C TTFT p95 ms | RR / C requests/s | RR / C prefix-token hit |
+| --- | ---: | ---: | ---: | ---: |
+| locality C1 | 55.617 / 66.387 | 100.934 / 114.622 | 1.8392 / 1.7617 | 64.49% / 73.84% |
+| cold C4 | 63.500 / 74.480 | 178.210 / 182.346 | 6.4229 / 6.0268 | 0% / 0% |
+| cold C1 | 55.178 / 67.739 | 105.256 / 152.911 | 1.7467 / 1.6751 | 0% / 0% |
+
+Cold controls have genuinely zero observed prefix hits. Their overhead remains
+without a cache benefit. Locality/C1 also remains slower end-to-end; these
+two-arm cells do not separately isolate input preparation from placement.
+These comparisons support the bounded negative result, not a universal
+claim that cache-aware routing cannot benefit larger or independent devices.
+
+### Same-production-artifact cross-family correctness
+
+Qwen3-0.6B and SmolLM2-135M-Instruct each passed the existing 27-case GPU
+functional matrix on the same production native `32e9de…` and runtime `9a9d968`.
+These use the production artifact, distinct from the non-publishing ablation
+performance artifact. Each model checks text Completion/Chat, JSON/SSE, actual
+Worker generation token IDs, Dense boundaries, unsupported salt fallback and
+stream cancellation. No family-specific Router branch was added.
+
+In each model's 464-token boundary, 29 matched blocks correspond to predicted
+and actual 448 reusable tokens, not 464. Generation-time `/render` access counts
+remain unchanged; metadata refresh accesses still occur in the background.
+This proves a finite supported input/layout subset, not arbitrary models, no
+metadata traffic, multimodal support, or full repository/hosted CI.
+
+### CPU affinity experiment and closeout
+
+Four additional groups ran inherit → NUMA0-16 → NUMA0-16 → inherit, each
+product RR/C, reversing the arm order in the last two groups. All eight phases
+/ 256 requests passed their finite identity/correctness checks. The adapter
+changed only startup affinity of the whole Router, not Worker/client settings,
+and used the same boundary observations in both controls. All Router TIDs were
+checked before/after each timed window; actual masks were 0–127 or 0–15.
+Worker/API/Engine and client main-thread masks remained unchanged. This is
+boundary verification, not continuous per-thread ownership or a single-core pin.
+
+| Pair, fixed16 versus inherit | Policy | TTFT p50 delta | TTFT p95 delta | RPS delta |
+| --- | --- | ---: | ---: | ---: |
+| 1 | product RR | +0.99% | +72.97% | +1.88% |
+| 1 | C | +5.69% | −9.38% | +1.50% |
+| 2 (reverse arm order) | product RR | +3.18% | +0.61% | −11.02% |
+| 2 (reverse arm order) | C | −1.14% | +13.68% | −3.61% |
+
+No stable affinity benefit was demonstrated, so no production default or flag
+changed. CPU0–15 are distinct physical cores in GPU-local NUMA0, but this is
+not exclusive allocation, per-thread single-core pinning or memory binding.
+Threads can still migrate within the set; 128→16 also changes permitted burst
+capacity/topology despite the same shared 16-CPU quota. Two short observations
+per setting do not settle affinity choices for other workloads or hardware.
+
+The completed GPU phase contains 30 performance phases / 960 successful timed
+requests, with zero request errors, plus 27 functional cases per model. It does
+not establish a universal speedup, longer stability, real cache-clear behavior,
+unfiltered CI or an agreed production SLO. No model/cache deletion was needed.
+All 32 measured Router processes exited normally. Recorded ownership checks
+covered 35 cohorts (including preserved deployment failures); no recorded owned
+process remained running, all task ports were closed and visible GPU memory
+returned to 0 MiB. Source/native hashes and the read-only Worker dependency
+were unchanged. Services stopped before the user deadline; no instance shutdown,
+push or PR creation occurred.
+
+The local raw-evidence archive SHA256 is
+`17bbb99ef7b669fe436cd9ecc04af06821ed8d5fb97226c9d967a3462f6b9fa1`.
+The archive contains all raw requests, traces, metrics, exit/ownership records,
+source/artifact proofs and exact invocation manifests; its local and remote
+hashes match. Public publication still requires attaching the evidence at a
+real accessible location and human correctness/authorship/license/base review.
