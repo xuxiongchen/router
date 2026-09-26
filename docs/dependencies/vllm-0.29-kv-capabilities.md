@@ -124,8 +124,12 @@ ZMQ tests exercise the actual proposed publisher on loopback. This proves the
 adapter/transport slice, **not** full GPU EngineCore initialization. Hardware
 acceptance remains separately authorized work.
 
-Observed focused result: **39 passed** (CPU, 24.12 seconds). Ruff checks for new
-exporter/API/test code and patch applicability passed. No GPU result is claimed.
+Original source-audit result: **39 passed** (CPU, 24.12 seconds). Ruff checks for
+new exporter/API/test code and patch applicability passed. That original audit
+and its provenance JSON remain CPU-only. The later separately authorized
+[finite GPU deployment report](../kv-capabilities-gpu-results.md) records actual
+Worker initialization, the same patch hash, candidate/native binding and the
+remaining production-installation limitations; it does not relabel this audit.
 
 ## Compact field provenance (original pinned source)
 

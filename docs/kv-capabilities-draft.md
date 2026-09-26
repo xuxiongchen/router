@@ -8,7 +8,7 @@ Separate stored prefix coverage from reusable logical tokens, including the 464-
 
 ## Dependencies and coordination
 
-- Based on accepted Render Bridge `f0f02adb64a26d819b0e6e9e501a37b8a9d71f09`; PR1 unchanged, historical #130 not a dependency.
+- Based on the locally verified Render Bridge `f0f02adb64a26d819b0e6e9e501a37b8a9d71f09`; PR1 unchanged, historical #130 not a dependency. This does not imply maintainer approval of the publication base.
 - Requires the separately reviewed linked vLLM 0.29 capability-export/epoch-topic proposal and full Worker restart. The proposed HTTP endpoint is not stock or maintainer-approved. Coordinate endpoint/shared semantics with #294/#295 before publishing.
 - A changed Worker boot invalidates the fixed input contract; restart Router to repeat automatic conformance. No transparent reboot/replay claim.
 
@@ -16,7 +16,9 @@ Separate stored prefix coverage from reusable logical tokens, including the 464-
 
 Public CPU tests cover initialized manager/spec traversal, descriptor/auth transport, source-executed reuse boundaries and Python entrypoint/automatic defaults. Real vLLM CPU preprocessing for non-Qwen SmolLM2-135M-Instruct matches official render full tokens across 10 input shapes. That preprocessing test uses a controlled descriptor and does not prove actual GPU KV layout.
 
-Rust test code is type-checked; execution and the new native artifact build are outstanding user-run gates. Real two-Worker Qwen/non-Qwen GPU acceptance is pending fresh authorization. Production TTFT and release ABI portability are not established. No salt/adapter/MM, Hybrid/MTP/PD, cost model, new renderer pool or tokens-in/out support is claimed.
+The authorized isolated Linux run passes 55 KV-related Rust tests, 13 bridge tests, fmt/check/Clippy and a debug native build. Two independent DP=1 Workers pass 27/27 finite GPU cases for Qwen3-0.6B and 27/27 for non-Qwen SmolLM2-135M-Instruct, with the same Router binary and no new family-specific production code or handwritten Profile. Full tokens match local preparation, both Worker render endpoints and actual generation. N=464 has 29 stored matches, 448 predicted reusable tokens and 448 actual hit tokens. An actual owned SmolLM2 Worker restart verifies changed-epoch contract rejection, mandatory Router re-conformance and empty observed-subset bootstrap; real cache clear was not run.
+
+[Exact candidate/native bindings and finite measurements](kv-capabilities-gpu-results.md) distinguish measured code from subsequent documentation-only commits. The finite real-text Qwen and SmolLM2 comparisons increase prefix token hits but worsen TTFT and reduce throughput; neither establishes a performance speedup. Each model completed all 256 timed requests, with 16/16 actual Worker request counts per phase. This is finite request-distribution evidence, not universal load balance. Production TTFT and release ABI portability remain unvalidated. No salt/adapter/MM, Hybrid/MTP/PD, cost model, new renderer pool or tokens-in/out support is claimed.
 
 ## Review focus
 

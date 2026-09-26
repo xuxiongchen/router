@@ -77,10 +77,13 @@ The preserved GPU observation N=464, B=16, matched=29 therefore allows 448 reusa
 | Worker proposal | CPU real initialized manager/spec objects, controlled scheduler/engine configuration, real FastAPI auth route and loopback ZMQ; utility transport is controlled, not a GPU EngineCore |
 | Python discovery/entrypoint | CPU HTTP bounds/errors/auth/counters, automatic defaults/conflicts, no request-time discovery/render RPC |
 | Non-Qwen preprocessing | Real vLLM 0.29 HfRenderer and official HTTP renderer; SmolLM2-135M-Instruct, 10 input shapes, full token equality; descriptor is explicitly synthetic |
-| Rust descriptor/subscriber/selection | Public focused tests added and type-checked; execution remains a user-run gate under the current repository permission |
-| Real Worker layout/generation/KV hits with this candidate | **Not yet GPU-verified**; requires fresh authorization, reviewed Worker update/restart and exact new native build |
-| Release ABI / production TTFT | Unvalidated, separate release gates; no global LD_PRELOAD recipe |
+| Rust descriptor/subscriber/selection | Authorized isolated Linux run: 55 KV-related tests and 13 bridge tests pass; fmt/check/Clippy and debug native build pass |
+| Real Worker layout/generation/KV hits | Qwen3-0.6B and non-Qwen SmolLM2-135M-Instruct: 27/27 finite cases each, same candidate and actual mapped native; see exact binding below |
+| Actual Worker restart | SmolLM2 replacement epoch revokes old contract; fresh Router repeats conformance and learns only new observed events. No transparent reboot/replay or real cache-clear claim |
+| Release ABI / production TTFT | Unvalidated, separate release gates. Finite debug comparison improves prefix-hit ratios but does not establish a latency/throughput gain; no global LD_PRELOAD recipe |
 
-SmolLM2 test assets are config/tokenizer-only, from ModelScope `HuggingFaceTB/SmolLM2-135M-Instruct` commit `c134cb42e51e0d1f29041149173377c623c99b25`; no weights were needed for CPU preprocessing. This revision pin is test provenance, not a production allowlist. Qwen3-0.6B remains the subsequent hardware baseline; use the **same new Router binary** for both model runs, sequentially with two independent copies of one model at a time.
+SmolLM2 test assets are from ModelScope `HuggingFaceTB/SmolLM2-135M-Instruct` commit `c134cb42e51e0d1f29041149173377c623c99b25`; CPU preprocessing needs only config/tokenizer files. The separately authorized GPU run also verified its small weight file. This revision pin is test provenance, not a production allowlist. Qwen3-0.6B and SmolLM2 were run sequentially with two independent copies of one model at a time, using the **same new Router binary**.
+
+[Finite CPU/GPU results](kv-capabilities-gpu-results.md) bind final executable evidence to candidate `60ca5ec61fa473141aa09d8f639198e6b8bda554` and the exact debug native SHA; earlier `50d72d9` CPU/GPU records retain their original identity. Later documentation-only commits do not relabel the measured candidate. The original source-audit provenance JSON preserves its earlier CPU-only observation; the hardware report is the subsequent deployment evidence.
 
 Commands and outstanding acceptance gates: [validation guide](kv-capabilities-validation.md). Full results must bind the exact candidate/tree and actual native artifact. The old Render Bridge native SHA/results must not be relabeled as this candidate's evidence.

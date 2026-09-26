@@ -25,13 +25,14 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_PLUGINS='' \
   CMB_CAPABILITIES_TEST_MODEL_DIR=/capability-evidence/assets/SmolLM2-135M-Instruct \
   $PYO3_PYTHON -B -m unittest py_test.test_kv_capabilities_vllm -v
 $PYO3_PYTHON -B scripts/render_bridge_gpu_validate.py --self-check
+$PYO3_PYTHON -B scripts/kv_capabilities_performance.py --self-check
 ```
 
 For another machine, `VLLM_KV_PROPOSAL_SOURCE` is a separately prepared pinned vLLM source tree with the reviewed patch applied, not the installed package. Without the optional source/assets, corresponding tests explicitly skip; a skip is not a PASS. The synthetic fixture never qualifies a real GPU layout. Test asset revision/hashes are in the review evidence; download only configuration/tokenizer files for CPU checks.
 
-### User-run Rust execution/build gate
+### Focused Rust execution/build gate
 
-These commands are provided, **not executed by the agent under the latest repository restrictions**. They operate on the new candidate, not PR1 or the original checkout:
+These reproduction commands operate on the new candidate, not PR1 or the original checkout. The separately authorized dedicated GPU-host run executed the focused Rust tests and debug build successfully; [the hardware report](kv-capabilities-gpu-results.md) records the exact measured candidate/artifact. Local reproduction still follows the operator's environment permissions:
 
 ```sh
 docker exec cmb-kv-capabilities-dev-x86 bash -c '
@@ -51,7 +52,7 @@ docker exec cmb-kv-capabilities-dev-x86 bash -c '
 
 `cargo check --tests` type-checks test code but does not execute it. The focused set includes real local HTTP + ZMQ subscriber/metadata integration, stale generations, gap/clear/epoch fencing, Dense boundaries, original raw forwarding and render-once/retry protections. No internal `codex_verify.sh` or release build is required here. Broad upstream/native regressions and release/wheel portability remain separate gates.
 
-## Fresh GPU authorization needed
+## Fresh authorization for another GPU run
 
 Request a new SSH endpoint, dedicated directory and finite time budget. Deployment approval must explicitly include reviewing/applying the single Worker patch and fully restarting **only owned test Workers**, optional cache clear/restart cases, the local Rust test/debug build gate, and the two event ports' network isolation. Do not assume a previous instance or authorization still applies.
 
@@ -109,7 +110,7 @@ Acceptance requires:
 - No request-level remote rendering; metadata access may increase from documented background refresh/revalidation, not one lookup per request.
 - If separately authorized, reset only an owned Worker cache and demonstrate old ownership is cleared. Restart one owned Worker: new epoch must invalidate the old Router contract; restarting Router repeats conformance and begins empty. These mutation cases are manual/exclusive and are not automatically performed by the runner.
 
-Stop only owned task processes on completion or budget expiry. Any cloud fix must be returned to this contribution branch and all final affected tests rerun against the new candidate/native SHA. No GPU PASS is claimed until these actual executions finish.
+Stop only owned task processes on completion or budget expiry. Any cloud fix must be returned to this contribution branch and all final affected tests rerun against the new candidate/native SHA. Every GPU PASS must identify its actual executed candidate and native artifact; a later documentation commit is not a new measured binary.
 
 ## Optional finite performance comparison
 
@@ -147,3 +148,7 @@ comparison, not an isolated scoring benchmark. Two Workers on one GPU, a debug
 extension, short synthetic traces, client HTTP setup and token-ID response
 overhead limit extrapolation to production. Gains, neutral results and
 regressions must all be reported; no universal speedup is an acceptance rule.
+The ordinary RR path does not maintain the same Router load counter as KV's
+owned lease. A zero RR `/workers.load` is not an idle GPU and must not be
+compared numerically with the KV counter. Actual Worker completed-request
+counts provide the finite request-distribution evidence.
