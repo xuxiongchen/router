@@ -5,6 +5,7 @@ use crate::config::KvAwareConfig;
 use crate::core::Worker;
 use crate::kv_index::{BlockKeyGenerator, KVBlockIndex};
 use crate::metrics::RouterMetrics;
+use crate::prompt_tokens::timing::StageTimer;
 use sha2::{Digest, Sha256};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -73,11 +74,15 @@ impl LoadBalancingPolicy for KvAwarePolicy {
         token_ids: Option<&[u32]>,
         _headers: Option<&RequestHeaders>,
     ) -> Option<usize> {
+        let _selector = StageTimer::start("selector_total");
+        let hash = StageTimer::start("block_hash");
         let keys = token_ids
             .map(|ids| self.generator.generate_block_keys(ids))
             .unwrap_or_default();
+        drop(hash);
         let dense_reuse = self.dense_reuse.load(Ordering::Acquire);
         let query_tokens = token_ids.map_or(0, <[u32]>::len);
+        let index = StageTimer::start("index_candidates");
         let candidates: Vec<_> = get_healthy_worker_indices(workers)
             .into_iter()
             .map(|i| {
@@ -98,6 +103,7 @@ impl LoadBalancingPolicy for KvAwarePolicy {
                 }
             })
             .collect();
+        drop(index);
         let best_score = candidates.iter().map(|candidate| candidate.score).max()?;
         let least_load = candidates
             .iter()

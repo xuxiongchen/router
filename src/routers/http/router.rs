@@ -12,6 +12,7 @@ use crate::program_scheduling::{
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
 };
 use crate::prompt_tokens::bridge::{PreparedResult, RenderBridge, RenderContract, RequestKind};
+use crate::prompt_tokens::timing::StageTimer;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
     InferenceGenerateRequest, RerankRequest, RerankResponse, RerankResult, ResponsesRequest,
@@ -39,7 +40,111 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
+
+pub(crate) const KV_PERF_ENV: &str = "VLLM_ROUTER_KV_PERF_MODE";
+pub(crate) const KV_PERF_MODES: [&str; 3] = ["shared_rr", "render_rr", "render_kv"];
+
+fn parse_kv_perf_mode(value: Option<&str>, enabled: bool) -> Result<Option<&'static str>, String> {
+    let Some(value) = value else { return Ok(None) };
+    if !enabled {
+        return Err(format!(
+            "{KV_PERF_ENV} requires the benchmark-only kv-perf build feature"
+        ));
+    }
+    KV_PERF_MODES
+        .into_iter()
+        .find(|mode| *mode == value)
+        .map(Some)
+        .ok_or_else(|| format!("{KV_PERF_ENV} must be shared_rr, render_rr, or render_kv"))
+}
+
+/// Read once during startup (and explicitly by the Python capability manifest),
+/// never on the request path. An accidental benchmark env fails closed.
+pub(crate) fn kv_perf_requested_mode() -> Result<Option<&'static str>, String> {
+    let value = std::env::var(KV_PERF_ENV);
+    match value {
+        Ok(value) => parse_kv_perf_mode(Some(&value), cfg!(feature = "kv-perf")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{KV_PERF_ENV} must be valid Unicode"))
+        }
+    }
+}
+
+#[cfg(feature = "kv-perf")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KvPerfMode {
+    SharedRr,
+    RenderRr,
+    RenderKv,
+}
+
+#[cfg(feature = "kv-perf")]
+impl KvPerfMode {
+    fn from_validated_name(mode: &str) -> Self {
+        match mode {
+            "shared_rr" => Self::SharedRr,
+            "render_rr" => Self::RenderRr,
+            "render_kv" => Self::RenderKv,
+            _ => unreachable!("benchmark name was validated at startup"),
+        }
+    }
+}
+
+#[cfg(feature = "kv-perf")]
+#[derive(Debug)]
+struct KvPerf {
+    mode: KvPerfMode,
+    round_robin: crate::policies::RoundRobinPolicy,
+}
+
+#[cfg(feature = "kv-perf")]
+fn validate_kv_perf_deployment(
+    config: &crate::config::RouterConfig,
+    worker_urls: &[String],
+    has_capabilities: bool,
+    has_active_contract: bool,
+) -> Result<(), String> {
+    use crate::config::{ConnectionMode, PolicyConfig, RoutingMode};
+    let loopback_host = config
+        .host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback());
+    let loopback_workers = !worker_urls.is_empty()
+        && worker_urls.iter().all(|worker| {
+            reqwest::Url::parse(worker).is_ok_and(|url| {
+                url.scheme() == "http"
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+                    && matches!(url.path(), "" | "/")
+                    && url.host_str().is_some_and(|host| {
+                        host.trim_matches(['[', ']'])
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|address| address.is_loopback())
+                    })
+            })
+        });
+    if !loopback_host || !loopback_workers {
+        return Err(
+            "kv-perf requires a literal loopback Router bind and loopback HTTP workers".into(),
+        );
+    }
+    if !matches!(config.mode, RoutingMode::Regular { .. })
+        || config.connection_mode != ConnectionMode::Http
+        || config.intra_node_data_parallel_size != 1
+        || config.discovery.is_some()
+        || config.program_scheduling.is_some()
+        || !matches!(config.policy, PolicyConfig::KvAware { .. })
+        || !has_capabilities
+        || !has_active_contract
+    {
+        return Err("kv-perf requires static Regular DP=1 kv_aware with an active automatically verified vllm capability bridge, without program scheduling".into());
+    }
+    Ok(())
+}
 
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
     if let Ok(value) = HeaderValue::from_str(&stages.to_string()) {
@@ -254,6 +359,8 @@ impl Drop for KvLoadLease {
 #[derive(Debug)]
 pub struct Router {
     kv_runtime: Option<KvRuntime>,
+    #[cfg(feature = "kv-perf")]
+    kv_perf: Option<KvPerf>,
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
@@ -297,6 +404,34 @@ impl Router {
         worker_urls: Vec<String>,
         ctx: &Arc<crate::server::AppContext>,
     ) -> Result<Self, String> {
+        // All three ablations retain capability discovery, subscriptions,
+        // health fencing and the raw-forward/load/stream lifetime below.
+        let requested_perf_mode = kv_perf_requested_mode()?;
+        #[cfg(feature = "kv-perf")]
+        let kv_perf = if let Some(mode) = requested_perf_mode {
+            validate_kv_perf_deployment(
+                &ctx.router_config,
+                &worker_urls,
+                ctx.render_bridge
+                    .as_ref()
+                    .is_some_and(|bridge| bridge.capability_cohort.is_some()),
+                ctx.render_bridge
+                    .as_ref()
+                    .is_some_and(|bridge| bridge.current_contract().is_some()),
+            )?;
+            warn!(
+                mode,
+                "benchmark-only kv-perf ablation enabled; not a production policy"
+            );
+            Some(KvPerf {
+                mode: KvPerfMode::from_validated_name(mode),
+                round_robin: crate::policies::RoundRobinPolicy::new(),
+            })
+        } else {
+            None
+        };
+        #[cfg(not(feature = "kv-perf"))]
+        let _ = requested_perf_mode;
         let kv_tokenizer =
             if let crate::config::PolicyConfig::KvAware { config } = &ctx.router_config.policy {
                 ctx.router_config
@@ -533,6 +668,8 @@ impl Router {
 
         Ok(Router {
             kv_runtime,
+            #[cfg(feature = "kv-perf")]
+            kv_perf,
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
@@ -1198,6 +1335,9 @@ impl Router {
         headers: Option<&HeaderMap>,
         token_ids: Option<&[u32]>,
     ) -> Option<Arc<dyn Worker>> {
+        // Common A/B/C boundary; includes lookup/filtering plus the actual
+        // selector. The nested KV selector/hash/index intervals are not sums.
+        let _selection = StageTimer::start("router_select_total");
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1222,6 +1362,13 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
+        // A/B ignore affinity only for selection, without publishing fake KV
+        // scores or changing the registered production policy. C is untouched.
+        #[cfg(feature = "kv-perf")]
+        let policy: &dyn LoadBalancingPolicy = match &self.kv_perf {
+            Some(perf) if perf.mode != KvPerfMode::RenderKv => &perf.round_robin,
+            _ => policy.as_ref(),
+        };
         let idx = policy.select_worker_with_tokens(
             &available,
             text,
@@ -1534,18 +1681,24 @@ impl Router {
                 }
             }
         }
-        let response = match otel_http::send_client_request(
-            request,
-            headers,
-            ClientRequestOptions {
-                method: "POST",
-                url: &url,
-                route: Some(route),
-                request_phase: Some("inference"),
-            },
-        )
-        .await
-        {
+        let response = {
+            // Includes client dispatch and upstream header wait, or its
+            // failure/cancellation. Full body/content timings belong to the
+            // client harness; do not inspect or duplicate streamed SSE here.
+            let _timer = StageTimer::start("dispatch_headers");
+            otel_http::send_client_request(
+                request,
+                headers,
+                ClientRequestOptions {
+                    method: "POST",
+                    url: &url,
+                    route: Some(route),
+                    request_phase: Some("inference"),
+                },
+            )
+            .await
+        };
+        let response = match response {
             Ok(response) => response,
             Err(error) => {
                 return (
@@ -1604,6 +1757,29 @@ impl Router {
         model_id: Option<&str>,
         kind: RequestKind,
     ) -> Response {
+        let future = self.route_kv_bytes_inner(headers, raw, model_id, kind);
+        if !crate::prompt_tokens::timing::enabled() {
+            return future.await;
+        }
+        let request_id = headers
+            .and_then(|headers| headers.get("x-request-id"))
+            .filter(|value| value.as_bytes().len() <= 128)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        future
+            .instrument(tracing::info_span!("kv_request", %request_id))
+            .await
+    }
+
+    async fn route_kv_bytes_inner(
+        &self,
+        headers: Option<&HeaderMap>,
+        raw: &[u8],
+        model_id: Option<&str>,
+        kind: RequestKind,
+    ) -> Response {
         let runtime = self
             .kv_runtime
             .as_ref()
@@ -1620,43 +1796,55 @@ impl Router {
                 )
                     .into_response();
             };
-            // Copy the immutable body once for the cross-runtime job. Neither
-            // serde's map ordering nor our older protocol types enter Python.
-            let prepared = bridge.prepare_bytes(kind, raw).await;
-            let tokens = match prepared {
-                PreparedResult::Exact(prepared) => {
-                    if prepared.contract != contract || !bridge.is_current(&contract) {
-                        return (StatusCode::SERVICE_UNAVAILABLE, "Render contract changed")
+            #[cfg(feature = "kv-perf")]
+            let skip_render = self
+                .kv_perf
+                .as_ref()
+                .is_some_and(|perf| perf.mode == KvPerfMode::SharedRr);
+            #[cfg(not(feature = "kv-perf"))]
+            let skip_render = false;
+            // A deliberately omits only per-request local preprocessing. It
+            // still checks this active contract and the pre-dispatch retry
+            // fence, and forwards the untouched request for Worker validation.
+            // B/C copy and render the immutable request exactly once.
+            let tokens = if skip_render {
+                None
+            } else {
+                match bridge.prepare_bytes(kind, raw).await {
+                    PreparedResult::Exact(prepared) => {
+                        if prepared.contract != contract || !bridge.is_current(&contract) {
+                            return (StatusCode::SERVICE_UNAVAILABLE, "Render contract changed")
+                                .into_response();
+                        }
+                        prepared.cache_eligible.then_some(prepared.token_ids)
+                    }
+                    PreparedResult::Invalid { http_status } => {
+                        let status = StatusCode::from_u16(http_status)
+                            .ok()
+                            .filter(StatusCode::is_client_error)
+                            .unwrap_or(StatusCode::BAD_REQUEST);
+                        return (
+                            status,
+                            axum::Json(serde_json::json!({
+                                "error": {
+                                    "message": "Invalid vLLM text request",
+                                    "type": "invalid_request_error",
+                                    "param": null,
+                                    "code": status.as_u16()
+                                }
+                            })),
+                        )
                             .into_response();
                     }
-                    prepared.cache_eligible.then_some(prepared.token_ids)
+                    PreparedResult::Cancelled => {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "Render request cancelled")
+                            .into_response();
+                    }
+                    PreparedResult::Unsupported
+                    | PreparedResult::Unavailable
+                    | PreparedResult::Busy
+                    | PreparedResult::Deadline(_) => None,
                 }
-                PreparedResult::Invalid { http_status } => {
-                    let status = StatusCode::from_u16(http_status)
-                        .ok()
-                        .filter(StatusCode::is_client_error)
-                        .unwrap_or(StatusCode::BAD_REQUEST);
-                    return (
-                        status,
-                        axum::Json(serde_json::json!({
-                            "error": {
-                                "message": "Invalid vLLM text request",
-                                "type": "invalid_request_error",
-                                "param": null,
-                                "code": status.as_u16()
-                            }
-                        })),
-                    )
-                        .into_response();
-                }
-                PreparedResult::Cancelled => {
-                    return (StatusCode::SERVICE_UNAVAILABLE, "Render request cancelled")
-                        .into_response();
-                }
-                PreparedResult::Unsupported
-                | PreparedResult::Unavailable
-                | PreparedResult::Busy
-                | PreparedResult::Deadline(_) => None,
             };
             // This metadata is used only by the existing fair policy and raw
             // transport. Full validation belongs to the vLLM serving facade.
@@ -3341,17 +3529,231 @@ mod tests {
 
     #[tokio::test]
     async fn kv_retry_reuses_exact_tokens_preserves_raw_and_releases_each_lease() {
-        kv_retry_case(false, false).await;
+        kv_retry_case(false, false, None).await;
     }
 
     #[tokio::test]
     async fn kv_render_bridge_prepares_once_and_retries_original_bytes() {
-        kv_retry_case(true, false).await;
+        kv_retry_case(true, false, None).await;
     }
 
     #[tokio::test]
     async fn kv_render_bridge_epoch_change_blocks_retry() {
-        kv_retry_case(true, true).await;
+        kv_retry_case(true, true, None).await;
+    }
+
+    #[test]
+    fn kv_perf_mode_parser_fails_closed_without_mutating_environment() {
+        assert_eq!(parse_kv_perf_mode(None, false).unwrap(), None);
+        assert_eq!(parse_kv_perf_mode(None, true).unwrap(), None);
+        for mode in KV_PERF_MODES {
+            assert!(parse_kv_perf_mode(Some(mode), false).is_err());
+            assert_eq!(parse_kv_perf_mode(Some(mode), true).unwrap(), Some(mode));
+        }
+        for invalid in ["", "round_robin", "shared_rr ", "render", "0"] {
+            assert!(parse_kv_perf_mode(Some(invalid), true).is_err());
+        }
+    }
+
+    #[cfg(feature = "kv-perf")]
+    #[test]
+    fn kv_perf_deployment_rejects_nonlocal_or_unverified_input_paths() {
+        use crate::config::{PolicyConfig, RouterConfig};
+        let mut config = RouterConfig {
+            policy: PolicyConfig::KvAware {
+                config: Default::default(),
+            },
+            ..Default::default()
+        };
+        let urls = vec!["http://127.0.0.1:8000".into(), "http://[::1]:8001/".into()];
+        assert!(validate_kv_perf_deployment(&config, &urls, true, true).is_ok());
+        for (capabilities, active) in [(false, true), (true, false), (false, false)] {
+            assert!(validate_kv_perf_deployment(&config, &urls, capabilities, active).is_err());
+        }
+        for invalid in [
+            "http://localhost:8000",
+            "http://192.0.2.1:8000",
+            "grpc://127.0.0.1:8000",
+            "http://127.0.0.1:8000/path",
+            "http://user@127.0.0.1:8000",
+        ] {
+            assert!(validate_kv_perf_deployment(&config, &[invalid.into()], true, true).is_err());
+        }
+        assert!(validate_kv_perf_deployment(&config, &[], true, true).is_err());
+        config.host = "0.0.0.0".into();
+        assert!(validate_kv_perf_deployment(&config, &urls, true, true).is_err());
+        config.host = "127.0.0.1".into();
+        config.intra_node_data_parallel_size = 2;
+        assert!(validate_kv_perf_deployment(&config, &urls, true, true).is_err());
+        config.intra_node_data_parallel_size = 1;
+        config.policy = PolicyConfig::RoundRobin;
+        assert!(validate_kv_perf_deployment(&config, &urls, true, true).is_err());
+    }
+
+    #[cfg(feature = "kv-perf")]
+    #[tokio::test]
+    async fn kv_perf_ab_really_ignore_affinity_while_c_keeps_selector() {
+        for mode in [
+            KvPerfMode::SharedRr,
+            KvPerfMode::RenderRr,
+            KvPerfMode::RenderKv,
+        ] {
+            let mut router = create_test_regular_router();
+            router.kv_perf = Some(KvPerf {
+                mode,
+                round_robin: Default::default(),
+            });
+            router.policy_registry =
+                Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                    config: Default::default(),
+                }));
+            let workers = router.worker_registry.get_all();
+            let owner = workers[1].clone();
+            let policy = router.policy_registry.get_default_policy();
+            let index = policy
+                .as_any()
+                .downcast_ref::<crate::policies::KvAwarePolicy>()
+                .unwrap()
+                .index();
+            let tokens: Vec<u32> = (0..32).collect();
+            let keys = crate::kv_index::BlockKeyGenerator::new(16, 0).generate_block_keys(&tokens);
+            let generation = index.begin_worker(owner.url());
+            assert!(index.store(owner.url(), generation, &keys));
+            let first = router
+                .select_worker_for_model_with_tokens(None, None, None, Some(&tokens))
+                .unwrap();
+            let second = router
+                .select_worker_for_model_with_tokens(None, None, None, Some(&tokens))
+                .unwrap();
+            if mode == KvPerfMode::RenderKv {
+                assert_eq!(first.url(), owner.url());
+                assert_eq!(second.url(), owner.url());
+            } else {
+                assert_eq!(first.url(), workers[0].url());
+                assert_eq!(second.url(), workers[1].url());
+            }
+            assert_eq!(index.prefix_score(owner.url(), &keys), 2);
+        }
+    }
+
+    #[cfg(feature = "kv-perf")]
+    #[tokio::test]
+    async fn kv_perf_abc_retry_raw_once_and_contract_fencing() {
+        for mode in KV_PERF_MODES {
+            kv_retry_case(true, false, Some(mode)).await;
+            kv_retry_case(true, true, Some(mode)).await;
+        }
+    }
+
+    #[cfg(feature = "kv-perf")]
+    #[tokio::test]
+    async fn kv_perf_abc_share_stream_lease_and_active_contract_guard() {
+        for mode in [
+            KvPerfMode::SharedRr,
+            KvPerfMode::RenderRr,
+            KvPerfMode::RenderKv,
+        ] {
+            let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let seen = received.clone();
+            let app = axum::Router::new().route(
+                "/v1/completions",
+                axum::routing::post(move |raw: bytes::Bytes| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().push(raw.to_vec());
+                        let first = futures_util::stream::once(async {
+                            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: {}\n\n"))
+                        });
+                        Response::new(Body::from_stream(
+                            first.chain(futures_util::stream::pending()),
+                        ))
+                    }
+                }),
+            );
+            let (worker, server) = kv_test_server(app).await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = calls.clone();
+            let contract = RenderContract {
+                id: "public-benchmark-contract".into(),
+                epoch: 1,
+            };
+            let result = crate::prompt_tokens::bridge::PreparedTokens {
+                token_ids: Arc::from([1, 2, 3]),
+                contract: contract.clone(),
+                cache_eligible: true,
+            };
+            let raw = br#"{ "prompt": "public fixture", "stream":true, "vendor_extension": null }"#;
+            let bridge = Arc::new(RenderBridge::for_test(
+                contract,
+                Default::default(),
+                move |kind, bytes| {
+                    assert_eq!(kind, RequestKind::Completion);
+                    assert_eq!(bytes, raw);
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    PreparedResult::Exact(result.clone())
+                },
+            ));
+            bridge.wait_ready(Duration::from_secs(1)).await.unwrap();
+            let mut router = create_test_regular_router();
+            router.kv_perf = Some(KvPerf {
+                mode,
+                round_robin: Default::default(),
+            });
+            router.worker_registry = Arc::new(WorkerRegistry::new());
+            router.worker_registry.register(worker.clone());
+            router.policy_registry =
+                Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                    config: Default::default(),
+                }));
+            router.client = Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap();
+            router.kv_runtime = Some(KvRuntime {
+                _pool: None,
+                _capability_pool: None,
+                tokenizer: None,
+                render_bridge: Some(bridge.clone()),
+                model: "synthetic".into(),
+            });
+            let response = tokio::time::timeout(
+                Duration::from_secs(3),
+                router.route_completion_bytes(None, raw, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                worker.load(),
+                1,
+                "lease must survive successful streaming headers"
+            );
+            drop(response);
+            assert_eq!(
+                worker.load(),
+                0,
+                "client cancellation must release the same lease"
+            );
+            assert_eq!(received.lock().as_slice(), &[raw.to_vec()]);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(mode != KvPerfMode::SharedRr)
+            );
+            bridge.invalidate();
+            let response = router.route_completion_bytes(None, raw, None).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                received.lock().len(),
+                1,
+                "A must not bypass deployment invalidation"
+            );
+            assert_eq!(worker.load(), 0);
+            bridge.shutdown();
+            assert!(bridge.wait_closed(Duration::from_secs(1)).await);
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
     }
 
     #[test]
@@ -3437,7 +3839,11 @@ mod tests {
         }
     }
 
-    async fn kv_retry_case(use_bridge: bool, invalidate_after_first: bool) {
+    async fn kv_retry_case(
+        use_bridge: bool,
+        invalidate_after_first: bool,
+        perf_mode: Option<&str>,
+    ) {
         // Abort only these test-owned servers on both success and assertion
         // failure. The successful path also joins them with a bounded wait.
         struct TestServers(Vec<tokio::task::JoinHandle<()>>);
@@ -3606,6 +4012,21 @@ mod tests {
         } else {
             None
         };
+        #[cfg(feature = "kv-perf")]
+        if let Some(mode) = perf_mode {
+            let perf = KvPerf {
+                mode: KvPerfMode::from_validated_name(mode),
+                round_robin: Default::default(),
+            };
+            // Registry iteration order is deliberately not a policy contract.
+            // Prime only this fixture's RR counter so its first attempt hits
+            // the failing worker, independently of map ordering.
+            let workers = router.worker_registry.get_all();
+            if workers[0].url() != worker0.url() {
+                perf.round_robin.select_worker(&workers, None);
+            }
+            router.kv_perf = Some(perf);
+        }
         let response = tokio::time::timeout(
             Duration::from_secs(10),
             router.route_completion_bytes(None, &raw_bytes, None),
@@ -3630,7 +4051,7 @@ mod tests {
         }
         assert_eq!(
             render_calls.load(std::sync::atomic::Ordering::SeqCst),
-            usize::from(use_bridge)
+            usize::from(use_bridge && perf_mode != Some("shared_rr"))
         );
         assert_eq!([worker0.load(), worker1.load()], initial_loads);
         assert!(
@@ -3748,6 +4169,8 @@ mod tests {
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
             kv_runtime: None,
+            #[cfg(feature = "kv-perf")]
+            kv_perf: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -3780,6 +4203,8 @@ mod tests {
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
             kv_runtime: None,
+            #[cfg(feature = "kv-perf")]
+            kv_perf: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -4045,6 +4470,8 @@ mod tests {
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
             kv_runtime: None,
+            #[cfg(feature = "kv-perf")]
+            kv_perf: None,
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,

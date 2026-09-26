@@ -737,9 +737,31 @@ fn render_bridge_limits(
     Ok(limits)
 }
 
+/// Explicit native capability handshake for the controlled performance harness.
+/// No environment value means ordinary production behavior, including in a
+/// feature-enabled build. Invalid/unsupported requests fail before measurement.
+#[pyfunction]
+fn kv_perf_capabilities(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
+    let selected_mode = routers::http::router::kv_perf_requested_mode()
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let result = pyo3::types::PyDict::new(py);
+    result.set_item("enabled", cfg!(feature = "kv-perf"))?;
+    let modes: &[&str] = if cfg!(feature = "kv-perf") {
+        &routers::http::router::KV_PERF_MODES
+    } else {
+        &[]
+    };
+    result.set_item("modes", modes)?;
+    result.set_item("environment_variable", routers::http::router::KV_PERF_ENV)?;
+    result.set_item("loopback_only", true)?;
+    result.set_item("selected_mode", selected_mode)?;
+    Ok(result)
+}
+
 #[pymodule]
 fn vllm_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PolicyType>()?;
     m.add_class::<Router>()?;
+    m.add_function(wrap_pyfunction!(kv_perf_capabilities, m)?)?;
     Ok(())
 }

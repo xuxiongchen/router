@@ -13,6 +13,10 @@ crate-type = ["cdylib", "rlib"]
 name = "vllm-router"
 path = "src/main.rs"
 
+[features]
+# Controlled loopback-only A/B/C ablations; never a production routing policy.
+kv-perf = []
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }

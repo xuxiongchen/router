@@ -5,6 +5,7 @@ Run in the isolated Linux environment with unittest discovery, without importing
 the package's native extension (which these adapter boundary tests do not need).
 """
 
+import asyncio
 import importlib.util
 import json
 import logging
@@ -346,6 +347,177 @@ class RenderBridgeBoundaryTests(unittest.TestCase):
         self.config["cache_layout"]["hash_seed"] = 2**32
         with self.assertRaises(bridge.RenderConfigurationError):
             self.facade()
+
+
+class RenderBridgeTimingTests(unittest.TestCase):
+    """Instrumentation contracts only; these doubles do not prove vLLM speed."""
+
+    setUp = RenderBridgeBoundaryTests.setUp
+    facade = RenderBridgeBoundaryTests.facade
+    ready = RenderBridgeBoundaryTests.ready
+
+    def timed_ready(self):
+        with patch.dict(os.environ, {"VLLM_ROUTER_KV_STAGE_TIMING": "1"}):
+            return self.ready()
+
+    def test_disabled_by_default_and_only_literal_one_enables(self):
+        for setting in ("", "0", "true"):
+            with self.subTest(setting=setting), patch.dict(
+                os.environ, {"VLLM_ROUTER_KV_STAGE_TIMING": setting}
+            ):
+                facade = self.ready()
+                with patch.object(bridge.time, "perf_counter_ns", side_effect=AssertionError("unexpected clock")):
+                    result = facade.render("chat", b'{"messages":[]}')
+                self.assertEqual(result["status"], "exact")
+                self.assertNotIn("stage_durations_ns", result)
+                self.assertNotIn("stage_counters", result)
+                facade.close()
+
+    def test_observation_preserves_full_result_and_contract(self):
+        facade = self.timed_ready()
+        result = facade.render("chat", b'{"messages":[]}')
+        stages = result.pop("stage_durations_ns")
+        counters = result.pop("stage_counters")
+        facade._stage_timing_enabled = False
+        self.assertEqual(result, facade.render("chat", b'{"messages":[]}'))
+        self.assertEqual(set(stages), {"python_total", "asset_check", "schema_json", "raw_json",
+                                       "cache_eligibility", "serving", "python_result"})
+        self.assertTrue(all(type(value) is int and value >= 0 for value in stages.values()))
+        self.assertGreaterEqual(stages["python_total"], stages["serving"])
+        self.assertEqual(counters, {
+            "asset_scan_calls": 5, "asset_is_file_calls": 4, "asset_exists_calls": 1,
+            "asset_stat_calls": 14, "asset_read_calls": 0, "asset_read_bytes": 0,
+            "asset_hash_calls": 0, "asset_hash_bytes": 0,
+        })
+
+    def test_setting_is_sampled_at_construction_not_each_request(self):
+        facade = self.timed_ready()
+        with patch.dict(os.environ, {"VLLM_ROUTER_KV_STAGE_TIMING": "0"}):
+            self.assertIn("stage_durations_ns", facade.render("chat", b'{"messages":[]}'))
+
+    def test_clock_failure_never_changes_or_repeats_render(self):
+        facade = self.timed_ready()
+        with patch.object(bridge.time, "perf_counter_ns", side_effect=RuntimeError("clock failure")):
+            result = facade.render("chat", b'{"messages":[]}')
+        self.assertEqual(result["status"], "exact")
+        self.assertEqual(result["token_ids"], [4, 2, 19])
+        self.assertEqual(len(self.runtime.seen), 1)
+        self.assertEqual(result["stage_durations_ns"], {})
+        self.assertIsNone(bridge._ACTIVE_STAGE_OBSERVER.get())
+
+    def test_clock_exit_and_counter_failure_do_not_escape(self):
+        class BrokenDict(dict):
+            def __setitem__(self, key, value):
+                raise RuntimeError("observation storage failure")
+        observer = bridge._StageObserver()
+        observer.durations = BrokenDict()
+        observer.counters = BrokenDict(observer.counters)
+        with observer.measure("python_total"):
+            observer.count("asset_stat_calls")
+        with patch.object(bridge.time, "perf_counter_ns", side_effect=[1, RuntimeError("exit failure")]):
+            with observer.measure("python_total"):
+                pass
+        self.assertEqual(observer.durations, {})
+
+    def test_schema_failure_has_only_entered_stages_and_no_stale_values(self):
+        facade = self.timed_ready()
+        failed = facade.render("chat", b"not-json")
+        self.assertEqual(failed["reason"], "request_schema")
+        self.assertEqual(set(failed["stage_durations_ns"]), {"python_total", "asset_check", "schema_json"})
+        result = facade.render("chat", b'{"messages":[]}')
+        self.assertIn("serving", result["stage_durations_ns"])
+        self.assertIsNot(failed["stage_durations_ns"], result["stage_durations_ns"])
+        self.assertIsNone(bridge._ACTIVE_STAGE_OBSERVER.get())
+
+    def test_unsupported_does_not_claim_renderer_time(self):
+        facade = self.timed_ready()
+        result = facade.render("chat", b'{"cache_salt":"private","messages":[]}')
+        self.assertEqual(result["status"], "unsupported")
+        self.assertIn("cache_eligibility", result["stage_durations_ns"])
+        self.assertNotIn("serving", result["stage_durations_ns"])
+        self.assertNotIn("private", json.dumps(result))
+
+    def test_asset_mutation_still_invalidates_and_observation_is_fresh(self):
+        facade = self.timed_ready()
+        (self.root / "new.jinja").write_text("test-only added asset")
+        result = facade.render("chat", b'{"messages":[]}')
+        self.assertEqual((result["status"], result["epoch"]), ("invalidated", 2))
+        self.assertIn("asset_check", result["stage_durations_ns"])
+        self.assertNotIn("schema_json", result["stage_durations_ns"])
+        later = facade.render("chat", b'{"messages":[]}')
+        self.assertEqual(set(later["stage_durations_ns"]), {"python_total"})
+        self.assertEqual(sum(later["stage_counters"].values()), 0)
+
+    def test_provider_exception_records_serving_and_restores_context(self):
+        facade = self.timed_ready()
+        async def fail(_):
+            raise RuntimeError("private failure")
+        self.runtime.render_chat_request = fail
+        result = facade.render("chat", b'{"messages":[]}')
+        self.assertEqual(result["reason"], "provider_exception")
+        self.assertIn("serving", result["stage_durations_ns"])
+        self.assertNotIn("python_result", result["stage_durations_ns"])
+        self.assertIsNone(bridge._ACTIVE_STAGE_OBSERVER.get())
+        self.assertNotIn("private failure", json.dumps(result))
+
+    def test_wrong_thread_does_not_use_owner_runtime_or_leak_context(self):
+        facade = self.timed_ready()
+        replies = []
+        def invoke():
+            replies.append(facade.render("chat", b'{"messages":[]}'))
+            self.assertIsNone(bridge._ACTIVE_STAGE_OBSERVER.get())
+        thread = threading.Thread(target=invoke)
+        thread.start()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(replies[0]["reason"], "provider_not_ready")
+        self.assertEqual(set(replies[0]["stage_durations_ns"]), {"python_total"})
+        self.assertEqual(facade.render("chat", b'{"messages":[]}')["status"], "exact")
+
+    def test_asset_read_and_hash_bytes_count_actual_helper_work(self):
+        observer = bridge._StageObserver()
+        path = self.root / "tokenizer.json"
+        digest = bridge._asset_digest(path, observer)
+        self.assertEqual(digest, bridge.hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(observer.counters["asset_read_calls"], 1)
+        self.assertEqual(observer.counters["asset_read_bytes"], path.stat().st_size)
+        self.assertEqual(observer.counters["asset_hash_calls"], 1)
+        self.assertEqual(observer.counters["asset_hash_bytes"], path.stat().st_size)
+
+    def test_nested_instance_async_observers_preserve_results_and_are_local(self):
+        class Renderer:
+            async def _tokenize_prompt_async(self, value):
+                await asyncio.sleep(0)
+                return value
+
+            async def _apply_chat_template_async(self, value):
+                return value
+
+            async def render_chat(self, value):
+                value = await self._apply_chat_template_async(value)
+                ids = await self._tokenize_prompt_async(value)
+                return "prompt", [{"prompt_token_ids": ids}]
+
+            async def render_completion(self, value):
+                return [{"prompt_token_ids": await self._tokenize_prompt_async(value)}]
+
+        first, second = Renderer(), Renderer()
+        bridge._observe_renderer_async(first)
+        self.assertNotIn("_tokenize_prompt_async", second.__dict__)
+        capture = bridge._CaptureRenderer(first)
+        observer = bridge._StageObserver()
+        token = bridge._ACTIVE_STAGE_OBSERVER.set(observer)
+        try:
+            result = asyncio.run(capture.render_chat([4, 2, 19]))
+        finally:
+            bridge._ACTIVE_STAGE_OBSERVER.reset(token)
+        self.assertEqual(result[1], capture.engine_inputs)
+        self.assertEqual(set(observer.durations), {"online_renderer", "tokenize_async", "template_async"})
+        self.assertGreaterEqual(observer.durations["online_renderer"], observer.durations["tokenize_async"])
+        previous = dict(observer.durations)
+        with patch.object(bridge.time, "perf_counter_ns", side_effect=AssertionError("unexpected clock")):
+            self.assertEqual(asyncio.run(capture.render_completion([7])), [{"prompt_token_ids": [7]}])
+        self.assertEqual(observer.durations, previous)
 
 
 if __name__ == "__main__":

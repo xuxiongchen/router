@@ -14,6 +14,8 @@ Engine health and inference-engine checks remain the generation worker's job.
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
+from contextvars import ContextVar
 import hashlib
 import importlib.metadata
 import json
@@ -63,6 +65,109 @@ _CONTENT_FREE_LOGGERS = (
     "vllm.entrypoints.chat_utils",
     "vllm.entrypoints.scale_out.render.serving",
 )
+_ACTIVE_STAGE_OBSERVER = ContextVar("cmb_render_stage_observer", default=None)
+_UNTIMED = nullcontext()
+_STAGE_COUNTER_KEYS = (
+    "asset_scan_calls", "asset_is_file_calls", "asset_exists_calls",
+    "asset_stat_calls", "asset_read_calls", "asset_read_bytes",
+    "asset_hash_calls", "asset_hash_bytes",
+)
+
+
+class _StageDuration:
+    def __init__(self, observer, key):
+        self.observer = observer
+        self.key = key
+
+    def __enter__(self):
+        self.started = None
+        try:
+            self.started = time.perf_counter_ns()
+        except Exception:
+            # Diagnostics must not change validation or render outcomes.
+            pass
+
+    def __exit__(self, *_exc):
+        if self.started is not None:
+            try:
+                elapsed = time.perf_counter_ns() - self.started
+                values = self.observer.durations
+                values[self.key] = values.get(self.key, 0) + elapsed
+            except Exception:
+                pass
+
+
+class _StageObserver:
+    """Request-local elapsed durations; nested intervals are not additive.
+
+    Counters describe explicit facade operations, not OS syscall counts and
+    not filesystem access performed inside vLLM/Transformers. In particular,
+    is_file/exists may themselves perform stat, but are counted separately.
+    No timestamps, paths, requests or token arrays enter the observation.
+    """
+
+    def __init__(self):
+        self.durations = {}
+        self.counters = dict.fromkeys(_STAGE_COUNTER_KEYS, 0)
+
+    def measure(self, key):
+        return _StageDuration(self, key)
+
+    def count(self, key, amount=1):
+        try:
+            self.counters[key] += amount
+        except Exception:
+            pass
+
+
+def _asset_stat(path, observer=None):
+    if observer is not None:
+        observer.count("asset_stat_calls")
+    return path.stat()
+
+
+def _asset_is_file(path, observer=None):
+    if observer is not None:
+        observer.count("asset_is_file_calls")
+    return path.is_file()
+
+
+def _asset_read_bytes(path, observer=None):
+    if observer is not None:
+        observer.count("asset_read_calls")
+    data = path.read_bytes()
+    if observer is not None:
+        observer.count("asset_read_bytes", len(data))
+    return data
+
+
+def _asset_digest(path, observer=None):
+    data = _asset_read_bytes(path, observer)
+    if observer is not None:
+        observer.count("asset_hash_calls")
+        observer.count("asset_hash_bytes", len(data))
+    return hashlib.sha256(data).hexdigest()
+
+
+def _observe_renderer_async(renderer):
+    """Wrap only this renderer's existing offload entry points when enabled.
+
+    These durations include the existing executor's wait and execution; they
+    are not pure tokenizer/template CPU time. No global tokenizer or vLLM
+    function is patched, and no thread, event loop or executor is introduced.
+    """
+    def wrap(original, key):
+        async def observed(*args, **kwargs):
+            observer = _ACTIVE_STAGE_OBSERVER.get()
+            with observer.measure(key) if observer is not None else _UNTIMED:
+                return await original(*args, **kwargs)
+        return observed
+
+    for name, key in (("_tokenize_prompt_async", "tokenize_async"),
+                      ("_apply_chat_template_async", "template_async")):
+        original = getattr(renderer, name, None)
+        if callable(original):
+            setattr(renderer, name, wrap(original, key))
 
 
 class _ContentFreeRenderLog(logging.Filter):
@@ -102,7 +207,7 @@ def _config_object(pairs):
 
 def _read_json(path):
     try:
-        return json.loads(path.read_bytes(), object_pairs_hook=_config_object)
+        return json.loads(_asset_read_bytes(path), object_pairs_hook=_config_object)
     except (OSError, UnicodeError, ValueError):
         raise RenderConfigurationError("invalid_local_configuration") from None
 
@@ -136,17 +241,23 @@ def _local_directory(value):
     return path.resolve()
 
 
-def _asset_files(model_dir, tokenizer_dir):
+def _asset_files(model_dir, tokenizer_dir, observer=None):
     """Hash local configuration/tokenizer assets, never weights or a cache clone."""
     paths = set()
     for directory in {model_dir, tokenizer_dir}:
         for pattern in ("*.json", "*.jinja", "*.txt", "*.model", "*.tiktoken"):
-            paths.update(p for p in directory.glob(pattern) if p.is_file())
+            if observer is not None:
+                observer.count("asset_scan_calls")
+            paths.update(p for p in directory.glob(pattern) if _asset_is_file(p, observer))
         templates = directory / "chat_templates"
+        if observer is not None:
+            observer.count("asset_exists_calls")
         if templates.exists():
-            paths.update(p for p in templates.rglob("*") if p.is_file())
+            if observer is not None:
+                observer.count("asset_scan_calls")
+            paths.update(p for p in templates.rglob("*") if _asset_is_file(p, observer))
     for path in paths:
-        _require(path.stat().st_size <= 128 * 1024 * 1024,
+        _require(_asset_stat(path, observer).st_size <= 128 * 1024 * 1024,
                  "oversized_preprocessing_asset")
     return sorted(paths)
 
@@ -169,8 +280,9 @@ def _validate_layout(model):
              "unsupported_cache_layout_model")
 
 
-def _stat_signature(paths):
-    return tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
+def _stat_signature(paths, observer=None):
+    return tuple((str(p), _asset_stat(p, observer).st_size,
+                  _asset_stat(p, observer).st_mtime_ns) for p in paths)
 
 
 def _validate_template_determinism(tokenizer_dir):
@@ -210,13 +322,17 @@ class _CaptureRenderer:
         return getattr(self.inner, name)
 
     async def render_chat(self, request, **kwargs):
-        result = await self.inner.render_chat(request, **kwargs)
+        observer = _ACTIVE_STAGE_OBSERVER.get()
+        with observer.measure("online_renderer") if observer is not None else _UNTIMED:
+            result = await self.inner.render_chat(request, **kwargs)
         if isinstance(result, tuple):
             self.engine_inputs = result[1]
         return result
 
     async def render_completion(self, request, **kwargs):
-        result = await self.inner.render_completion(request, **kwargs)
+        observer = _ACTIVE_STAGE_OBSERVER.get()
+        with observer.measure("online_renderer") if observer is not None else _UNTIMED:
+            result = await self.inner.render_completion(request, **kwargs)
         if isinstance(result, list):
             self.engine_inputs = result
         return result
@@ -337,6 +453,7 @@ class RenderFacade:
     """Single reviewed cohort, one loop, one renderer, one contract epoch."""
 
     def __init__(self, config_path):
+        self._stage_timing_enabled = os.environ.get("VLLM_ROUTER_KV_STAGE_TIMING") == "1"
         self._config_path = Path(config_path).resolve()
         config = _read_json(self._config_path)
         _require(isinstance(config, dict) and not set(config) - {
@@ -413,7 +530,7 @@ class RenderFacade:
             self.capability_cohort = {"workers": descriptors, "api_key_env": self._api_key_env}
         self._asset_directories = (model_dir, tokenizer_dir)
         self._paths = [self._config_path, *_asset_files(model_dir, tokenizer_dir)]
-        assets = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in self._paths}
+        assets = {str(p): _asset_digest(p) for p in self._paths}
         # Templates using clock/random globals cannot establish deterministic
         # prefix identity. No arbitrary user template/plugin override is enabled.
         for path in self._paths:
@@ -446,12 +563,12 @@ class RenderFacade:
         return {"status": status, "reason": reason, "cache_eligible": False,
                 "contract_id": self.contract_id, "epoch": self.epoch, **extra}
 
-    def _assets_intact(self):
+    def _assets_intact(self, observer=None):
         # Also detect newly added higher-precedence templates/configuration,
         # not only mutations/deletions in the startup list of assets.
         try:
-            current = [self._config_path, *_asset_files(*self._asset_directories)]
-            return _stat_signature(current) == self._signature
+            current = [self._config_path, *_asset_files(*self._asset_directories, observer=observer)]
+            return _stat_signature(current, observer) == self._signature
         except (OSError, RenderConfigurationError):
             return False
 
@@ -494,6 +611,8 @@ class RenderFacade:
         # Official app initialization runs within a live event loop, too.
         self._runtime = (_load_runtime(self._argv, worker_capabilities=True)
                          if self.worker_capabilities else _load_runtime(self._argv))
+        if self._stage_timing_enabled:
+            _observe_renderer_async(self._runtime.renderer)
         self.effective_config = self._runtime.effective
         await self._verify_workers()
         if self.capability_cohort:
@@ -507,33 +626,42 @@ class RenderFacade:
                          and after["events"]["topic"] == before["events"]["topic"],
                          "worker_changed_during_conformance")
 
-    async def _render(self, kind, raw):
+    async def _render(self, kind, raw, observer=None):
         runtime = self._runtime
         try:
             # vLLM's FastAPI ingress uses JSON last-key-wins semantics. Parse the
             # ORIGINAL bytes directly with its schema, never a Rust JSON tree.
-            request = runtime.schemas[kind].model_validate_json(raw)
-            raw_object = json.loads(raw)
+            with observer.measure("schema_json") if observer is not None else _UNTIMED:
+                request = runtime.schemas[kind].model_validate_json(raw)
+            with observer.measure("raw_json") if observer is not None else _UNTIMED:
+                raw_object = json.loads(raw)
         except (runtime.validation_type, ValueError, UnicodeError, TypeError):
             return self._result("invalid", "request_schema", http_status=400)
         # This cohort has exactly one reviewed served alias. Match vLLM's model
         # gate before its error logger can include an arbitrary request.model.
         # Matching requests still execute the complete ServingRender validation.
-        if raw_object.get("model") not in (None, self.model):
-            return self._result("invalid", "model_not_served", http_status=404)
-        reason = _request_cache_reason(request, raw_object, kind)
-        if reason:
-            return self._result("unsupported", reason)
+        with observer.measure("cache_eligibility") if observer is not None else _UNTIMED:
+            if raw_object.get("model") not in (None, self.model):
+                return self._result("invalid", "model_not_served", http_status=404)
+            reason = _request_cache_reason(request, raw_object, kind)
+            if reason:
+                return self._result("unsupported", reason)
         runtime.capture.engine_inputs = None
         try:
-            if kind == "chat":
-                result = await runtime.serving.render_chat_request(request)
-            else:
-                result = await runtime.serving.render_completion_request(request)
+            with observer.measure("serving") if observer is not None else _UNTIMED:
+                if kind == "chat":
+                    result = await runtime.serving.render_chat_request(request)
+                else:
+                    result = await runtime.serving.render_completion_request(request)
         except (ValueError, TypeError):
             # The same renderer errors become client errors in vLLM's serving
             # frontend. Never include exception messages containing prompt text.
             return self._result("invalid", "render_validation", http_status=400)
+        with observer.measure("python_result") if observer is not None else _UNTIMED:
+            return self._render_result(kind, result)
+
+    def _render_result(self, kind, result):
+        runtime = self._runtime
         if isinstance(result, runtime.error_type):
             code = result.error.code
             if isinstance(code, int) and 400 <= code < 500:
@@ -559,6 +687,20 @@ class RenderFacade:
         return self._result("exact", "verified_text", token_ids=list(ids), cache_eligible=True)
 
     def render(self, kind, raw):
+        if not self._stage_timing_enabled:
+            return self._render_owned(kind, raw)
+        observer = _StageObserver()
+        token = _ACTIVE_STAGE_OBSERVER.set(observer)
+        try:
+            with observer.measure("python_total"):
+                result = self._render_owned(kind, raw, observer)
+        finally:
+            _ACTIVE_STAGE_OBSERVER.reset(token)
+        result["stage_durations_ns"] = observer.durations
+        result["stage_counters"] = observer.counters
+        return result
+
+    def _render_owned(self, kind, raw, observer=None):
         if self._identity_changed:
             return self._result("invalidated", "contract_changed", epoch=self.epoch + 1)
         if (threading.get_ident() != self._thread or not self._ready
@@ -568,12 +710,14 @@ class RenderFacade:
             return self._result("invalid", "invalid_bridge_input", http_status=400)
         if len(raw) > self.limits["max_input_bytes"]:
             return self._result("unsupported", "input_byte_budget")
-        if not self._assets_intact():
+        with observer.measure("asset_check") if observer is not None else _UNTIMED:
+            assets_intact = self._assets_intact(observer)
+        if not assets_intact:
             self._identity_changed = True
             self._invalidated = True
             return self._result("invalidated", "contract_changed", epoch=self.epoch + 1)
         try:
-            return self._loop.run_until_complete(self._render(kind, raw))
+            return self._loop.run_until_complete(self._render(kind, raw, observer))
         except BaseException:
             self._invalidated = True
             return self._result("unavailable", "provider_exception")

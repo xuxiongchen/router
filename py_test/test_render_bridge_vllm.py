@@ -256,6 +256,15 @@ class RealVllmRenderTests(unittest.TestCase):
                             raw = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
                             result = facade.render(kind, raw)
                             self.assertEqual(result["status"], "exact", name + ": " + str(result))
+                            if os.environ.get("VLLM_ROUTER_KV_STAGE_TIMING") == "1":
+                                stages = result["stage_durations_ns"]
+                                self.assertTrue({"python_total", "asset_check", "schema_json", "raw_json",
+                                                 "cache_eligibility", "serving", "online_renderer",
+                                                 "python_result"} <= stages.keys(), name)
+                                self.assertTrue(all(type(value) is int and value >= 0
+                                                    for value in stages.values()), name)
+                                self.assertEqual(result["stage_counters"]["asset_read_bytes"], 0)
+                                self.assertEqual(result["stage_counters"]["asset_hash_bytes"], 0)
                             expected = bridge._remote_render(url, kind, raw, 10, None)
                             self.assertEqual(result["token_ids"], expected, name)
                             passed.append(name)
@@ -320,6 +329,7 @@ class RealVllmRenderTests(unittest.TestCase):
                                         "effective_template_sha256": template_digest,
                                         "public_golden_eligible": golden_eligible,
                                         "unsupported_cases": len(unsupported), "invalid_cases": 2,
+                                        "stage_timing": os.environ.get("VLLM_ROUTER_KV_STAGE_TIMING") == "1",
                                         "startup_conformance": facade.conformance})
                         if os.environ.get("CMB_RENDER_BENCHMARK") == "1":
                             measure_serial(facade, url)

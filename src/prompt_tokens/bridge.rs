@@ -24,6 +24,8 @@ use pyo3::{
 };
 use tokio::sync::{oneshot, watch};
 
+use super::timing::{self, StageTimer};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RenderContract {
     pub id: String,
@@ -118,6 +120,18 @@ struct Budget {
     jobs: usize,
     bytes: usize,
     tokens: usize,
+    active: usize,
+}
+
+impl Budget {
+    fn observe(&self) {
+        timing::gauge("jobs", self.jobs);
+        timing::gauge("input_bytes", self.bytes);
+        timing::gauge("reserved_tokens", self.tokens);
+        timing::gauge("active", self.active);
+        // Includes admission/copy-before-enqueue, not only channel occupancy.
+        timing::gauge("pending", self.jobs.saturating_sub(self.active));
+    }
 }
 
 struct Shared {
@@ -146,6 +160,7 @@ impl Shared {
         budget.jobs += 1;
         budget.bytes += bytes;
         budget.tokens += tokens;
+        budget.observe();
         Some(Reservation {
             shared: Arc::clone(self),
             bytes,
@@ -160,12 +175,40 @@ struct Reservation {
     tokens: usize,
 }
 
+/// Measurement only: does not own or release admission. Drop covers panics too.
+struct ActiveMeasurement(Option<Arc<Shared>>);
+
+impl ActiveMeasurement {
+    fn new(shared: &Arc<Shared>) -> Self {
+        if !timing::enabled() {
+            return Self(None);
+        }
+        {
+            let mut budget = shared.budget.lock();
+            budget.active += 1;
+            budget.observe();
+        }
+        Self(Some(Arc::clone(shared)))
+    }
+}
+
+impl Drop for ActiveMeasurement {
+    fn drop(&mut self) {
+        if let Some(shared) = &self.0 {
+            let mut budget = shared.budget.lock();
+            budget.active -= 1;
+            budget.observe();
+        }
+    }
+}
+
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut budget = self.shared.budget.lock();
         budget.jobs -= 1;
         budget.bytes -= self.bytes;
         budget.tokens -= self.tokens;
+        budget.observe();
     }
 }
 
@@ -174,6 +217,8 @@ struct Job {
     raw: Arc<[u8]>,
     cancelled: Arc<AtomicBool>,
     queue_deadline: Instant,
+    enqueued: Option<Instant>,
+    span: Option<tracing::Span>,
     started: oneshot::Sender<Instant>,
     result: oneshot::Sender<PreparedResult>,
     _reservation: Reservation,
@@ -275,15 +320,24 @@ impl Executor for PythonExecutor {
     }
 
     fn render(&mut self, kind: RequestKind, raw: &[u8], limit: usize) -> PreparedResult {
+        let attach_wait = StageTimer::start("python_attach_entry");
         let reply = Python::attach(|py| {
+            // Wall time to enter Python; not a claim of pure GIL contention.
+            drop(attach_wait);
             let Some(facade) = self.facade.as_ref() else {
                 return PythonReply::Prepared(PreparedResult::Unavailable);
             };
             // One safe copy into Python and one bounded copy back into Rust.
+            let call = StageTimer::start("python_call");
             let result = facade
                 .bind(py)
-                .call_method1("render", (kind.as_str(), PyBytes::new(py, raw)))
-                .and_then(|result| parse_python_result(&result, limit, &self.contract));
+                .call_method1("render", (kind.as_str(), PyBytes::new(py, raw)));
+            drop(call);
+            let result = result.and_then(|result| {
+                let _conversion = StageTimer::start("python_result_conversion");
+                observe_python_stages(&result);
+                parse_python_result(&result, limit, &self.contract)
+            });
             result.unwrap_or(PythonReply::Prepared(PreparedResult::Unavailable))
         });
         match reply {
@@ -311,6 +365,59 @@ impl Executor for PythonExecutor {
         // A callback has returned (or unwound) before Executor can be dropped.
         // Release the lifetime waiter only after disposing our facade reference.
         self.lifetime.release();
+    }
+}
+
+/// Telemetry is optional and cannot change render success/failure semantics.
+/// Ignore unknown/malformed values; bound labels using a fixed allowlist.
+fn observe_python_stages(result: &Bound<'_, PyAny>) {
+    if !timing::enabled() {
+        return;
+    }
+    let Ok(result) = result.cast::<PyDict>() else {
+        return;
+    };
+    if let Ok(Some(stages)) = result.get_item("stage_durations_ns") {
+        if let Ok(stages) = stages.cast::<PyDict>() {
+            for stage in [
+                "asset_check",
+                "schema_json",
+                "raw_json",
+                "cache_eligibility",
+                "serving",
+                "online_renderer",
+                "tokenize_async",
+                "template_async",
+                "python_result",
+                "python_total",
+            ] {
+                if let Ok(Some(value)) = stages.get_item(stage) {
+                    if let Ok(ns) = value.extract::<u64>() {
+                        timing::record(stage, Duration::from_nanos(ns));
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(Some(counters)) = result.get_item("stage_counters") {
+        if let Ok(counters) = counters.cast::<PyDict>() {
+            for name in [
+                "asset_stat_calls",
+                "asset_scan_calls",
+                "asset_is_file_calls",
+                "asset_exists_calls",
+                "asset_read_calls",
+                "asset_read_bytes",
+                "asset_hash_calls",
+                "asset_hash_bytes",
+            ] {
+                if let Ok(Some(value)) = counters.get_item(name) {
+                    if let Ok(value) = value.extract::<u64>() {
+                        timing::count(name, value);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -372,10 +479,12 @@ fn parse_python_result(
             if tokens.is_empty() || tokens.len() > limit || id.is_empty() || id.len() > 256 {
                 return Ok(PythonReply::Prepared(PreparedResult::Unsupported));
             }
+            let conversion = StageTimer::start("token_conversion");
             let token_ids = tokens
                 .iter()
                 .map(|token| token.extract::<u32>())
                 .collect::<PyResult<Vec<_>>>()?;
+            drop(conversion);
             PreparedResult::Exact(PreparedTokens {
                 token_ids: token_ids.into(),
                 contract: RenderContract {
@@ -656,6 +765,8 @@ impl RenderBridge {
             raw,
             cancelled,
             queue_deadline,
+            enqueued: timing::enabled().then(Instant::now),
+            span: timing::enabled().then(tracing::Span::current),
             started: started_sender,
             result: result_sender,
             _reservation: reservation,
@@ -717,6 +828,10 @@ fn run_executor(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        let _span = job.span.as_ref().map(tracing::Span::enter);
+        if let Some(enqueued) = job.enqueued {
+            timing::record("queue_wait", enqueued.elapsed());
+        }
         let result = if !shared.accepting.load(Ordering::Acquire) {
             PreparedResult::Unavailable
         } else if job.cancelled.load(Ordering::Acquire) {
@@ -728,8 +843,12 @@ fn run_executor(
             if job.started.send(deadline).is_err() || job.cancelled.load(Ordering::Acquire) {
                 PreparedResult::Cancelled
             } else {
+                let active = ActiveMeasurement::new(&shared);
+                let occupied = StageTimer::start("executor_occupied");
                 let result =
                     executor.render(job.kind, &job.raw, shared.limits.max_tokens_per_request);
+                drop(occupied);
+                drop(active);
                 if executor.is_invalidated() {
                     shared.stopping.store(true, Ordering::Release);
                     shared.accepting.store(false, Ordering::Release);
@@ -896,14 +1015,30 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            let budget = self.bridge.shared.budget.lock();
+            assert_eq!(budget.active, usize::from(timing::enabled()));
+            assert!(budget.jobs >= 1, "an executing job retains admission");
+        }
+
+        fn assert_budget(&self, jobs: usize, bytes: usize, active: usize) {
+            let budget = self.bridge.shared.budget.lock();
+            assert_eq!(
+                (budget.jobs, budget.bytes, budget.tokens, budget.active),
+                (
+                    jobs,
+                    bytes,
+                    jobs * self.bridge.shared.limits.max_tokens_per_request,
+                    if timing::enabled() { active } else { 0 },
+                ),
+                "measurement must follow actual execution, not caller lifetime"
+            );
         }
 
         async fn close(&self) {
             self.bridge.shutdown();
             assert!(self.bridge.wait_closed(Duration::from_secs(1)).await);
             assert!(self.was_closed.load(Ordering::SeqCst));
-            let budget = self.bridge.shared.budget.lock();
-            assert_eq!((budget.jobs, budget.bytes, budget.tokens), (0, 0, 0));
+            self.assert_budget(0, 0, 0);
         }
     }
 
@@ -997,14 +1132,14 @@ mod tests {
             request.await.unwrap(),
             PreparedResult::Deadline(DeadlineStage::Execution)
         ));
-        assert_eq!(h.bridge.shared.budget.lock().jobs, 1);
+        h.assert_budget(1, 20, 1);
         assert!(matches!(
             h.bridge.prepare(RequestKind::Chat, Arc::from([b'y'])).await,
             PreparedResult::Busy
         ));
         h.bridge.shutdown();
         assert!(!h.bridge.wait_closed(Duration::from_millis(10)).await);
-        assert_eq!(h.bridge.shared.budget.lock().jobs, 1);
+        h.assert_budget(1, 20, 1);
         h.release.send(()).unwrap();
         h.close().await;
     }
@@ -1026,7 +1161,7 @@ mod tests {
         assert!(queued.await.unwrap_err().is_cancelled());
         active.abort();
         assert!(active.await.unwrap_err().is_cancelled());
-        assert_eq!(h.bridge.shared.budget.lock().jobs, 2);
+        h.assert_budget(2, 50, 1);
         h.release.send(()).unwrap();
         h.close().await;
         assert_eq!(h.calls.load(Ordering::SeqCst), 1);
@@ -1048,6 +1183,7 @@ mod tests {
             queued.await.unwrap(),
             PreparedResult::Deadline(DeadlineStage::Queue)
         ));
+        h.assert_budget(2, 40, 1);
         h.release.send(()).unwrap();
         assert!(matches!(active.await.unwrap(), PreparedResult::Exact(_)));
         h.close().await;
@@ -1119,6 +1255,7 @@ mod tests {
         .await
         .unwrap();
         h.bridge.shutdown();
+        h.assert_budget(2, 40, 1);
         h.release.send(()).unwrap();
         assert!(matches!(active.await.unwrap(), PreparedResult::Unavailable));
         assert!(matches!(queued.await.unwrap(), PreparedResult::Unavailable));
@@ -1191,18 +1328,48 @@ mod tests {
 
     #[tokio::test]
     async fn executor_panic_fences_contract_and_acknowledges_disposal() {
-        let bridge = RenderBridge::for_test(contract(), BridgeLimits::default(), |_, _| {
-            panic!("synthetic executor panic");
-        });
+        let (entered_sender, entered) = oneshot::channel();
+        let mut entered_sender = Some(entered_sender);
+        let (release, release_receiver) = mpsc::channel();
+        let bridge = Arc::new(RenderBridge::for_test(
+            contract(),
+            BridgeLimits::default(),
+            move |_, _| {
+                entered_sender.take().unwrap().send(()).unwrap();
+                release_receiver
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                panic!("synthetic executor panic");
+            },
+        ));
         bridge.wait_ready(Duration::from_secs(1)).await.unwrap();
+        let requesting_bridge = bridge.clone();
+        let request = tokio::spawn(async move {
+            requesting_bridge
+                .prepare_bytes(RequestKind::Chat, b"synthetic")
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let budget = bridge.shared.budget.lock();
+            assert_eq!((budget.jobs, budget.bytes, budget.tokens), (1, 9, 65_536));
+            assert_eq!(budget.active, usize::from(timing::enabled()));
+        }
+        release.send(()).unwrap();
         assert!(matches!(
-            bridge.prepare_bytes(RequestKind::Chat, b"synthetic").await,
+            request.await.unwrap(),
             PreparedResult::Unavailable
         ));
         assert!(bridge.wait_closed(Duration::from_secs(1)).await);
         assert!(bridge.current_contract().is_none());
         assert!(!bridge.is_current(&contract()));
         let budget = bridge.shared.budget.lock();
-        assert_eq!((budget.jobs, budget.bytes, budget.tokens), (0, 0, 0));
+        assert_eq!(
+            (budget.jobs, budget.bytes, budget.tokens, budget.active),
+            (0, 0, 0, 0)
+        );
     }
 }

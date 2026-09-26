@@ -15,6 +15,11 @@ pub struct RouterFactory;
 impl RouterFactory {
     /// Create a router instance from application context
     pub async fn create_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        if super::http::router::kv_perf_requested_mode()?.is_some()
+            && !matches!(ctx.router_config.mode, RoutingMode::Regular { .. })
+        {
+            return Err("kv-perf is restricted to controlled static Regular routing".into());
+        }
         match &ctx.router_config.mode {
             RoutingMode::Regular { worker_urls } => {
                 Self::create_regular_router(worker_urls, ctx).await

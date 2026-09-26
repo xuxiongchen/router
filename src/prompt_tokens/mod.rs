@@ -16,6 +16,7 @@ use tokenizers::Tokenizer;
 use crate::protocols::spec::{CompletionRequest, PromptInput};
 
 pub mod bridge;
+pub mod timing;
 
 // This fingerprint identifies renderer semantics, not a model/revision or
 // tokenizer vocabulary. Unknown templates disable Chat affinity only.
