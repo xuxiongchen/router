@@ -39,6 +39,16 @@ hash. Verify the main crate's effective rustc flags in the verbose log; a
 `pyo3/abi3-py38`; this differs from a plain CPython-specific `cargo build --lib`.
 The optional vLLM dependency's supported Python version is a separate constraint.
 
+The original `346c3c3` fails this actual abi3 wheel build in three existing
+`extract::<&str>()` calls (PyO3 0.26.0 does not expose that extraction below the
+limited-API 3.10 floor). The isolated ABI-only baseline is
+`c888e8d3b987a3b22a487973d57600d80b88b510`, containing only the strict `Cow<str>`
+extraction fix. The performance candidate carries the same fix. This still
+rejects non-strings and invalid UTF-8/surrogates, and owns the final contract ID;
+the abi3-py38 fallback copies UTF-8 rather than borrowing it. Do not label the
+unmodified baseline as a successful wheel build or count ABI compatibility as a
+performance gain. Compare the two optimized artifacts at the same ABI/profile.
+
 Install the wheel without dependency replacement in a separate venv. Check both
 `vllm_router.__file__` and `vllm_router_rs.__file__`, the native hash, and the live
 Linux `/proc/self/maps` entry. Do not let a checkout/PYTHONPATH silently replace
