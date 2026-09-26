@@ -79,7 +79,7 @@ def sse_events(response, clock=time.perf_counter):
     raise RuntimeError("SSE response exceeded finite byte budget")
 
 
-def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None):
+def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None, measure_ttft=True):
     parsed = urllib.parse.urlsplit(url)
     connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
     raw = json.dumps(payload, separators=(",", ":")).encode()
@@ -113,14 +113,16 @@ def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None)
                 if ids is not None:
                     require(seen_ids is None or seen_ids == ids, "generation prompt IDs changed within SSE")
                     seen_ids = ids
-        require(done and first_text is not None, "SSE never produced nonempty generated text and completion")
+        require(done, "SSE never produced completion")
+        if measure_ttft:
+            require(first_text is not None, "SSE never produced nonempty generated text")
         expected = payload["prompt"] if isinstance(payload["prompt"], list) else expected_tokens
         require(expected and seen_ids == expected, "actual Worker prompt IDs differ from exact prepared trace")
         require(usage is not None and usage.get("prompt_tokens") == len(expected),
                 "actual generation usage missing or prompt token length differs")
         require(usage.get("completion_tokens") == payload["max_tokens"],
                 "fixed-output trace did not generate the requested token count")
-        row.update(status="PASS", ttft_ms=(first_text - started) * 1000,
+        row.update(status="PASS", ttft_ms=(first_text - started) * 1000 if first_text is not None else None,
                    end_to_end_ms=(time.perf_counter() - started) * 1000,
                    prompt_tokens=len(seen_ids), output_tokens=usage["completion_tokens"], response_id=response_id)
     except Exception as error:
@@ -364,7 +366,7 @@ def phase(args, common, policy, scenario, concurrency, pair_seed, out):
         warm_rows = []
         for index, (owner, request) in enumerate(warm):
             result = streamed_request(config["workers"][owner], request, f"warm-{index}",
-                                      expected_tokens=expected_warm[index])
+                                      expected_tokens=expected_warm[index], measure_ttft=False)
             require(result["status"] == "PASS", f"direct warm failed: {result}")
             warm_rows.append({"worker_index": owner, **result})
         save(directory / "warmup-results.json", warm_rows)
@@ -565,6 +567,21 @@ def self_check():
         row = streamed_request("http://127.0.0.1:1", payload, 0, expected_tokens=[1, 2, 3])
     require(row["status"] == "PASS" and row["ttft_ms"] >= 0 and row["prompt_tokens"] == 3,
             "end-to-end SSE reader consumed headers as output or lost token evidence")
+    # A one-token warmup can decode to no text (e.g. a special token). It is not
+    # timed, but still must finish with exact prompt IDs and generation usage.
+    payload = {"prompt": "public test", "max_tokens": 1}
+    stream = (b'data: {"id":"warm","choices":[{"text":"","prompt_token_ids":[1,2,3]}]}\n\n'
+              b'data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n'
+              b'data: [DONE]\n\n')
+    with patch.object(http.client, "HTTPConnection", return_value=FakeConnection()):
+        warm_row = streamed_request("http://127.0.0.1:1", payload, "warm", expected_tokens=[1, 2, 3],
+                                    measure_ttft=False)
+        timed_row = streamed_request("http://127.0.0.1:1", payload, "timed", expected_tokens=[1, 2, 3])
+    require(warm_row["status"] == "PASS" and warm_row["ttft_ms"] is None
+            and warm_row["prompt_tokens"] == 3 and warm_row["output_tokens"] == 1,
+            "valid empty decoded warmup did not retain exact token evidence")
+    require(timed_row["status"] == "ERROR" and "nonempty generated text" in timed_row["error"],
+            "timed empty decoded response was accepted without TTFT")
     for raw in (b'data: [DONE]', b'data: {"error":"x"}\n\n', b'event: error\n\n'):
         try:
             list(sse_events(BytesIO(raw)))
@@ -578,7 +595,7 @@ def self_check():
         except RuntimeError:
             continue
         raise RuntimeError("unsuccessful reset response was accepted")
-    print("PASS finite performance self-check (16 checks; no HTTP/GPU/processes)")
+    print("PASS finite performance self-check (18 checks; no HTTP/GPU/processes)")
     return 0
 
 
