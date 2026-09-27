@@ -125,6 +125,69 @@ def server(*, slow=False, connection_close=False):
 
 
 class PerformanceContractTests(unittest.TestCase):
+    def test_third_worker_tokens_and_idle_are_not_ignored(self):
+        workers = [f"http://127.0.0.1:{8100+i}" for i in range(3)]
+        with patch.object(
+            perf.acceptance, "raw_request", return_value=(200, {}, b"fixture")
+        ), patch.object(
+            perf.acceptance,
+            "public_render_tokens",
+            side_effect=[[1, 2], [1, 2], [1, 3]],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Workers disagree"):
+                perf.prepare_trace(workers, [{"prompt": "text"}])
+        values = {"vllm:num_requests_running": 0, "vllm:num_requests_waiting": 0}
+        with patch.object(perf.prior, "metrics", return_value=values), patch.object(
+            perf.prior, "count", side_effect=lambda metrics, name: metrics[name]
+        ), patch.object(
+            perf.prior,
+            "json_request",
+            return_value={"workers": [{"url": url, "load": 0} for url in workers]},
+        ):
+            perf.idle(workers, "http://router", timeout=0.1)
+
+    def test_third_worker_contract_and_epoch_are_checked(self):
+        workers = ["w0", "w1", "w2"]
+        descriptors = {
+            url: {"contract": "same", "events": {"epoch": url}} for url in workers
+        }
+        bridge = SimpleNamespace(
+            _remote_capabilities=lambda url, *_: descriptors[url],
+            _capability_contract=lambda value, _: value["contract"],
+        )
+        spec = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda _: None))
+        with patch.object(
+            perf.acceptance.importlib.util, "spec_from_file_location", return_value=spec
+        ), patch.object(
+            perf.acceptance.importlib.util, "module_from_spec", return_value=bridge
+        ):
+            self.assertEqual(
+                perf.acceptance.worker_capabilities(workers, "model"), descriptors
+            )
+            descriptors["w2"]["contract"] = "different"
+            with self.assertRaisesRegex(RuntimeError, "incompatible"):
+                perf.acceptance.worker_capabilities(workers, "model")
+            descriptors["w2"]["contract"] = "same"
+            descriptors["w2"]["events"]["epoch"] = "w0"
+            with self.assertRaisesRegex(RuntimeError, "distinct"):
+                perf.acceptance.worker_capabilities(workers, "model")
+
+    def test_third_worker_duplicate_process_is_rejected(self):
+        args = SimpleNamespace(
+            worker0_pid=1,
+            worker1_pid=2,
+            worker2_pid=3,
+            engine0_pid=4,
+            engine1_pid=5,
+            engine2_pid=1,
+        )
+        with patch.object(
+            perf.prior, "process", side_effect=lambda pid: {"pid": pid}
+        ) as capture:
+            with self.assertRaisesRegex(RuntimeError, "independent HTTP/EngineCore"):
+                perf.acceptance.verify_workers(args, {"workers": ["w0", "w1", "w2"]})
+            self.assertEqual(capture.call_count, 6)
+
     def test_repeat_128_32_has_four_occurrences_without_warmup(self):
         args = SimpleNamespace(
             groups=32,

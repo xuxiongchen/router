@@ -280,15 +280,17 @@ def metadata_access_count(paths):
 
 
 def worker_capabilities(workers, model):
-    """Two bounded control-plane snapshots; never called by routed()."""
+    """Bounded control-plane snapshots; never called by routed()."""
+    require(2 <= len(workers) <= 3 and len(set(workers)) == len(workers),
+            "finite fixture requires two or three distinct Workers")
     spec = importlib.util.spec_from_file_location(
         "gpu_capability_bridge", ROOT / "py_src/vllm_router/render_bridge.py")
     bridge = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bridge)
     descriptors = {url: bridge._remote_capabilities(url, 10, None) for url in workers}
     contracts = [bridge._capability_contract(value, model) for value in descriptors.values()]
-    require(contracts[0] == contracts[1], "Workers have incompatible actual capability contracts")
-    require(len({value["events"]["epoch"] for value in descriptors.values()}) == 2,
+    require(all(value == contracts[0] for value in contracts), "Workers have incompatible actual capability contracts")
+    require(len({value["events"]["epoch"] for value in descriptors.values()}) == len(workers),
             "independent Workers must have distinct publisher/engine epochs")
     return descriptors
 
@@ -772,11 +774,13 @@ class Validation(prior.Validation):
 
 
 def verify_workers(args, config):
-    processes = [prior.process(pid) for pid in (args.worker0_pid, args.worker1_pid,
-                                               args.engine0_pid, args.engine1_pid)]
-    require(len({item["pid"] for item in processes}) == 4, "four independent HTTP/EngineCore PIDs required")
-    for index in range(2):
-        worker, engine = processes[index], processes[index + 2]
+    count = len(config["workers"])
+    require(2 <= count <= 3, "finite process fixture requires two or three Workers")
+    processes = [prior.process(getattr(args, f"{kind}{index}_pid"))
+                 for kind in ("worker", "engine") for index in range(count)]
+    require(len({item["pid"] for item in processes}) == count * 2, "independent HTTP/EngineCore PIDs required")
+    for index in range(count):
+        worker, engine = processes[index], processes[index + count]
         require(engine["engine_core_title"] and prior.descendant(engine["pid"], worker["pid"]),
                 "EngineCore is not an independently addressable DP=1 worker child")
         flags, env = worker["selected_arguments"], worker["selected_environment"]
@@ -835,7 +839,7 @@ def verify_workers(args, config):
             selected[key] = value
         require("--enable-prefix-caching" in argv, "Worker prefix caching is not explicitly enabled")
         worker["verified_preprocessing_arguments"] = selected
-        log = Path((args.worker0_log, args.worker1_log)[index]).stat()
+        log = Path(getattr(args, f"worker{index}_log")).stat()
         fds = [Path(f"/proc/{worker['pid']}/fd/{fd}").stat() for fd in (1, 2)]
         require(any((fd.st_dev, fd.st_ino) == (log.st_dev, log.st_ino) for fd in fds),
                 "supplied Worker log is not that API process stdout/stderr")

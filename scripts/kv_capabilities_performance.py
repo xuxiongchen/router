@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Finite product comparison and explicitly test-only KV performance ablations.
 
-Starts/stops only its own Router child. Two exclusive DP=1 Workers must already
+Starts/stops only its own Router child. Two or three exclusive DP=1 Workers must already
 be running in a newly authorized environment. No packages, patches or models
 are installed. There is no built-in Worker/cloud management: only a separately
 authorized user-provided fresh-cohort hook may replace the specified Workers.
@@ -32,10 +32,12 @@ Fresh-cohort hook contract (not supplied by this repository): the caller must
 obtain fresh authority for replacing only these test Workers, then pass an
 absolute executable with --cache-state fresh-cohort --cohort-preparation-hook
 /absolute/user-approved-script --allow-cohort-preparation. No shell is used.
-The script receives CMB_KV_PERF_WORKER_URLS as a JSON array of the two unchanged
+The script receives CMB_KV_PERF_WORKER_URLS as a JSON array of all unchanged
 loopback URLs, and CMB_KV_PERF_PHASE_DIR as the evidence directory. It must print
 one JSON object, e.g. {"status":"PASS","state":"fresh_empty_cache",
 "worker0_pid":101,"worker1_pid":102,"engine0_pid":103,"engine1_pid":104}.
+With --worker-count 3, also provide worker2/engine2 PID fields and the complete
+--worker2 URL/PID/log, --engine2-pid, --event2 and --publisher2 CLI arguments.
 PIDs above are schema examples, not real processes. The harness independently
 checks live PID/start identity, changed event epochs, semantic compatibility,
 and identical full prepared tokens; it never trusts that declaration alone.
@@ -336,13 +338,14 @@ def idle(workers, router=None, timeout=30):
         values = [prior.metrics(worker) for worker in workers]
         running = [prior.count(value, "vllm:num_requests_running") for value in values]
         waiting = [prior.count(value, "vllm:num_requests_waiting") for value in values]
-        loads = [0, 0]
+        zero = [0] * len(workers)
+        loads = zero
         if router:
             values = prior.json_request(router, "/workers")["workers"]
             selected = {item["url"].rstrip("/"): item for item in values if item["url"].rstrip("/") in workers}
-            require(set(selected) == set(workers), "Router does not have exactly both fixture Workers")
+            require(set(selected) == set(workers), "Router is missing fixture Workers")
             loads = [selected[worker]["load"] for worker in workers]
-        if running == [0, 0] and waiting == [0, 0] and loads == [0, 0]:
+        if running == zero and waiting == zero and loads == zero:
             return
         time.sleep(0.1)
     raise RuntimeError("exclusive fixture Workers did not return to idle")
@@ -441,6 +444,7 @@ def owned_router(config, directory):
 def make_trace(args, vocabulary, scenario, namespace, trace_seed):
     """Same logical trace/target lengths; actual text lengths are independently recorded."""
     rng = random.Random(trace_seed)
+    worker_count = getattr(args, "worker_count", 2)
     has_locality = scenario in ("locality", "shared", "natural", "repeat")
     prefix_count = args.groups if has_locality else args.requests
     prefixes = [rng.choices(vocabulary, k=args.prefix_tokens) for _ in range(prefix_count)]
@@ -465,7 +469,7 @@ def make_trace(args, vocabulary, scenario, namespace, trace_seed):
             # not the entire timed query. Same full prompt length in both arms.
             request = {**base, "max_tokens": 1,
                        "prompt": prefix + rng.choices(vocabulary, k=args.input_tokens - args.prefix_tokens)}
-            for owner in ((0, 1) if scenario == "shared" else (group % 2,)):
+            for owner in (range(worker_count) if scenario == "shared" else (group % worker_count,)):
                 warm.append((owner, dict(request)))
     if getattr(args, "prompt_format", "token_ids") == "text":
         words = ("forest river water city cloud light garden energy stone morning school "
@@ -483,7 +487,7 @@ def make_trace(args, vocabulary, scenario, namespace, trace_seed):
                                  + " ".join(text_rng.choices(words, k=tail_words))
                                  + "\nBriefly summarize the themes of these words.")
         for index, (_owner, request) in enumerate(warm):
-            group = index // 2 if scenario == "shared" else index
+            group = index // worker_count if scenario == "shared" else index
             request["prompt"] = (text_prefixes[group] + "\n"
                                  + " ".join(text_rng.choices(words, k=tail_words))
                                  + "\nBriefly summarize the themes of these words.")
@@ -512,7 +516,7 @@ def prepare_trace(workers, trace):
             status, _, body = acceptance.raw_request(worker, route, raw, timeout=20)
             require(status == 200, "text trace preparation failed at real Worker /render")
             per_worker.append(acceptance.public_render_tokens(body, chat))
-        require(per_worker[0] == per_worker[1], "Workers disagree on real text trace preprocessing")
+        require(all(ids == per_worker[0] for ids in per_worker), "Workers disagree on real text trace preprocessing")
         expected.append(per_worker[0])
     return expected
 
@@ -767,7 +771,7 @@ def validate_fresh_cohort(previous_descriptors, descriptors, previous_processes,
         require(contract(previous_descriptors[worker], model) == contract(descriptor, model),
                 "fresh cohort changed the semantic Worker capability contract")
     previous = {(value["pid"], value["start_ticks"]) for value in previous_processes}
-    require(len(processes) == 4 and all((value["pid"], value["start_ticks"]) not in previous
+    require(len(processes) == 2 * len(descriptors) and all((value["pid"], value["start_ticks"]) not in previous
                                       for value in processes),
             "cohort hook reused an old HTTP or EngineCore process; empty-cache claim is unproven")
 
@@ -777,7 +781,8 @@ def prepare_fresh_cohort(args, common, directory):
 
     No built-in Worker deployment or kill/reset commands. The executable must
     print one JSON object: status=PASS, state=fresh_empty_cache, worker0_pid,
-    worker1_pid, engine0_pid, engine1_pid. It receives the existing task URLs
+    worker1_pid, engine0_pid, engine1_pid (plus worker2_pid/engine2_pid for three).
+    It receives the existing task URLs
     and output directory via CMB_KV_PERF_WORKER_URLS / CMB_KV_PERF_PHASE_DIR.
     A new Router is constructed only after actual epochs/processes are checked.
     """
@@ -802,7 +807,8 @@ def prepare_fresh_cohort(args, common, directory):
         observation["hook_result"] = declared
         require(isinstance(declared, dict) and declared.get("status") == "PASS"
                 and declared.get("state") == "fresh_empty_cache", "hook did not declare a fresh empty cohort")
-        for key in ("worker0_pid", "worker1_pid", "engine0_pid", "engine1_pid"):
+        for key in (f"{kind}{index}_pid" for kind in ("worker", "engine")
+                    for index in range(len(common["workers"]))):
             require(type(declared.get(key)) is int and declared[key] > 0, "invalid hook process manifest")
             setattr(args, key, declared[key])
         descriptors = acceptance.worker_capabilities(common["workers"], args.model)
@@ -1014,8 +1020,8 @@ def phase(args, common, arm, scenario, concurrency, pair_seed, out, round_index=
                   "prefix_hit_tokens": prefix_hits, "prefix_query_tokens": prefix_queries,
                   "prefix_token_hit_ratio": sum(prefix_hits) / sum(prefix_queries) if sum(prefix_queries) else None,
                   "per_worker_prefix_hit_ratio": [hit / query if query else None for hit, query in zip(prefix_hits, prefix_queries)],
-                  "per_worker_mean_sampled_router_load": [sum(row[i] for row in load_values) / len(load_values) for i in range(2)] if load_values else None,
-                  "per_worker_max_sampled_router_load": [max(row[i] for row in load_values) for i in range(2)] if load_values else None,
+                  "per_worker_mean_sampled_router_load": [sum(row[i] for row in load_values) / len(load_values) for i in range(len(config["workers"]))] if load_values else None,
+                  "per_worker_max_sampled_router_load": [max(row[i] for row in load_values) for i in range(len(config["workers"]))] if load_values else None,
                   "router_load_status": "UNKNOWN_UNMAINTAINED" if arm == "product_rr" else "ROUTER_INFLIGHT_NOT_GPU_QUEUE",
                   "load_samples": len(sampler.samples), "load_sampling_errors": sampler.errors,
                   "sample_interval_seconds": args.sample_interval,
@@ -1069,7 +1075,7 @@ def run(args):
         require(build.get("status") == "PASS" and build.get("candidate_sha") == native_candidate
                 and build.get("native_sha256") == native_hash, "candidate/native build manifest mismatch")
         deployment = json.loads(Path(args.render_config).read_text())
-        workers = [acceptance.loopback_url(args.worker0), acceptance.loopback_url(args.worker1)]
+        workers = [acceptance.loopback_url(getattr(args, f"worker{i}")) for i in range(args.worker_count)]
         require(deployment.get("kv_capabilities") == "worker" and not deployment.get("worker_api_key_env")
                 and deployment["worker_urls"] == workers, "requires matching unauthenticated automatic-capability loopback deployment")
         descriptors = acceptance.worker_capabilities(workers, args.model)
@@ -1083,9 +1089,9 @@ def run(args):
                   "router": f"http://127.0.0.1:{args.router_port}", "automatic_capabilities": True,
                   "metrics": f"http://127.0.0.1:{args.metrics_port}", "log_level": args.log_level,
                   "stage_timing": args.stage_timing, "stage_trace": args.stage_trace,
-                  "event_endpoints": [args.event0, args.event1],
-                  "publisher_endpoints": [args.publisher0, args.publisher1], "capabilities": descriptors,
-                  "worker_logs": [args.worker0_log, args.worker1_log]}
+                  "event_endpoints": [getattr(args, f"event{i}") for i in range(args.worker_count)],
+                  "publisher_endpoints": [getattr(args, f"publisher{i}") for i in range(args.worker_count)], "capabilities": descriptors,
+                  "worker_logs": [getattr(args, f"worker{i}_log") for i in range(args.worker_count)]}
         for endpoint in common["event_endpoints"]:
             parsed = urllib.parse.urlsplit(endpoint)
             require(parsed.scheme == "tcp" and parsed.hostname == "127.0.0.1" and parsed.port
@@ -1104,7 +1110,7 @@ def run(args):
                       input_token_target=args.input_tokens, prefix_token_target=args.prefix_tokens,
                       output_tokens=args.output_tokens, prompt_format=args.prompt_format,
                       request_kind=args.request_kind,
-                      requests_per_phase=args.requests, groups=args.groups,
+                      requests_per_phase=args.requests, groups=args.groups, worker_count=args.worker_count,
                       rounds=args.rounds, arms=args.arms, trace_order=args.trace_order,
                       production_validation=args.production_validation,
                       natural_warmup_requests=args.natural_warmup_requests,
@@ -1241,6 +1247,11 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--worker0", default="http://127.0.0.1:8100")
     parser.add_argument("--worker1", default="http://127.0.0.1:8101")
+    parser.add_argument("--worker-count", type=int, choices=(2, 3), default=2)
+    for name in ("worker2", "worker2-log", "event2", "publisher2"):
+        parser.add_argument("--" + name)
+    for name in ("worker2-pid", "engine2-pid"):
+        parser.add_argument("--" + name, type=int)
     for name in ("worker0-pid", "worker1-pid", "engine0-pid", "engine1-pid"):
         parser.add_argument("--" + name, type=int)
     parser.add_argument("--router-port", type=int, default=3102)
@@ -1282,7 +1293,7 @@ def main():
                         help="Fresh authority to run that user hook before each arm; never inferred from old SSH access")
     parser.add_argument("--cohort-timeout", type=int, default=180)
     parser.add_argument("--allow-test-worker-cache-reset", action="store_true",
-                        help="Explicit fresh authority for clearing only these two idle Workers; requires approved available endpoint, never enables DEV_MODE")
+                        help="Explicit fresh authority for clearing only these fixture Workers; requires approved available endpoint, never enables DEV_MODE")
     args = parser.parse_args()
     if args.child:
         child(args.child)
@@ -1294,6 +1305,9 @@ def main():
                 "worker0_pid", "worker1_pid", "engine0_pid", "engine1_pid"):
         require(getattr(args, key) is not None, "missing --" + key.replace("_", "-"))
     require(sys.platform == "linux", "GPU performance run requires the authorized Linux /proc namespace")
+    for key in ("worker2", "worker2_log", "event2", "publisher2", "worker2_pid", "engine2_pid"):
+        require((getattr(args, key) is not None) == (args.worker_count == 3),
+                "third Worker arguments must all accompany --worker-count 3")
     require(8 <= args.requests <= 256 and 2 <= args.groups <= 32 and args.requests % args.groups == 0,
             "finite trace requires 8..256 requests divisible by 2..32 groups")
     require(256 <= args.input_tokens <= 8192 and 32 <= args.prefix_tokens < args.input_tokens
