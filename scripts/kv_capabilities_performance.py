@@ -18,6 +18,9 @@ Product RR remains a separate baseline. Test-only A/B/C require the kv-perf
 native feature and respectively measure shared forwarding without render + RR,
 real render + RR, and real render + KV. C-B includes changed Worker placement,
 not just scorer time. The ordinary product_kv arm needs no experimental mode.
+Perf-2 C0/CL/CT/CLT all perform real render+KV, varying only load protection
+and prepared Completion forwarding. --production-validation requires the
+feature-off native artifact and exercises their ordinary production paths.
 
 Timed requests use warmed per-client keep-alive connections, omit prompt-ID
 echoes, and require actual usage and a complete SSE response. The full token
@@ -80,7 +83,22 @@ require, save = prior.require, prior.save
 BENCHMARK_ENV = "VLLM_ROUTER_KV_PERF_MODE"
 ARMS = {"product_rr": ("round_robin", None), "product_kv": ("kv_aware", None),
         "A": ("kv_aware", "shared_rr"), "B": ("kv_aware", "render_rr"),
-        "C": ("kv_aware", "render_kv")}
+        "C": ("kv_aware", "render_kv"),
+        **{arm: ("kv_aware", "render_kv") for arm in ("C0", "CL", "CT", "CLT")}}
+PERF2_FLAGS = {"C0": (False, False), "CL": (True, False),
+               "CT": (False, True), "CLT": (True, True)}
+
+
+def arm_configuration(arm, production_validation=False):
+    policy, mode = ARMS[arm]
+    if production_validation:
+        require(arm == "product_rr" or arm in PERF2_FLAGS,
+                "production validation supports product_rr and C0/CL/CT/CLT only")
+        mode = None
+    load_guard, token_input = PERF2_FLAGS.get(arm, (False, False))
+    return {"policy": policy, "benchmark_mode": mode, "kv_load_guard": load_guard,
+            "kv_completion_token_input": token_input,
+            "production_validation": production_validation}
 
 
 def percentiles(values):
@@ -118,15 +136,18 @@ def sse_events(response, clock=time.perf_counter):
 
 
 def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None, measure_ttft=True,
-                     connection=None, require_token_ids=True, require_keepalive=False):
+                     connection=None, require_token_ids=True, require_keepalive=False,
+                     retain_token_ids=False):
     parsed = urllib.parse.urlsplit(url)
+    chat = "messages" in payload
     owned_connection = connection is None
     if owned_connection:
         connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
     raw = json.dumps(payload, separators=(",", ":")).encode()
     correlation_id = "cmb-perf-" + uuid.uuid4().hex
     row = {"request_id": request_id, "correlation_id": correlation_id, "status": "ERROR",
-           "request_sha256": hashlib.sha256(raw).hexdigest()}
+           "request_sha256": hashlib.sha256(raw).hexdigest(),
+           "request_hash_scope": "client ingress bytes; not Router-derived backend bytes"}
     started = time.perf_counter()
     row.update(started_monotonic=started, connection_reused=connection.sock is not None)
     first_text, first_event, first_reasoning = None, None, None
@@ -154,7 +175,7 @@ def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None,
                 "timed keep-alive connection was closed; automatic reconnect is not allowed")
         if connection.sock is not None:
             connection.sock.settimeout(timeout)
-        connection.request("POST", "/v1/completions", raw,
+        connection.request("POST", "/v1/chat/completions" if chat else "/v1/completions", raw,
                            {"Content-Type": "application/json", "X-Request-Id": correlation_id})
         active_socket[0] = connection.sock
         require(not expired.is_set(), "absolute request deadline expired while dispatching")
@@ -178,16 +199,22 @@ def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None,
                 response_id = event.get("id")
             if event.get("usage"):
                 usage = event["usage"]
+            if chat and event.get("prompt_token_ids") is not None:
+                ids = event["prompt_token_ids"]
+                require(seen_ids is None or seen_ids == ids, "generation prompt IDs changed within SSE")
+                seen_ids = ids
             for choice in event.get("choices", []):
                 if choice.get("finish_reason") is not None:
                     require(choice["finish_reason"] in ("stop", "length"), "unsuccessful generation finish reason")
                     finish_reason = choice["finish_reason"]
-                reasoning = choice.get("reasoning") or choice.get("reasoning_content")
+                content = choice.get("delta", {}) if chat else choice
+                reasoning = content.get("reasoning") or content.get("reasoning_content")
                 if first_reasoning is None and isinstance(reasoning, str) and reasoning:
                     first_reasoning = arrived
-                if first_text is None and isinstance(choice.get("text"), str) and choice["text"]:
+                generated = content.get("content") if chat else content.get("text")
+                if first_text is None and isinstance(generated, str) and generated:
                     first_text = arrived
-                ids = choice.get("prompt_token_ids")
+                ids = choice.get("prompt_token_ids") if not chat else None
                 if ids is not None:
                     require(seen_ids is None or seen_ids == ids, "generation prompt IDs changed within SSE")
                     seen_ids = ids
@@ -201,7 +228,7 @@ def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None,
                 "absolute request deadline expired")
         if measure_ttft:
             require(first_text is not None, "SSE never produced nonempty generated text")
-        expected = payload["prompt"] if isinstance(payload["prompt"], list) else expected_tokens
+        expected = payload["prompt"] if isinstance(payload.get("prompt"), list) else expected_tokens
         require(expected, "exact prepared trace is missing")
         if require_token_ids:
             require(seen_ids == expected, "actual Worker prompt IDs differ from exact prepared trace")
@@ -221,6 +248,12 @@ def streamed_request(url, payload, request_id, timeout=60, expected_tokens=None,
     except Exception as error:
         row.update(error=f"{type(error).__name__}: {error}", end_to_end_ms=(time.perf_counter() - started) * 1000)
     finally:
+        if retain_token_ids:
+            # Finite fixtures only; preserve actual arrays even on mismatch.
+            # Timed requests never enable ID echo or retain this diagnostic.
+            row["actual_worker_prompt_token_ids"] = seen_ids
+            row["expected_prompt_token_ids"] = expected_tokens
+            row["ingress_body_utf8"] = raw.decode("utf-8")
         watchdog.cancel()
         watchdog.join(timeout=1)
         if watchdog.is_alive():
@@ -267,14 +300,17 @@ class KeepAliveClients:
             connection.close()
 
 
-def validate_benchmark_capabilities(info, arm):
-    mode = ARMS[arm][1]
+def validate_benchmark_capabilities(info, arm, production_validation=False):
+    mode = arm_configuration(arm, production_validation)["benchmark_mode"]
     require(isinstance(info, dict), "native benchmark capability response is not an object")
     require(info.get("selected_mode") == mode, "native did not confirm the requested experimental mode")
     if mode is not None:
         require(info.get("enabled") is True and info.get("loopback_only") is True
                 and info.get("environment_variable") == BENCHMARK_ENV and mode in info.get("modes", []),
-                "A/B/C require an explicitly enabled loopback-only kv-perf build")
+                "experimental arms require an explicitly enabled loopback-only kv-perf build")
+    if production_validation:
+        require(info.get("enabled") is False and info.get("modes") == [],
+                "production validation requires a feature-off native artifact, not an idle ablation build")
     return info
 
 
@@ -313,7 +349,8 @@ def child(path):
     spec.loader.exec_module(native)
     capability = (native.kv_perf_capabilities() if hasattr(native, "kv_perf_capabilities")
                   else {"enabled": False, "modes": [], "selected_mode": None})
-    save(config["benchmark_identity"], validate_benchmark_capabilities(capability, config["arm"]))
+    save(config["benchmark_identity"], validate_benchmark_capabilities(
+        capability, config["arm"], config.get("production_validation", False)))
     sys.path.insert(0, str(ROOT / "py_src"))
     from vllm_router.router import Router
     from vllm_router.router_args import RouterArgs
@@ -329,6 +366,8 @@ def child(path):
                "queue_size": 0}
     if config["policy"] == "kv_aware":
         options.update(kv_input_backend="vllm", kv_render_config=config["render_config"],
+                       kv_load_guard=config.get("kv_load_guard", False),
+                       kv_completion_token_input=config.get("kv_completion_token_input", False),
                        kv_events_topic_filter="", kv_events_endpoints=[worker + "=" + endpoint
                        for worker, endpoint in zip(config["workers"], config["event_endpoints"])])
     router = Router.from_args(RouterArgs(**options))
@@ -354,8 +393,9 @@ def owned_router(config, directory):
     environment = os.environ.copy()
     for key in (BENCHMARK_ENV, "VLLM_ROUTER_KV_STAGE_TIMING", "VLLM_ROUTER_KV_STAGE_TRACE"):
         environment.pop(key, None)
-    if ARMS[config["arm"]][1] is not None:
-        environment[BENCHMARK_ENV] = ARMS[config["arm"]][1]
+    mode = arm_configuration(config["arm"], config.get("production_validation", False))["benchmark_mode"]
+    if mode is not None:
+        environment[BENCHMARK_ENV] = mode
     if config["stage_timing"]:
         environment["VLLM_ROUTER_KV_STAGE_TIMING"] = "1"
     if config["stage_trace"]:
@@ -377,7 +417,7 @@ def owned_router(config, directory):
             else:
                 raise RuntimeError("owned Router startup timeout")
             validate_benchmark_capabilities(json.loads(Path(config["benchmark_identity"]).read_text()),
-                                            config["arm"])
+                                            config["arm"], config.get("production_validation", False))
             yield process
         finally:
             if process.poll() is None:
@@ -393,7 +433,7 @@ def owned_router(config, directory):
 def make_trace(args, vocabulary, scenario, namespace, trace_seed):
     """Same logical trace/target lengths; actual text lengths are independently recorded."""
     rng = random.Random(trace_seed)
-    has_locality = scenario in ("locality", "shared")
+    has_locality = scenario in ("locality", "shared", "natural")
     prefix_count = args.groups if has_locality else args.requests
     prefixes = [rng.choices(vocabulary, k=args.prefix_tokens) for _ in range(prefix_count)]
     namespace_rng = random.Random(namespace)
@@ -404,14 +444,14 @@ def make_trace(args, vocabulary, scenario, namespace, trace_seed):
     # adversarial request-order search. Each locality prefix occurs equally.
     order = ([i // (args.requests // args.groups) for i in range(args.requests)]
              if has_locality else list(range(args.requests)))
-    if has_locality and getattr(args, "trace_order", "burst") == "interleaved":
+    if has_locality and (scenario == "natural" or getattr(args, "trace_order", "burst") == "interleaved"):
         order = [i % args.groups for i in range(args.requests)]
     base = {"model": args.model, "stream": True, "stream_options": {"include_usage": True},
             "max_tokens": args.output_tokens, "ignore_eos": True, "temperature": 0,
             "add_special_tokens": False, "return_token_ids": False}
     trace = [{**base, "prompt": prefixes[group] + suffixes[i]} for i, group in enumerate(order)]
     warm = []
-    if has_locality:
+    if has_locality and scenario != "natural":
         for group, prefix in enumerate(prefixes):
             # Distinct tail means warmup covers the intended reusable prefix,
             # not the entire timed query. Same full prompt length in both arms.
@@ -439,6 +479,13 @@ def make_trace(args, vocabulary, scenario, namespace, trace_seed):
             request["prompt"] = (text_prefixes[group] + "\n"
                                  + " ".join(text_rng.choices(words, k=tail_words))
                                  + "\nBriefly summarize the themes of these words.")
+    if getattr(args, "request_kind", "completion") == "chat":
+        require(getattr(args, "prompt_format", "token_ids") == "text", "Chat fixture requires real text")
+        for request in trace + [row for _owner, row in warm]:
+            text = request.pop("prompt")
+            request.pop("add_special_tokens", None)
+            request.update(messages=[{"role": "user", "content": text}],
+                           chat_template_kwargs={"enable_thinking": False})
     return trace, warm, order
 
 
@@ -446,18 +493,83 @@ def prepare_trace(workers, trace):
     """Out-of-band measurement setup only, never in a timed request path."""
     expected = []
     for request in trace:
-        if isinstance(request["prompt"], list):
+        chat = "messages" in request
+        if isinstance(request.get("prompt"), list):
             expected.append(request["prompt"])
             continue
         raw = json.dumps(request, separators=(",", ":")).encode()
         per_worker = []
         for worker in workers:
-            status, _, body = acceptance.raw_request(worker, "/v1/completions/render", raw, timeout=20)
+            route = "/v1/chat/completions/render" if chat else "/v1/completions/render"
+            status, _, body = acceptance.raw_request(worker, route, raw, timeout=20)
             require(status == 200, "text trace preparation failed at real Worker /render")
-            per_worker.append(acceptance.public_render_tokens(body, False))
+            per_worker.append(acceptance.public_render_tokens(body, chat))
         require(per_worker[0] == per_worker[1], "Workers disagree on real text trace preprocessing")
         expected.append(per_worker[0])
     return expected
+
+
+def natural_warmup_trace(args, trace, order, trace_seed):
+    """Router-selected interleaved burn-in; distinct tails, no owner injection."""
+    rng = random.Random(trace_seed + ":natural-burn-in")
+    first = {group: order.index(group) for group in range(args.groups)}
+    rows = []
+    for index in range(args.natural_warmup_requests):
+        request = dict(trace[first[index % args.groups]])
+        chat = "messages" in request
+        content = request["messages"][0]["content"] if chat else request["prompt"]
+        if isinstance(content, str):
+            prefix = content.split("\n", 1)[0]
+            tail = " ".join(rng.choices(("river", "garden", "cloud", "paper", "green"),
+                                       k=max(1, args.input_tokens - args.prefix_tokens)))
+            text = prefix + "\n" + tail + "\nDescribe these warmup themes."
+            if chat:
+                request["messages"] = [{"role": "user", "content": text}]
+            else:
+                request["prompt"] = text
+        else:
+            request["prompt"] = (request["prompt"][:args.prefix_tokens]
+                                 + rng.choices(args.vocabulary, k=args.input_tokens - args.prefix_tokens))
+        rows.append(request)
+    return rows
+
+
+def verify_context_budget(workers, model, traces):
+    """Use actual served context limit, never infer it from token-length targets."""
+    limits = []
+    for worker in workers:
+        models = prior.json_request(worker, "/v1/models")
+        matches = [value for value in models.get("data", []) if value.get("id") == model]
+        require(len(matches) == 1 and type(matches[0].get("max_model_len")) is int,
+                "actual Worker model/context limit is unavailable")
+        limits.append(matches[0]["max_model_len"])
+    maximum = max(len(tokens) + request["max_tokens"]
+                  for requests, expected in traces for request, tokens in zip(requests, expected))
+    require(maximum <= min(limits), "actual prompt plus output exceeds a Worker context limit")
+    return {"worker_context_limits": limits, "maximum_requested_sequence_tokens": maximum}
+
+
+def run_natural_warmup(config, trace, expected, concurrency, evidence_path):
+    """Bounded, untimed Router burn-in, preserving the cohort for measurement."""
+    rows, futures = [], []
+    clients = KeepAliveClients(config["router"], concurrency)
+    executor = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="owned-natural-burn-in")
+    try:
+        futures = [executor.submit(clients.request, request, index, expected[index])
+                   for index, request in enumerate(trace)]
+        for future in as_completed(futures):
+            rows.append(future.result())
+        require(len(rows) == len(trace) and all(row["status"] == "PASS" for row in rows),
+                "natural burn-in failed; no measured window is allowed")
+    finally:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        clients.close()
+        save(evidence_path, {"requests": sorted(rows, key=lambda row: row["request_id"]),
+             "complete": len(rows) == len(trace) and all(row["status"] == "PASS" for row in rows),
+             "scope": "Untimed Router-selected interleaved burn-in; no direct owner warmup. "
+                      "Same Router/Workers continue into the measured window. Not proof of production steady state."})
 
 
 class LoadSampler:
@@ -544,16 +656,67 @@ def window_snapshot(config, pid):
                                "Nested stage durations must not be summed or p95-subtracted."}
 
 
+def forwarding_window(before, after, expected_requests, prepared, completion=True):
+    """Always-on production counters prove a token arm did not silently fall back."""
+    def value(raw, name, key, label):
+        found = []
+        for line in raw.splitlines():
+            match = re.fullmatch(re.escape(name) + r"\{([^}]*)\}\s+([^ ]+)(?:\s+.*)?", line)
+            if match and re.search(r'(?:^|,)' + re.escape(key) + r'="' + re.escape(label) + r'"(?:,|$)',
+                                   match.group(1)):
+                found.append(float(match.group(2)))
+        require(found and all(math.isfinite(item) for item in found),
+                f"missing/nonfinite production forwarding metric: {name} {label}")
+        return sum(found)
+
+    result = {}
+    for name, key, labels in (
+        ("vllm_router_kv_completion_forward_total", "mode", ("prepared", "raw")),
+        ("vllm_router_kv_completion_payload_bytes_total", "kind", ("ingress", "backend")),
+    ):
+        for label in labels:
+            delta = value(after, name, key, label) - value(before, name, key, label)
+            require(delta >= 0, "production forwarding counter decreased")
+            result[label] = delta
+    require(result["prepared"] == (expected_requests if prepared else 0)
+            and result["raw"] == (0 if prepared else expected_requests),
+            "prepared forwarding eligibility/count differs from the declared arm")
+    if completion:
+        require(result["ingress"] > 0 and result["backend"] > 0, "forwarded byte counters are empty")
+    else:
+        require(expected_requests == 0 and result["ingress"] == result["backend"] == 0,
+                "Chat unexpectedly entered Completion forwarding counters")
+    result["scope"] = ("Per actual backend attempt; failures/retries are not hidden. "
+                       "Backend byte totals are not a full backend-body capture or byte-equivalence proof.")
+    return result
+
+
 def token_oracle_after_timing(config, trace, expected, evidence_path):
-    """Full generated prompt IDs for every trace on both Workers, after timing."""
+    """Persist full real Worker IDs, including Router-forwarded probes, after timing."""
     rows = []
     try:
+        observed_forwarding = ("metrics" in config and "router" in config
+                               and config["arm"] in PERF2_FLAGS)
+        forwarding_before = metric_snapshot(config["metrics"])[0] if observed_forwarding else None
         for index, (request, tokens) in enumerate(zip(trace, expected)):
             probe = {**request, "max_tokens": 1, "return_token_ids": True}
             for owner, worker in enumerate(config["workers"]):
-                row = streamed_request(worker, probe, index, expected_tokens=tokens, measure_ttft=False)
-                rows.append({"worker_index": owner, **row})
+                row = streamed_request(worker, probe, index, expected_tokens=tokens, measure_ttft=False,
+                                       retain_token_ids=True)
+                rows.append({"path": "direct_original", "worker_index": owner, **row})
                 require(row["status"] == "PASS", f"post-window actual Worker token oracle failed: {row}")
+            if "router" in config and config["arm"] in PERF2_FLAGS:
+                row = streamed_request(config["router"], probe, index, expected_tokens=tokens,
+                                       measure_ttft=False, retain_token_ids=True)
+                rows.append({"path": "through_router", "worker_index": None, **row})
+                require(row["status"] == "PASS", f"post-window Router token oracle failed: {row}")
+        if observed_forwarding:
+            completion = all("messages" not in row for row in trace)
+            observation = forwarding_window(
+                forwarding_before, metric_snapshot(config["metrics"])[0], len(trace) if completion else 0,
+                completion and config["kv_completion_token_input"]
+                and all(isinstance(row["prompt"], str) for row in trace), completion=completion)
+            save(evidence_path.with_name(evidence_path.stem + "-forwarding-window.json"), observation)
         return rows
     finally:
         save(evidence_path, rows)
@@ -672,13 +835,14 @@ def reset_exact_test_workers(args, config, directory):
 
 
 def phase(args, common, arm, scenario, concurrency, pair_seed, out, round_index=0):
-    policy, mode = ARMS[arm]
+    arm_options = arm_configuration(arm, args.production_validation)
+    policy, mode = arm_options["policy"], arm_options["benchmark_mode"]
     name = f"{scenario}-c{concurrency}-r{round_index + 1}-{arm}"
     directory = out / name
     directory.mkdir()
     if args.cache_state == "fresh-cohort":
         prepare_fresh_cohort(args, common, directory)
-    config = {**common, "policy": policy, "arm": arm,
+    config = {**common, **arm_options, "arm": arm,
               "facade_identity": str(directory / "facade-identity.json"),
               "benchmark_identity": str(directory / "native-benchmark.json")}
     strict_pair = args.cache_state in ("reset", "fresh-cohort")
@@ -686,15 +850,25 @@ def phase(args, common, arm, scenario, concurrency, pair_seed, out, round_index=
     trace, warm, order = make_trace(args, args.vocabulary, scenario, namespace, pair_seed)
     expected_trace = prepare_trace(config["workers"], trace)
     expected_warm = prepare_trace(config["workers"], [request for _owner, request in warm])
+    natural_trace = natural_warmup_trace(args, trace, order, pair_seed) if scenario == "natural" else []
+    expected_natural = prepare_trace(config["workers"], natural_trace)
+    require(all(len(tokens) <= 8192 for tokens in expected_trace + expected_warm + expected_natural),
+            "actual fixture tokens exceed the bounded full-ID evidence limit")
+    context = verify_context_budget(config["workers"], args.model,
+                                   [(trace, expected_trace), ([request for _owner, request in warm], expected_warm),
+                                    (natural_trace, expected_natural)])
     if scenario == "cold":
         require(all(len(ids) >= args.block_size for ids in expected_trace)
                 and len({tuple(ids[:args.block_size]) for ids in expected_trace}) == len(expected_trace),
                 "actual prepared cold prompts do not have distinct complete first hash blocks")
     save(directory / "trace.json", {"logical_order": order, "requests": trace,
+         "ingress_request_bodies_utf8": [json.dumps(request, separators=(",", ":")) for request in trace],
          "namespace": namespace, "expected_prompt_token_ids": expected_trace,
          "direct_warm": [{"worker_index": owner, "request": request,
                           "expected_prompt_token_ids": expected_warm[index]}
-                         for index, (owner, request) in enumerate(warm)]})
+                         for index, (owner, request) in enumerate(warm)],
+         "natural_router_burn_in": [{"request": request, "expected_prompt_token_ids": tokens}
+                                    for request, tokens in zip(natural_trace, expected_natural)]})
     if args.cache_state == "reset":
         # Clear before creating the Router, so no old event/index generation is
         # carried across phases. This never enables an unavailable reset API.
@@ -712,6 +886,9 @@ def phase(args, common, arm, scenario, concurrency, pair_seed, out, round_index=
             require(result["status"] == "PASS", f"direct warm failed: {result}")
             warm_rows.append({"worker_index": owner, **result})
         save(directory / "warmup-results.json", warm_rows)
+        if natural_trace:
+            run_natural_warmup(config, natural_trace, expected_natural, concurrency,
+                               directory / "natural-burn-in-results.json")
         idle(config["workers"], config["router"])
         time.sleep(args.event_wait)
         before_window = window_snapshot(config, process.pid)
@@ -766,8 +943,17 @@ def phase(args, common, arm, scenario, concurrency, pair_seed, out, round_index=
         after_window = window_snapshot(config, process.pid)
         save(directory / "metrics-after.json", after_window)
         after = after_window["worker_counters"]
+        forwarding = (forwarding_window(before_window["router_raw_prometheus"],
+                                        after_window["router_raw_prometheus"],
+                                        len(rows) if args.request_kind == "completion" else 0,
+                                        config["kv_completion_token_input"] and args.prompt_format == "text"
+                                        and args.request_kind == "completion",
+                                        completion=args.request_kind == "completion")
+                      if arm in PERF2_FLAGS else None)
         deltas = [{key: current[key] - previous[key] for key in current} for previous, current in zip(before, after)]
         passed = [row for row in rows if row["status"] == "PASS"]
+        require(len(passed) == args.requests and len(rows) == args.requests,
+                "measured request failed or is unresolved; stop instead of continuing other arms")
         request_counts = [row["vllm:request_success_total"] for row in deltas]
         prefix_hits = [row["vllm:prefix_cache_hits_total"] for row in deltas]
         prefix_queries = [row["vllm:prefix_cache_queries_total"] for row in deltas]
@@ -794,12 +980,19 @@ def phase(args, common, arm, scenario, concurrency, pair_seed, out, round_index=
                     "Worker identity changed during a measured phase or its post-window oracle")
         result = {"name": name, "status": "PASS" if len(passed) == args.requests else "FAIL",
                   "policy": policy, "arm": arm, "benchmark_mode": mode, "round": round_index + 1,
+                  "production_validation": args.production_validation,
+                  "kv_load_guard": config["kv_load_guard"],
+                  "kv_completion_token_input": config["kv_completion_token_input"],
+                  "completion_forwarding_window": forwarding,
                   "scenario": scenario, "concurrency": concurrency,
                   "requested": args.requests, "successful": len(passed), "errors": len(rows) - len(passed),
                   "prompt_format": args.prompt_format,
+                  "request_kind": args.request_kind,
+                  "chat_fixture_scope": "single user text, thinking disabled" if args.request_kind == "chat" else None,
                   "actual_prompt_tokens_min": min(map(len, expected_trace)),
                   "actual_prompt_tokens_max": max(map(len, expected_trace)),
                   "actual_prompt_tokens_mean": sum(map(len, expected_trace)) / len(expected_trace),
+                  "context_budget": context,
                   "elapsed_seconds": elapsed, "requests_per_second": len(passed) / elapsed,
                   "output_tokens_per_second": sum(row["output_tokens"] for row in passed) / elapsed,
                   "ttft_ms": percentiles([row["ttft_ms"] for row in passed]),
@@ -825,11 +1018,16 @@ def phase(args, common, arm, scenario, concurrency, pair_seed, out, round_index=
                   "router_process": process_before, "mapped_native": native_before,
                   "physical_trace_sha256": prior.sha256(directory / "trace.json"),
                   "request_bodies_sha256": hashlib.sha256(json.dumps(trace, separators=(",", ":")).encode()).hexdigest(),
+                  "request_bodies_hash_scope": "immutable client ingress; never a derived backend-body hash",
                   "prepared_tokens_sha256": hashlib.sha256(json.dumps(expected_trace, separators=(",", ":")).encode()).hexdigest(),
                   "client_connections": concurrency,
                   "requests_using_existing_connection": sum(row.get("connection_reused", False) for row in rows),
                   "initial_cache_state": args.cache_state,
                   "strict_byte_identical_pair": strict_pair,
+                  "strict_byte_identical_scope": "client ingress and full prepared token IDs; backend body may be derived",
+                  "measured_cache_preparation": ("router_selected_natural_burn_in" if scenario == "natural"
+                                                 else "direct_owner_warmup" if warm else "unwarmed_cold"),
+                  "natural_burn_in_requests": len(natural_trace),
                   "worker_processes": common["worker_processes"], "worker_descriptors": common["capabilities"],
                   "stage_timing": args.stage_timing, "stage_trace": args.stage_trace,
                   "scope": "Closed-loop warmed keep-alive clients; no prompt token-ID echo during timing. "
@@ -850,7 +1048,9 @@ def run(args):
                 "Product RR and shared-forward A are distinct baselines. C-B includes changed Worker placement.",
                 "Prefix-hit counters are tokens, not request hit rates. Router load is not GPU utilization or engine queue.",
                 "Without explicitly authorized supported reset, namespaces/initial caches differ and comparisons are not strict.",
-                "Closed-loop throughput is not production capacity; no p99 or SLO PASS is inferred."]}
+                "Closed-loop throughput is not production capacity; no p99 or SLO PASS is inferred.",
+                "Identical hashes bind ingress and prepared IDs, not derived token-forward backend bytes.",
+                "Natural is a finite Router-selected burn-in followed by a persistent-cohort window, not verified production steady state."]}
     save(out / "summary.json", report)
     try:
         identity = acceptance.source_identity(args.source, args.candidate, True)
@@ -893,14 +1093,17 @@ def run(args):
                         ("vllm", "torch", "transformers", "tokenizers", "pydantic")},
                       input_token_target=args.input_tokens, prefix_token_target=args.prefix_tokens,
                       output_tokens=args.output_tokens, prompt_format=args.prompt_format,
+                      request_kind=args.request_kind,
                       requests_per_phase=args.requests, groups=args.groups,
                       rounds=args.rounds, arms=args.arms, trace_order=args.trace_order,
+                      production_validation=args.production_validation,
+                      natural_warmup_requests=args.natural_warmup_requests,
                       stage_timing=args.stage_timing, stage_trace=args.stage_trace,
                       sample_interval_seconds=args.sample_interval, build_manifest=build,
-                      comparison_classification=("IDENTICAL_BODIES_EXPLICIT_" + args.cache_state.upper()
+                      comparison_classification=("IDENTICAL_INGRESS_AND_PREPARED_IDS_EXPLICIT_" + args.cache_state.upper()
                                                  if args.cache_state != "namespaced"
                                                  else "EXPLORATORY_NAMESPACE_AND_INITIAL_STATE_DIFFER"),
-                      trace_mode=("byte_identical_with_explicit_" + args.cache_state if args.cache_state != "namespaced"
+                      trace_mode=("ingress_byte_identical_with_explicit_" + args.cache_state if args.cache_state != "namespaced"
                                   else "same_logical_trace_fresh_first_block_namespaces"),
                       timing_definitions={"headers_ms": "client-observed response headers, not Rust upstream headers",
                           "first_sse_ms": "first complete non-DONE SSE JSON record including empty-text records",
@@ -921,7 +1124,7 @@ def run(args):
                         pair_identity = (result["request_bodies_sha256"], result["prepared_tokens_sha256"])
                         first_pair_identity = first_pair_identity or pair_identity
                         require(pair_identity == first_pair_identity,
-                                "paired experiment changed request bytes/order or actual prepared tokens")
+                                "paired experiment changed immutable ingress bytes/order or actual prepared tokens")
                     report["phases"].append(result)
                     save(out / "summary.json", report)
         for before in common["worker_processes"]:
@@ -1039,13 +1242,19 @@ def main():
     parser.add_argument("--output-tokens", type=int, default=32)
     parser.add_argument("--prompt-format", choices=("text", "token_ids"), default="text",
                         help="Default real text exercises actual tokenization; token_ids is an explicitly narrower diagnostic")
-    parser.add_argument("--arms", nargs="+", choices=tuple(ARMS), default=["product_rr", "A", "B", "C"],
-                        help="A/B/C require the test-only kv-perf feature; product_rr remains the real baseline")
+    parser.add_argument("--request-kind", choices=("completion", "chat"), default="completion",
+                        help="Chat is a single pure-text user message with thinking disabled; never prepared Completion forwarding")
+    parser.add_argument("--arms", nargs="+", choices=tuple(ARMS), default=["product_rr", "C0", "CL", "CT", "CLT"],
+                        help="C0/CL/CT/CLT are the Perf-2 2x2; existing A/B/C remain available. Include product_rr")
+    parser.add_argument("--production-validation", action="store_true",
+                        help="Require feature-off native artifact; C0/CL/CT/CLT use ordinary production dispatch, not an experimental mode")
     parser.add_argument("--rounds", type=int, default=3, help="Rotated/reversed arm order; never select only the best round")
     parser.add_argument("--seed", help="Recorded deterministic trace seed; omitted generates a fresh run namespace")
     parser.add_argument("--trace-order", choices=("burst", "interleaved"), default="burst")
     parser.add_argument("--concurrencies", nargs="+", type=int, default=[1, 4])
-    parser.add_argument("--scenarios", nargs="+", choices=("locality", "cold", "shared"), default=["locality", "cold"])
+    parser.add_argument("--scenarios", nargs="+", choices=("locality", "cold", "shared", "natural"), default=["locality", "cold"])
+    parser.add_argument("--natural-warmup-requests", type=int, default=32,
+                        help="Finite Router-selected interleaved burn-in before natural window; no direct owner warmup")
     parser.add_argument("--budget-seconds", "--max-seconds", dest="budget_seconds", type=int, default=900,
                         help="Default 900; explicit maximum 3600, always within the caller's fresh authorized remaining budget")
     parser.add_argument("--event-wait", type=float, default=2)
@@ -1073,15 +1282,21 @@ def main():
                 "worker0_pid", "worker1_pid", "engine0_pid", "engine1_pid"):
         require(getattr(args, key) is not None, "missing --" + key.replace("_", "-"))
     require(sys.platform == "linux", "GPU performance run requires the authorized Linux /proc namespace")
-    require(8 <= args.requests <= 64 and 2 <= args.groups <= 16 and args.requests % args.groups == 0,
-            "finite trace requires 8..64 requests divisible by 2..16 groups")
-    require(256 <= args.input_tokens <= 2048 and 32 <= args.prefix_tokens < args.input_tokens
+    require(8 <= args.requests <= 256 and 2 <= args.groups <= 16 and args.requests % args.groups == 0,
+            "finite trace requires 8..256 requests divisible by 2..16 groups")
+    require(256 <= args.input_tokens <= 8192 and 32 <= args.prefix_tokens < args.input_tokens
             and 1 <= args.output_tokens <= 64, "finite token dimensions exceeded")
+    require(8 <= args.natural_warmup_requests <= 128 and args.natural_warmup_requests % args.groups == 0,
+            "natural burn-in requires 8..128 requests divisible by groups")
     require(args.concurrencies and len(args.concurrencies) == len(set(args.concurrencies))
             and set(args.concurrencies) <= {1, 4}, "concurrency must be 1 and/or 4, once each")
     require(len(args.scenarios) == len(set(args.scenarios)), "duplicate scenarios")
+    require(args.request_kind != "chat" or (args.prompt_format == "text" and "cold" not in args.scenarios),
+            "Chat fixture needs --prompt-format text and locality/shared/natural; its shared template precludes the zero-hit all-cold control")
     require(args.arms and len(args.arms) == len(set(args.arms)) and "product_rr" in args.arms,
             "include the true product_rr baseline exactly once; A is not its replacement")
+    for arm in args.arms:
+        arm_configuration(arm, args.production_validation)
     require(1 <= args.rounds <= 3, "bounded experiment supports 1..3 rounds")
     require(args.sample_interval == 0 or 0.1 <= args.sample_interval <= 5, "invalid bounded sample interval")
     require(not args.stage_trace or (args.stage_timing and args.log_level == "info"),

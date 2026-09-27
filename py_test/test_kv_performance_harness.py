@@ -22,16 +22,22 @@ sys.path.insert(0, str(SCRIPTS))
 import kv_capabilities_performance as perf  # noqa: E402
 
 
-def stream(ids=None, text="generated", completion=2, done=True, finish=True):
-    choice = {"text": text}
+def stream(
+    ids=None, text="generated", completion=2, done=True, finish=True, chat=False
+):
+    choice = (
+        {"delta": {"role": "assistant", "content": text}} if chat else {"text": text}
+    )
     if finish:
         choice["finish_reason"] = "length"
-    if ids is not None:
+    if ids is not None and not chat:
         choice["prompt_token_ids"] = ids
     events = [
         {"id": "public-fixture", "choices": [choice]},
         {"usage": {"prompt_tokens": 3, "completion_tokens": completion}},
     ]
+    if ids is not None and chat:
+        events[0]["prompt_token_ids"] = ids
     body = b"".join(
         b"data: " + json.dumps(event).encode() + b"\n\n" for event in events
     )
@@ -50,9 +56,10 @@ class FakeConnection:
 
     def __init__(self, body):
         self.body, self.closed = body, False
+        self.requests = []
 
-    def request(self, *_args, **_kwargs):
-        pass
+    def request(self, *args, **kwargs):
+        self.requests.append((args, kwargs))
 
     def getresponse(self):
         return FakeResponse(self.body)
@@ -82,7 +89,7 @@ def server(*, slow=False, connection_close=False):
             records.append(
                 (self.client_address, request, self.headers.get("X-Request-Id"))
             )
-            body = stream(completion=request["max_tokens"])
+            body = stream(completion=request["max_tokens"], chat="messages" in request)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             if slow:
@@ -146,6 +153,39 @@ class PerformanceContractTests(unittest.TestCase):
                 {**ordinary, "selected_mode": "shared_rr"}, "product_rr"
             )
 
+    def test_perf2_is_a_real_render_two_by_two(self):
+        expected = {
+            "C0": (False, False),
+            "CL": (True, False),
+            "CT": (False, True),
+            "CLT": (True, True),
+        }
+        for arm, flags in expected.items():
+            with self.subTest(arm=arm):
+                config = perf.arm_configuration(arm)
+                self.assertEqual(config["policy"], "kv_aware")
+                self.assertEqual(config["benchmark_mode"], "render_kv")
+                self.assertEqual(
+                    (config["kv_load_guard"], config["kv_completion_token_input"]),
+                    flags,
+                )
+        self.assertEqual(perf.arm_configuration("product_rr")["policy"], "round_robin")
+
+    def test_production_requires_feature_off_not_only_unselected_mode(self):
+        ordinary = {"enabled": False, "modes": [], "selected_mode": None}
+        for arm in ("product_rr", "C0", "CL", "CT", "CLT"):
+            config = perf.arm_configuration(arm, production_validation=True)
+            self.assertIsNone(config["benchmark_mode"])
+            perf.validate_benchmark_capabilities(
+                ordinary, arm, production_validation=True
+            )
+            with self.assertRaisesRegex(RuntimeError, "feature-off"):
+                perf.validate_benchmark_capabilities(
+                    {**ordinary, "enabled": True}, arm, production_validation=True
+                )
+        with self.assertRaisesRegex(RuntimeError, "production validation supports"):
+            perf.arm_configuration("B", production_validation=True)
+
     def test_arm_order_repeats_without_cherry_picking(self):
         arms = ["product_rr", "A", "B", "C"]
         orders = [perf.arm_order(arms, index, 0) for index in range(3)]
@@ -198,6 +238,104 @@ class PerformanceContractTests(unittest.TestCase):
                 warm[group * 2 + 1][1]["prompt"].split("\n")[0],
             )
 
+    def test_natural_burn_in_is_interleaved_no_owner_warm_and_distinct_tail(self):
+        args = SimpleNamespace(
+            groups=4,
+            requests=16,
+            prefix_tokens=48,
+            input_tokens=64,
+            block_size=16,
+            model="public-test",
+            output_tokens=2,
+            prompt_format="text",
+            trace_order="burst",
+            natural_warmup_requests=8,
+            vocabulary=list(range(256)),
+        )
+        trace, warm, order = perf.make_trace(
+            args, args.vocabulary, "natural", "same", "same"
+        )
+        self.assertEqual(warm, [])
+        self.assertEqual(order, [0, 1, 2, 3] * 4)
+        burn_in = perf.natural_warmup_trace(args, trace, order, "same")
+        self.assertEqual(len(burn_in), 8)
+        self.assertEqual(burn_in, perf.natural_warmup_trace(args, trace, order, "same"))
+        for index, request in enumerate(burn_in):
+            self.assertEqual(
+                request["prompt"].split("\n")[0],
+                trace[index % 4]["prompt"].split("\n")[0],
+            )
+            self.assertNotEqual(request["prompt"], trace[index % 4]["prompt"])
+            self.assertFalse(request["return_token_ids"])
+
+    def test_long_input_checks_real_served_context_not_requested_target(self):
+        traces = [([{"max_tokens": 2}], [[1, 2, 3]])]
+        with patch.object(
+            perf.prior,
+            "json_request",
+            return_value={"data": [{"id": "public-test", "max_model_len": 5}]},
+        ):
+            checked = perf.verify_context_budget(["w0", "w1"], "public-test", traces)
+            self.assertEqual(checked["maximum_requested_sequence_tokens"], 5)
+        for card in ({"id": "public-test", "max_model_len": 4}, {"id": "public-test"}):
+            with self.subTest(card=card), patch.object(
+                perf.prior, "json_request", return_value={"data": [card]}
+            ), self.assertRaises(RuntimeError):
+                perf.verify_context_budget(["w0", "w1"], "public-test", traces)
+
+    def test_chat_fixture_uses_real_text_messages_not_completion_options(self):
+        args = SimpleNamespace(
+            groups=4,
+            requests=16,
+            prefix_tokens=48,
+            input_tokens=64,
+            block_size=16,
+            model="public-test",
+            output_tokens=2,
+            prompt_format="text",
+            trace_order="burst",
+            natural_warmup_requests=8,
+            vocabulary=list(range(256)),
+            request_kind="chat",
+        )
+        trace, warm, order = perf.make_trace(
+            args, args.vocabulary, "locality", "same", "same"
+        )
+        for request in trace + [request for _owner, request in warm]:
+            self.assertNotIn("prompt", request)
+            self.assertNotIn("add_special_tokens", request)
+            self.assertEqual(request["messages"][0]["role"], "user")
+            self.assertEqual(
+                request["chat_template_kwargs"], {"enable_thinking": False}
+            )
+        original = json.dumps(trace, sort_keys=True)
+        burn_in = perf.natural_warmup_trace(args, trace, order, "same")
+        self.assertEqual(original, json.dumps(trace, sort_keys=True))
+        self.assertEqual(len(burn_in), 8)
+
+    def test_chat_preparation_uses_actual_chat_render_endpoint(self):
+        with patch.object(
+            perf.acceptance,
+            "raw_request",
+            return_value=(200, {}, b'{"token_ids":[1,2,3]}'),
+        ) as request:
+            tokens = perf.prepare_trace(
+                ["w0", "w1"],
+                [
+                    {
+                        "messages": [{"role": "user", "content": "fixture"}],
+                        "max_tokens": 2,
+                    }
+                ],
+            )
+        self.assertEqual(tokens, [[1, 2, 3]])
+        self.assertTrue(
+            all(
+                call.args[1] == "/v1/chat/completions/render"
+                for call in request.call_args_list
+            )
+        )
+
     def call_stream(self, body, **kwargs):
         connection = FakeConnection(body)
         payload = {
@@ -225,6 +363,25 @@ class PerformanceContractTests(unittest.TestCase):
         self.assertIsNone(row["first_reasoning_ms"])
         self.assertTrue(row["correlation_id"].startswith("cmb-perf-"))
 
+    def test_chat_sse_uses_content_and_top_level_actual_prompt_ids(self):
+        connection = FakeConnection(stream(ids=[1, 2, 3], chat=True))
+        row = perf.streamed_request(
+            "http://127.0.0.1:1",
+            {
+                "messages": [{"role": "user", "content": "fixture"}],
+                "max_tokens": 2,
+                "return_token_ids": True,
+            },
+            0,
+            connection=connection,
+            expected_tokens=[1, 2, 3],
+            retain_token_ids=True,
+        )
+        self.assertEqual(row["status"], "PASS")
+        self.assertIsNotNone(row["ttft_ms"])
+        self.assertEqual(row["actual_worker_prompt_token_ids"], [1, 2, 3])
+        self.assertEqual(connection.requests[0][0][1], "/v1/chat/completions")
+
     def test_timed_diagnostic_ids_are_rejected(self):
         row, connection = self.call_stream(
             stream(ids=[1, 2, 3]), require_token_ids=False
@@ -239,6 +396,47 @@ class PerformanceContractTests(unittest.TestCase):
         )
         self.assertEqual(row["status"], "ERROR")
         self.assertIn("prompt IDs differ", row["error"])
+
+    def test_offline_token_evidence_retains_actual_ids_even_on_mismatch(self):
+        row, _ = self.call_stream(
+            stream(ids=[1, 2, 4]),
+            require_token_ids=True,
+            return_token_ids=True,
+            retain_token_ids=True,
+        )
+        self.assertEqual(row["status"], "ERROR")
+        self.assertEqual(row["actual_worker_prompt_token_ids"], [1, 2, 4])
+        self.assertEqual(row["expected_prompt_token_ids"], [1, 2, 3])
+        self.assertIn("ingress", row["request_hash_scope"])
+        ordinary, _ = self.call_stream(stream(), require_token_ids=False)
+        self.assertNotIn("actual_worker_prompt_token_ids", ordinary)
+
+    def test_forward_counters_prove_prepared_arm_not_silent_fallback(self):
+        def metrics(prepared, raw, ingress, backend):
+            return (
+                f'vllm_router_kv_completion_forward_total{{mode="prepared"}} {prepared}\n'
+                f'vllm_router_kv_completion_forward_total{{mode="raw"}} {raw}\n'
+                f'vllm_router_kv_completion_payload_bytes_total{{kind="ingress"}} {ingress}\n'
+                f'vllm_router_kv_completion_payload_bytes_total{{kind="backend"}} {backend}\n'
+            )
+
+        before, after = metrics(0, 0, 0, 0), metrics(8, 0, 1000, 1800)
+        result = perf.forwarding_window(before, after, 8, prepared=True)
+        self.assertEqual(result["prepared"], 8)
+        self.assertEqual(result["backend"], 1800)
+        chat = perf.forwarding_window(
+            before, before, 0, prepared=False, completion=False
+        )
+        self.assertEqual(chat["prepared"], 0)
+        with self.assertRaises(RuntimeError):
+            perf.forwarding_window(before, after, 0, prepared=False, completion=False)
+        for invalid_before, invalid_after in (
+            ("", after),
+            (before, metrics(7, 1, 1000, 1800)),
+            (before, metrics(8, 0, 0, 0)),
+        ):
+            with self.subTest(after=invalid_after), self.assertRaises(RuntimeError):
+                perf.forwarding_window(invalid_before, invalid_after, 8, prepared=True)
 
     def test_empty_unmeasured_oracle_not_empty_timed_ttft(self):
         row, _ = self.call_stream(
@@ -468,6 +666,31 @@ class PerformanceContractTests(unittest.TestCase):
                 )
             self.assertEqual(len(save.call_args.args[1]), 1)
             self.assertEqual(save.call_args.args[1][0]["status"], "ERROR")
+
+    def test_perf2_oracle_checks_both_workers_and_actual_router_path(self):
+        with patch.object(
+            perf,
+            "streamed_request",
+            return_value={
+                "status": "PASS",
+                "actual_worker_prompt_token_ids": [1, 2, 3],
+                "expected_prompt_token_ids": [1, 2, 3],
+            },
+        ) as request, patch.object(perf, "save") as save:
+            rows = perf.token_oracle_after_timing(
+                {"workers": ["w0", "w1"], "router": "router", "arm": "CT"},
+                [{"prompt": "fixture", "max_tokens": 2}],
+                [[1, 2, 3]],
+                Path("/evidence/oracle.json"),
+            )
+        self.assertEqual(
+            [call.args[0] for call in request.call_args_list], ["w0", "w1", "router"]
+        )
+        self.assertTrue(
+            all(call.kwargs["retain_token_ids"] for call in request.call_args_list)
+        )
+        self.assertEqual(rows[-1]["path"], "through_router")
+        self.assertEqual(save.call_args.args[1], rows)
 
 
 if __name__ == "__main__":
