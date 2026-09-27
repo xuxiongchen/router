@@ -82,7 +82,7 @@ def verify_native_source(source, candidate, native_candidate):
     # Fail closed: whitelist only non-product paths, not a guess at all Rust
     # build inputs (build.rs, manifests, generated bindings, etc.).
     harness_files = {"scripts/render_bridge_gpu_validate.py", "scripts/kv_aware_cuda_validate.py",
-                     "scripts/chat_serving_semantics.py"}
+                     "scripts/chat_serving_semantics.py", "scripts/kv_capabilities_performance.py"}
     require(all(path.startswith(("docs/", "py_test/")) or path in harness_files for path in changed),
             "native-source differs in product/build inputs; rebuild the production wheel")
     return {"native_source_candidate": native_candidate, "harness_candidate": candidate,

@@ -82,6 +82,7 @@ ROOT = Path(__file__).resolve().parents[1]
 require, save = prior.require, prior.save
 BENCHMARK_ENV = "VLLM_ROUTER_KV_PERF_MODE"
 ARMS = {"product_rr": ("round_robin", None), "product_kv": ("kv_aware", None),
+        "product_cache_aware": ("cache_aware", None),
         "A": ("kv_aware", "shared_rr"), "B": ("kv_aware", "render_rr"),
         "C": ("kv_aware", "render_kv"),
         **{arm: ("kv_aware", "render_kv") for arm in ("C0", "CL", "CT", "CLT")}}
@@ -92,8 +93,8 @@ PERF2_FLAGS = {"C0": (False, False), "CL": (True, False),
 def arm_configuration(arm, production_validation=False):
     policy, mode = ARMS[arm]
     if production_validation:
-        require(arm == "product_rr" or arm in PERF2_FLAGS,
-                "production validation supports product_rr and C0/CL/CT/CLT only")
+        require(arm in ("product_rr", "product_cache_aware") or arm in PERF2_FLAGS,
+                "production validation supports product RR/cache_aware and C0/CL/CT/CLT only")
         mode = None
     load_guard, token_input = PERF2_FLAGS.get(arm, (False, False))
     return {"policy": policy, "benchmark_mode": mode, "kv_load_guard": load_guard,
@@ -440,7 +441,7 @@ def owned_router(config, directory):
 def make_trace(args, vocabulary, scenario, namespace, trace_seed):
     """Same logical trace/target lengths; actual text lengths are independently recorded."""
     rng = random.Random(trace_seed)
-    has_locality = scenario in ("locality", "shared", "natural")
+    has_locality = scenario in ("locality", "shared", "natural", "repeat")
     prefix_count = args.groups if has_locality else args.requests
     prefixes = [rng.choices(vocabulary, k=args.prefix_tokens) for _ in range(prefix_count)]
     namespace_rng = random.Random(namespace)
@@ -458,7 +459,7 @@ def make_trace(args, vocabulary, scenario, namespace, trace_seed):
             "add_special_tokens": False, "return_token_ids": False}
     trace = [{**base, "prompt": prefixes[group] + suffixes[i]} for i, group in enumerate(order)]
     warm = []
-    if has_locality and scenario != "natural":
+    if has_locality and scenario not in ("natural", "repeat"):
         for group, prefix in enumerate(prefixes):
             # Distinct tail means warmup covers the intended reusable prefix,
             # not the entire timed query. Same full prompt length in both arms.
@@ -1061,9 +1062,11 @@ def run(args):
     save(out / "summary.json", report)
     try:
         identity = acceptance.source_identity(args.source, args.candidate, True)
+        native_candidate = args.native_source_candidate or args.candidate
+        provenance = acceptance.verify_native_source(args.source, args.candidate, native_candidate)
         native_hash = prior.sha256(args.native)
         build = json.loads(Path(args.build_manifest).read_text())
-        require(build.get("status") == "PASS" and build.get("candidate_sha") == args.candidate
+        require(build.get("status") == "PASS" and build.get("candidate_sha") == native_candidate
                 and build.get("native_sha256") == native_hash, "candidate/native build manifest mismatch")
         deployment = json.loads(Path(args.render_config).read_text())
         workers = [acceptance.loopback_url(args.worker0), acceptance.loopback_url(args.worker1)]
@@ -1091,7 +1094,7 @@ def run(args):
         processes = acceptance.verify_workers(args, common)
         common["worker_processes"] = processes
         prior.capture_worker_versions(workers, out / "worker-versions.json")
-        report.update(identity, native_sha256=native_hash, native=str(Path(args.native).resolve()),
+        report.update(identity, native_provenance=provenance, native_sha256=native_hash, native=str(Path(args.native).resolve()),
                       build_manifest_sha256=prior.sha256(args.build_manifest),
                       render_config_sha256=prior.sha256(args.render_config),
                       worker_processes=processes, capabilities=descriptors,
@@ -1244,6 +1247,7 @@ def main():
     parser.add_argument("--metrics-port", type=int, default=29102)
     parser.add_argument("--requests", type=int, default=32)
     parser.add_argument("--groups", type=int, default=4)
+    parser.add_argument("--native-source-candidate", help="Exact historical native SHA; only verified test/doc-only followups allowed")
     parser.add_argument("--input-tokens", type=int, default=1024)
     parser.add_argument("--prefix-tokens", type=int, default=768)
     parser.add_argument("--output-tokens", type=int, default=32)
@@ -1259,7 +1263,8 @@ def main():
     parser.add_argument("--seed", help="Recorded deterministic trace seed; omitted generates a fresh run namespace")
     parser.add_argument("--trace-order", choices=("burst", "interleaved"), default="burst")
     parser.add_argument("--concurrencies", nargs="+", type=int, default=[1, 4])
-    parser.add_argument("--scenarios", nargs="+", choices=("locality", "cold", "shared", "natural"), default=["locality", "cold"])
+    parser.add_argument("--scenarios", nargs="+", choices=("locality", "cold", "shared", "natural", "repeat"), default=["locality", "cold"],
+                        help="repeat starts cold with no owner warmup or Router burn-in")
     parser.add_argument("--natural-warmup-requests", type=int, default=32,
                         help="Finite Router-selected interleaved burn-in before natural window; no direct owner warmup")
     parser.add_argument("--budget-seconds", "--max-seconds", dest="budget_seconds", type=int, default=900,
@@ -1289,8 +1294,8 @@ def main():
                 "worker0_pid", "worker1_pid", "engine0_pid", "engine1_pid"):
         require(getattr(args, key) is not None, "missing --" + key.replace("_", "-"))
     require(sys.platform == "linux", "GPU performance run requires the authorized Linux /proc namespace")
-    require(8 <= args.requests <= 256 and 2 <= args.groups <= 16 and args.requests % args.groups == 0,
-            "finite trace requires 8..256 requests divisible by 2..16 groups")
+    require(8 <= args.requests <= 256 and 2 <= args.groups <= 32 and args.requests % args.groups == 0,
+            "finite trace requires 8..256 requests divisible by 2..32 groups")
     require(256 <= args.input_tokens <= 8192 and 32 <= args.prefix_tokens < args.input_tokens
             and 1 <= args.output_tokens <= 64, "finite token dimensions exceeded")
     require(8 <= args.natural_warmup_requests <= 128 and args.natural_warmup_requests % args.groups == 0,

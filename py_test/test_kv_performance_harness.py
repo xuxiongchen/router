@@ -125,6 +125,39 @@ def server(*, slow=False, connection_close=False):
 
 
 class PerformanceContractTests(unittest.TestCase):
+    def test_repeat_128_32_has_four_occurrences_without_warmup(self):
+        args = SimpleNamespace(
+            groups=32,
+            requests=128,
+            prefix_tokens=48,
+            input_tokens=64,
+            block_size=16,
+            output_tokens=32,
+            model="fixture",
+            prompt_format="text",
+            request_kind="chat",
+            trace_order="interleaved",
+        )
+        trace, warm, order = perf.make_trace(
+            args, list(range(256)), "repeat", "fixed", "fixed"
+        )
+        self.assertFalse(warm)
+        self.assertEqual(Counter(order), {group: 4 for group in range(32)})
+        self.assertEqual(len(trace), 128)
+        self.assertEqual(
+            len({row["messages"][0]["content"].split("\n")[0] for row in trace}), 32
+        )
+        self.assertEqual(
+            (trace, warm, order),
+            perf.make_trace(args, list(range(256)), "repeat", "fixed", "fixed"),
+        )
+        config = perf.arm_configuration(
+            "product_cache_aware", production_validation=True
+        )
+        self.assertEqual(config["policy"], "cache_aware")
+        self.assertIsNone(config["benchmark_mode"])
+        self.assertFalse(config["kv_load_guard"])
+
     def test_feature_and_effective_mode_are_required(self):
         good = {
             "enabled": True,
