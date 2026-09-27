@@ -593,7 +593,7 @@ class Validation:
                 "max_tokens": 1024, "ignore_eos": True, "stream": True}
 
     def cancel_cleanup(self):
-        name = "stream_cancel_cleanup"
+        name = getattr(self, "cancel_case_name", "stream_cancel_cleanup")
         evidence = {"name": name, "status": "RUNNING", "started_at_unix": time.time()}
         try:
             self.idle()
@@ -620,7 +620,8 @@ class Validation:
             evidence["request"] = payload
             try:
                 evidence["dispatch_at_unix"] = time.time()
-                connection.request("POST", parsed.path.rstrip("/") + "/v1/completions",
+                route = "/v1/chat/completions" if "messages" in payload else "/v1/completions"
+                connection.request("POST", parsed.path.rstrip("/") + route,
                                    json.dumps(payload), {"Content-Type": "application/json"})
                 raw_socket = connection.sock
                 response = connection.getresponse()

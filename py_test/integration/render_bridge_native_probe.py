@@ -156,17 +156,19 @@ def child(config_path):
 
 
 class Workers:
-    def __init__(self, event_path, *, capabilities=False):
+    def __init__(self, event_path, *, capabilities=False, response_provider=None):
         self.servers = []
         self.threads = []
         self.urls = []
         self.endpoints = []
         self.descriptors = {}
         self.capabilities = capabilities
+        self.response_provider = response_provider
         for index in range(2):
             self._add(index, event_path)
 
     def _add(self, index, event_path):
+        response_provider = self.response_provider
         event_endpoint = f"tcp://127.0.0.1:{free_port()}"
         descriptor = None
         if self.capabilities:
@@ -204,6 +206,20 @@ class Workers:
                 value = json.loads(raw)
                 record(event_path, "worker_request", worker=index, path=self.path,
                        raw_hex=raw.hex(), headers=dict(self.headers))
+                if response_provider is not None:
+                    status, content_type, payload = response_provider(value)
+                    self.send_response(status)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    try:
+                        # Force awkward HTTP byte boundaries, including UTF-8.
+                        for start in range(0, len(payload), 7):
+                            self.wfile.write(payload[start:start + 7])
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
                 if value.get("stream"):
                     choice = ({"delta": {"content": "ok"}, "finish_reason": None}
                               if self.path == "/v1/chat/completions"

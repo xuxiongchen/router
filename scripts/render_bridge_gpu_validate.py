@@ -73,6 +73,22 @@ def source_identity(source, candidate, automatic_capabilities=False):
         ["git", "rev-parse", "HEAD^{tree}"], source), "source": str(source)}
 
 
+def verify_native_source(source, candidate, native_candidate):
+    """Allow test/doc-only followups without relabeling a historical native."""
+    require(len(native_candidate) == 40 and all(c in "0123456789abcdef" for c in native_candidate),
+            "native source must be an exact SHA")
+    prior.command(["git", "merge-base", "--is-ancestor", native_candidate, candidate], source)
+    changed = prior.command(["git", "diff", "--name-only", native_candidate, candidate], source).splitlines()
+    # Fail closed: whitelist only non-product paths, not a guess at all Rust
+    # build inputs (build.rs, manifests, generated bindings, etc.).
+    harness_files = {"scripts/render_bridge_gpu_validate.py", "scripts/kv_aware_cuda_validate.py",
+                     "scripts/chat_serving_semantics.py"}
+    require(all(path.startswith(("docs/", "py_test/")) or path in harness_files for path in changed),
+            "native-source differs in product/build inputs; rebuild the production wheel")
+    return {"native_source_candidate": native_candidate, "harness_candidate": candidate,
+            "non_product_diff_paths": changed}
+
+
 def loopback_url(value):
     parsed = urllib.parse.urlsplit(value)
     require(parsed.scheme == "http" and parsed.hostname == "127.0.0.1"
@@ -82,13 +98,35 @@ def loopback_url(value):
     return value.rstrip("/")
 
 
-def raw_request(base, route, raw, timeout=60):
+def raw_request(base, route, raw, timeout=60, timings=None):
     parsed = urllib.parse.urlsplit(base)
     connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
     try:
+        started = time.monotonic()
         connection.request("POST", route, raw, {"Content-Type": "application/json"})
         response = connection.getresponse()
-        return response.status, dict(response.getheaders()), response.read()
+        if timings is not None and "text/event-stream" in response.getheader("Content-Type", ""):
+            chunks, total = [], 0
+            while True:
+                line = response.readline(1_048_577)
+                if not line:
+                    break
+                total += len(line)
+                require(len(line) <= 1_048_576 and total <= 16_777_216, "bounded Chat response exceeded")
+                chunks.append(line)
+                if line.startswith(b"data:") and line[5:].strip() not in (b"", b"[DONE]"):
+                    event = json.loads(line[5:])
+                    for choice in event.get("choices", []):
+                        delta = choice.get("delta", {})
+                        for field in ("content", "reasoning", "tool_calls"):
+                            if delta.get(field):
+                                timings.setdefault("first_" + field + "_seconds", time.monotonic() - started)
+            body = b"".join(chunks)
+        else:
+            body = response.read()
+        if timings is not None:
+            timings["e2e_seconds"] = time.monotonic() - started
+        return response.status, dict(response.getheaders()), body
     finally:
         connection.close()
 
@@ -450,7 +488,8 @@ class Validation(prior.Validation):
         forwarding_before = self.forwarding_snapshot()
         request_started = time.monotonic()
         offset = Path(self.args.router_log).stat().st_size
-        status, headers, body = raw_request(self.args.router, route, raw)
+        timings = {} if getattr(self.args, "chat_agent", False) and "messages" in payload else None
+        status, headers, body = raw_request(self.args.router, route, raw, timings=timings)
         (self.out / f"{name}.response.bin").write_bytes(body)
         require(status == 200, f"Router HTTP {status}: {body[:500]!r}")
         if payload.get("stream"):
@@ -528,6 +567,7 @@ class Validation(prior.Validation):
                         zip(before_metadata, after_metadata)),
                     "unexpected metadata access burst during stable finite request")
         result = {"name": name, "status": "PASS", "actual_backend": actual,
+                  "chat_timings": timings,
                   "request": payload, "http_status": status, "response_sha256": hashlib.sha256(body).hexdigest(),
                   "decision": decision, "completed_request_deltas": delta,
                   "worker_token_count": len(tokens), "worker_token_ids_sha256": prior.token_digest(tokens),
@@ -631,6 +671,26 @@ class Validation(prior.Validation):
             save(self.out / "stream_cancel_cleanup.json", result)
             return result
         finally:
+            self._cancel_payload_override = None
+
+    def chat_cancel_cleanup(self):
+        self.cancel_case_name = "agent-cancel"
+        self._cancel_payload_override = {
+            "model": self.model, "messages": [{"role": "user", "content": "Count integers forever."}],
+            "chat_template_kwargs": {"enable_thinking": False}, "max_tokens": 1024,
+            "ignore_eos": True, "stream": True, "return_token_ids": True,
+        }
+        try:
+            _, ids, _ = self.oracle(self._cancel_payload_override, self.cancel_case_name)
+            before = self.forwarding_snapshot()
+            result = prior.Validation.cancel_cleanup(self)
+            require(generation_tokens(json.dumps(result["first_nonterminal_event"]).encode(), False, True) == ids,
+                    "cancelled Chat input differs from Worker render")
+            result["completion_forwarding"] = self.forwarding_evidence(before, False, completion=False)
+            save(self.out / "agent-cancel.json", result)
+            return result
+        finally:
+            del self.cancel_case_name
             self._cancel_payload_override = None
 
     def positive(self, name, kind, target, stream=False):
@@ -799,7 +859,9 @@ def run(args):
         identity = source_identity(args.source, args.candidate, args.automatic_capabilities)
         native_hash = prior.sha256(args.native)
         build = json.loads(Path(args.build_manifest).read_text())
-        require(build.get("status") == "PASS" and build.get("candidate_sha") == args.candidate
+        native_candidate = args.native_source_candidate or args.candidate
+        native_provenance = verify_native_source(args.source, args.candidate, native_candidate)
+        require(build.get("status") == "PASS" and build.get("candidate_sha") == native_candidate
                 and build.get("native_sha256") == native_hash,
                 "native build manifest must bind exact candidate and actual .so SHA")
         deployment = json.loads(Path(args.render_config).read_text())
@@ -837,7 +899,7 @@ def run(args):
             report["capabilities_before"] = config["capabilities"]
             report["worker_source_provenance"] = worker_source_evidence(args.worker_vllm_root)
         worker_processes = verify_workers(args, config)
-        report.update(identity, native_sha256=native_hash, native=str(Path(args.native).resolve()),
+        report.update(identity, **native_provenance, native_sha256=native_hash, native=str(Path(args.native).resolve()),
                       build_manifest_sha256=prior.sha256(args.build_manifest),
                       render_config_sha256=prior.sha256(args.render_config), workers=worker_processes,
                       kv_load_guard=args.kv_load_guard,
@@ -909,6 +971,14 @@ def run(args):
             # Existing helper has full first-record/active-before-close checks,
             # log/PID/ID correlation and no natural completion masquerading as abort.
             validation.case("stream_cancel_cleanup", validation.cancel_cleanup)
+            if args.chat_agent:
+                from chat_serving_semantics import run_gpu_cases
+                run_gpu_cases(validation)
+                validation.case("agent-cancel", validation.chat_cancel_cleanup)
+                validation.case("agent-cancel-recovery", lambda: validation.routed(
+                    "agent-cancel-recovery", {"model": args.model, "messages": [
+                        {"role": "user", "content": "Say hello."}], "max_tokens": 16,
+                        "chat_template_kwargs": {"enable_thinking": False}}))
             validation.idle()
             if args.automatic_capabilities:
                 metadata_after = metadata_access_count(validation.worker_logs)
@@ -1075,6 +1145,8 @@ def main():
     parser.add_argument("--self-check", action="store_true")
     parser.add_argument("--source", default=str(ROOT))
     parser.add_argument("--candidate")
+    parser.add_argument("--native-source-candidate",
+                        help="Exact ancestor SHA in the original build manifest; only docs/Python tests/reviewed harness files may differ")
     parser.add_argument("--native")
     parser.add_argument("--build-manifest")
     parser.add_argument("--render-config")
@@ -1086,6 +1158,8 @@ def main():
                         help="Exercise proven Completion token forwarding, not Chat tokens-in/out")
     parser.add_argument("--production-validation", action="store_true",
                         help="Require actual native extension built without the experimental kv-perf feature")
+    parser.add_argument("--chat-agent", action="store_true",
+                        help="Finite raw Chat output semantics and real synthetic-tool round trips; no model retry")
     parser.add_argument("--worker-vllm-root",
                         help="Explicit shared Worker vllm package directory for on-disk source hashes, not loaded-module attestation")
     parser.add_argument("--output")
@@ -1113,6 +1187,9 @@ def main():
     require(0 <= args.event_wait <= 10, "event wait must be finite and at most ten seconds")
     require(not (args.kv_load_guard or args.kv_completion_token_input) or args.automatic_capabilities,
             "Perf-2 acceptance requires verified automatic Worker capabilities")
+    require(not args.chat_agent or (args.automatic_capabilities and args.production_validation
+                                   and args.kv_load_guard),
+            "Chat Agent acceptance requires automatic capabilities, production native and raw load-guarded Chat")
     require(60 <= args.budget_seconds <= 1800, "matrix budget must be 60..1800 seconds")
     def interrupted(_signal, _frame):
         raise KeyboardInterrupt("supervised matrix interrupted")
