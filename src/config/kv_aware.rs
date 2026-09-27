@@ -21,6 +21,9 @@ pub struct KvAwareConfig {
     /// Opt-in cache-first guard: retain affinity within one excess in-flight
     /// request of the least-loaded eligible worker. Not a universal cost model.
     pub load_guard: bool,
+    /// Opt-in derived single-text Completion body, only with the vLLM bridge.
+    /// Unsupported shapes/headers remain on the original byte-forward path.
+    pub completion_token_input: bool,
 }
 
 impl Default for KvAwareConfig {
@@ -35,6 +38,7 @@ impl Default for KvAwareConfig {
             worker_endpoints: HashMap::new(),
             index_max_entries: 100_000,
             load_guard: false,
+            completion_token_input: false,
         }
     }
 }

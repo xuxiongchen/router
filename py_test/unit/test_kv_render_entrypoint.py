@@ -134,6 +134,19 @@ class TestKvRenderEntrypoint(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "require policy=kv_aware"):
             RouterArgs(policy="round_robin", kv_load_guard=True)._validate_router_args()
 
+    def test_completion_token_input_is_opt_in_and_requires_vllm(self):
+        self.assertFalse(self.module.Router.from_args(self.args())._router.kwargs["kv_completion_token_input"])
+        with self.assertRaisesRegex(ValueError, "requires automatic Worker capabilities"):
+            self.module.Router.from_args(self.args(kv_completion_token_input=True))
+        self.facade.capability_cohort = {
+            "workers": {url: {} for url in self.facade.worker_urls}, "api_key_env": None}
+        router = self.module.Router.from_args(self.args(kv_completion_token_input=True))
+        self.assertTrue(router._router.kwargs["kv_completion_token_input"])
+        with self.assertRaisesRegex(ValueError, "requires the vllm input backend"):
+            self.module.Router(kv_completion_token_input=True)
+        with self.assertRaisesRegex(ValueError, "requires the vllm input backend"):
+            RouterArgs(kv_completion_token_input=True)._validate_router_args()
+
     def test_explicit_matching_overrides_are_permitted(self):
         self.module.Router.from_args(self.args(
             kv_model=self.facade.model, kv_tokenizer_path=self.facade.tokenizer_path,

@@ -1,7 +1,8 @@
 //! Exact prompt extraction for a local Qwen3 Dense text tokenizer profile.
 //!
-//! These tokens are routing hints only. Callers must forward the original request
-//! and use a non-affinity fallback on every error, never an approximate prompt.
+//! Native tokens are routing hints only; native callers forward the original
+//! request. The optional vLLM bridge can independently prove a narrow Completion
+//! token-input forwarding subset. Never use an approximate prompt on either path.
 //!
 //! The restricted renderer is derived from the Qwen team's Apache-2.0 template
 //! used by the Qwen3 Dense family. See tests/fixtures/kv_qwen3/README.md for
@@ -16,6 +17,7 @@ use tokenizers::Tokenizer;
 use crate::protocols::spec::{CompletionRequest, PromptInput};
 
 pub mod bridge;
+pub mod completion_input;
 pub mod timing;
 
 // This fingerprint identifies renderer semantics, not a model/revision or

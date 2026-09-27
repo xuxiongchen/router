@@ -198,6 +198,60 @@ class RenderBridgeBoundaryTests(unittest.TestCase):
         self.assertIsNone(self.runtime.seen[-1]["messages"][0]["content"])
         self.assertEqual(self.runtime.seen[-1]["z"], 3)
 
+    def test_completion_input_proof_is_narrow_and_after_exact_render(self):
+        facade = self.ready()
+        base = {"prompt": "café 中文 🙂", "add_special_tokens": False}
+        for update in ({}, {"n": 1}, {"use_beam_search": False},
+                       {"return_token_ids": True}, {"return_token_ids": False},
+                       {"stream": True, "stream_options": {"include_usage": True}},
+                       {"temperature": None, "stop": None}):
+            request = {**base, **update}
+            result = facade.render("completion", json.dumps(request).encode())
+            self.assertEqual(result["status"], "exact")
+            self.assertTrue(result["completion_token_input_eligible"], update)
+            self.assertEqual(self.runtime.seen[-1], request)
+        for key, value in (
+            ("echo", False), ("echo", None), ("suffix", None),
+            ("logprobs", None), ("prompt_logprobs", None),
+            ("return_token_offsets", False), ("truncate_prompt_tokens", None),
+            ("truncation_side", None), ("cache_salt", None),
+            ("add_special_tokens", True), ("add_special_tokens", None),
+            ("n", "1"), ("n", True), ("n", 2),
+            ("response_format", {"type": "text"}),
+            ("user_unreviewed", "unchanged"), ("prompt", [4, 2, 19]),
+        ):
+            request = {**base, key: value}
+            result = facade.render("completion", json.dumps(request).encode())
+            self.assertFalse(result.get("completion_token_input_eligible", False), (key, value))
+        missing_special = facade.render("completion", b'{"prompt":"text"}')
+        self.assertFalse(missing_special["completion_token_input_eligible"])
+        chat = facade.render("chat", b'{"messages":[]}')
+        self.assertFalse(chat["completion_token_input_eligible"])
+        self.runtime.inputs = [{"type": "other", "prompt_token_ids": [4, 2, 19]}]
+        unsupported = facade.render("completion", json.dumps(base).encode())
+        self.assertNotEqual(unsupported["status"], "exact")
+        self.assertNotIn("completion_token_input_eligible", unsupported)
+
+    def test_runtime_validation_error_is_client_error_not_provider_invalidation(self):
+        # vLLMValidationError inherits Exception, not ValueError in v0.29.
+        class RuntimeValidationError(Exception):
+            pass
+
+        self.runtime.render_validation_type = RuntimeValidationError
+        facade = self.ready()
+        raw = b'{"prompt":"valid later","add_special_tokens":false}'
+        with patch.object(self.runtime, "render_completion_request",
+                          side_effect=RuntimeValidationError("synthetic private detail")):
+            failed = facade.render("completion", raw)
+        self.assertEqual(failed["status"], "invalid")
+        self.assertEqual(failed["http_status"], 400)
+        self.assertNotIn("completion_token_input_eligible", failed)
+        self.assertNotIn("synthetic private detail", str(failed))
+        self.assertFalse(facade._invalidated)
+        recovered = facade.render("completion", raw)
+        self.assertEqual(recovered["status"], "exact")
+        self.assertTrue(recovered["completion_token_input_eligible"])
+
     def test_valid_fields_are_not_removed(self):
         facade = self.ready()
         request = {"messages": [], "tools": [], "response_format": {"type": "json_object"},

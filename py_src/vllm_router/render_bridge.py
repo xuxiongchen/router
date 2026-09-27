@@ -60,6 +60,20 @@ _ENGINE_KEYS = {
     "type", "prompt_token_ids", "prompt", "prompt_token_offsets",
     "assistant_tokens_mask", "arrival_time",
 }
+# The token-input optimization is deliberately narrower than render/cache
+# eligibility. Every retained field still goes through the real vLLM schema,
+# ServingRender and the Worker's ordinary Completion endpoint. This allowlist
+# does not provide defaults or normalize/coerce the incoming JSON.
+_COMPLETION_TOKEN_INPUT_KEYS = {
+    "model", "prompt", "n", "use_beam_search", "add_special_tokens",
+    "max_tokens", "temperature", "top_p", "top_k", "min_p",
+    "frequency_penalty", "presence_penalty", "repetition_penalty",
+    "seed", "stop", "stop_token_ids", "include_stop_str_in_output",
+    "ignore_eos", "min_tokens", "skip_special_tokens",
+    "spaces_between_special_tokens", "logit_bias", "allowed_token_ids",
+    "stream", "stream_options", "user", "request_id", "return_token_ids",
+    "priority",
+}
 _CONTENT_FREE_LOGGERS = (
     "vllm.renderers.hf",
     "vllm.entrypoints.chat_utils",
@@ -363,6 +377,7 @@ def _load_runtime(argv, *, worker_capabilities=False):
     from vllm.entrypoints.openai.models.serving import OpenAIModelRegistry
     from vllm.entrypoints.scale_out.render.serving import ServingRender
     from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+    from vllm.exceptions import VLLMValidationError
     from vllm.renderers import renderer_from_config
     from vllm.renderers.online_renderer import OnlineRenderer
     from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -403,6 +418,7 @@ def _load_runtime(argv, *, worker_capabilities=False):
             serving=serving, capture=capture, renderer=renderer,
             schemas={"chat": ChatCompletionRequest, "completion": CompletionRequest},
             error_type=ErrorResponse, validation_type=ValidationError,
+            render_validation_type=VLLMValidationError,
             effective={
                 "model": model_config.model, "tokenizer": model_config.tokenizer,
                 "tokenizer_mode": model_config.tokenizer_mode,
@@ -450,6 +466,30 @@ def _request_cache_reason(request, raw_object, kind):
                        for part in content):
                     return "non_text_input"
     return None
+
+
+def _completion_token_input_eligible(raw_object, kind):
+    """Proof marker for an already successful, exact vLLM 0.29 render.
+
+    base.py's token-array branch skips text tokenization entirely and applies
+    only post-tokenization validation. With explicit add_special_tokens=False,
+    no truncation/offset/echo operation and one ordinary output, resubmitting
+    the complete IDs therefore neither adds nor removes tokens. Missing/true
+    special-token flags are intentionally left on the original path for this
+    first opt-in subset; no add_special_tokens value is rewritten.
+
+    This is NOT a replacement validator: unsupported and invalid requests keep
+    their existing behavior, and the caller invokes this only after full render.
+    """
+    return (
+        kind == "completion"
+        and type(raw_object.get("prompt")) is str
+        and raw_object.get("add_special_tokens") is False
+        and not set(raw_object) - _COMPLETION_TOKEN_INPUT_KEYS
+        and type(raw_object.get("n", 1)) is int
+        and raw_object.get("n", 1) == 1
+        and raw_object.get("use_beam_search", False) is False
+    )
 
 
 class RenderFacade:
@@ -638,7 +678,8 @@ class RenderFacade:
                 request = runtime.schemas[kind].model_validate_json(raw)
             with observer.measure("raw_json") if observer is not None else _UNTIMED:
                 raw_object = json.loads(raw)
-        except (runtime.validation_type, ValueError, UnicodeError, TypeError):
+        except (runtime.validation_type, ValueError, UnicodeError, TypeError,
+                getattr(runtime, "render_validation_type", ValueError)):
             return self._result("invalid", "request_schema", http_status=400)
         # This cohort has exactly one reviewed served alias. Match vLLM's model
         # gate before its error logger can include an arbitrary request.model.
@@ -656,12 +697,18 @@ class RenderFacade:
                     result = await runtime.serving.render_chat_request(request)
                 else:
                     result = await runtime.serving.render_completion_request(request)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError,
+                getattr(runtime, "render_validation_type", ValueError)):
             # The same renderer errors become client errors in vLLM's serving
             # frontend. Never include exception messages containing prompt text.
             return self._result("invalid", "render_validation", http_status=400)
         with observer.measure("python_result") if observer is not None else _UNTIMED:
-            return self._render_result(kind, result)
+            prepared = self._render_result(kind, result)
+            if prepared["status"] == "exact":
+                prepared["completion_token_input_eligible"] = (
+                    _completion_token_input_eligible(raw_object, kind)
+                )
+            return prepared
 
     def _render_result(self, kind, result):
         runtime = self._runtime

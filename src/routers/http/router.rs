@@ -12,6 +12,7 @@ use crate::program_scheduling::{
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
 };
 use crate::prompt_tokens::bridge::{PreparedResult, RenderBridge, RenderContract, RequestKind};
+use crate::prompt_tokens::completion_input::{derive_completion_input, DerivedCompletionInput};
 use crate::prompt_tokens::timing::StageTimer;
 use crate::protocols::spec::{
     ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, GenerationRequest,
@@ -196,9 +197,21 @@ impl futures_util::Stream for LoadTrackedBody {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = self.inner.as_mut().poll_next(cx);
-        if matches!(item, Poll::Ready(None)) {
-            self.release();
-            self.producer_abort.take();
+        match &item {
+            Poll::Ready(None) => {
+                self.release();
+                self.producer_abort.take();
+            }
+            Poll::Ready(Some(Err(_))) => {
+                self.release();
+                // The gRPC producer owns its lease until its task exits. A
+                // terminal body error must cancel it, not discard the handle
+                // and leave a pending producer alive after the client is done.
+                if let Some(abort) = self.producer_abort.take() {
+                    abort.abort();
+                }
+            }
+            _ => {}
         }
         item
     }
@@ -287,6 +300,7 @@ struct KvRuntime {
 struct PreparedKvInput {
     tokens: Option<Arc<[u32]>>,
     contract: Option<RenderContract>,
+    backend: Option<DerivedCompletionInput>,
 }
 
 /// Only scheduling metadata is decoded here. vLLM validates the original bytes,
@@ -381,6 +395,8 @@ pub struct Router {
     // Serialize only policy choice and the existing per-attempt increment.
     // Never hold this guard across render, admission, network or an await.
     kv_selection: Mutex<()>,
+    kv_completion_token_input: bool,
+    kv_max_payload_bytes: usize,
     #[cfg(feature = "kv-perf")]
     kv_perf: Option<KvPerf>,
     worker_registry: Arc<WorkerRegistry>,
@@ -454,21 +470,30 @@ impl Router {
         };
         #[cfg(not(feature = "kv-perf"))]
         let _ = requested_perf_mode;
-        let kv_tokenizer =
-            if let crate::config::PolicyConfig::KvAware { config } = &ctx.router_config.policy {
-                ctx.router_config
-                    .validate()
-                    .map_err(|error| error.to_string())?;
-                if ctx.render_bridge.is_some() {
-                    None
-                } else {
-                    Some(crate::prompt_tokens::PromptTokenizer::load(
-                        &config.tokenizer_path,
-                    )?)
-                }
-            } else {
+        let kv_tokenizer = if let crate::config::PolicyConfig::KvAware { config } =
+            &ctx.router_config.policy
+        {
+            if config.completion_token_input
+                && !ctx
+                    .render_bridge
+                    .as_ref()
+                    .is_some_and(|bridge| bridge.capability_cohort.is_some())
+            {
+                return Err("kv_completion_token_input requires the vllm input backend with automatic Worker capabilities".into());
+            }
+            ctx.router_config
+                .validate()
+                .map_err(|error| error.to_string())?;
+            if ctx.render_bridge.is_some() {
                 None
-            };
+            } else {
+                Some(crate::prompt_tokens::PromptTokenizer::load(
+                    &config.tokenizer_path,
+                )?)
+            }
+        } else {
+            None
+        };
         // Update active workers gauge
         RouterMetrics::set_active_workers(worker_urls.len());
 
@@ -691,6 +716,9 @@ impl Router {
         Ok(Router {
             kv_runtime,
             kv_selection: Mutex::new(()),
+            kv_completion_token_input: matches!(&ctx.router_config.policy,
+                crate::config::PolicyConfig::KvAware { config } if config.completion_token_input),
+            kv_max_payload_bytes: ctx.router_config.max_payload_size,
             #[cfg(feature = "kv-perf")]
             kv_perf,
             worker_registry: ctx.worker_registry.clone(),
@@ -1351,6 +1379,7 @@ impl Router {
         self.select_worker_for_model_with_tokens(model_id, text, headers, None)
     }
 
+    #[cfg(test)]
     fn select_worker_for_model_with_tokens(
         &self,
         model_id: Option<&str>,
@@ -1358,9 +1387,34 @@ impl Router {
         headers: Option<&HeaderMap>,
         token_ids: Option<&[u32]>,
     ) -> Option<Arc<dyn Worker>> {
+        self.select_worker_for_model_with_tokens_filtered(model_id, text, headers, token_ids, false)
+    }
+
+    fn select_worker_for_model_with_tokens_filtered(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+        headers: Option<&HeaderMap>,
+        token_ids: Option<&[u32]>,
+        prepared_forward: bool,
+    ) -> Option<Arc<dyn Worker>> {
         // Common A/B/C boundary; includes lookup/filtering plus the actual
         // selector. The nested KV selector/hash/index intervals are not sums.
         let _selection = StageTimer::start("router_select_total");
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let generation_index = if prepared_forward {
+            Some(
+                policy
+                    .as_any()
+                    .downcast_ref::<crate::policies::KvAwarePolicy>()?
+                    .index(),
+            )
+        } else {
+            None
+        };
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
@@ -1370,17 +1424,16 @@ impl Router {
         let available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
+            .filter(|w| {
+                generation_index
+                    .as_ref()
+                    .is_none_or(|index| index.current_generation(w.url()).is_some())
+            })
             .cloned()
             .collect();
         if available.is_empty() {
             return None;
         }
-
-        // Get the appropriate policy for this model
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
 
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
@@ -1401,9 +1454,19 @@ impl Router {
         Some(available[idx].clone())
     }
 
+    #[cfg(test)]
     fn select_and_reserve_kv(
         &self,
         model_id: Option<&str>,
+        select: impl FnOnce() -> Option<Arc<dyn Worker>>,
+    ) -> Option<(Arc<dyn Worker>, KvLoadLease)> {
+        self.select_and_reserve_kv_input(model_id, false, select)
+    }
+
+    fn select_and_reserve_kv_input(
+        &self,
+        model_id: Option<&str>,
+        prepared_forward: bool,
         select: impl FnOnce() -> Option<Arc<dyn Worker>>,
     ) -> Option<(Arc<dyn Worker>, KvLoadLease)> {
         let _selection = self.kv_selection.lock();
@@ -1414,7 +1477,7 @@ impl Router {
         let guarded_index = policy
             .as_any()
             .downcast_ref::<crate::policies::KvAwarePolicy>()
-            .filter(|policy| policy.load_guard_enabled())
+            .filter(|policy| policy.load_guard_enabled() || prepared_forward)
             .map(crate::policies::KvAwarePolicy::index);
         // Bind the subsequent score to the generation observed BEFORE choice.
         // If a clear/retire/replacement intervenes, fail this bounded attempt
@@ -1480,6 +1543,7 @@ impl Router {
             token_ids.map(|tokens| PreparedKvInput {
                 tokens: Some(tokens.into()),
                 contract: None,
+                backend: None,
             }),
             None,
         )
@@ -1582,16 +1646,21 @@ impl Router {
                             .get_by_url(target)
                             .filter(|worker| worker.is_available())
                     } else {
-                        self.select_worker_for_model_with_tokens(
+                        self.select_worker_for_model_with_tokens_filtered(
                             model_id,
                             Some(&text),
                             headers,
                             input.as_ref().and_then(|input| input.tokens.as_deref()),
+                            input.as_ref().is_some_and(|input| input.backend.is_some()),
                         )
                     }
                 };
                 let (selected_worker, kv_lease) = if self.kv_runtime.is_some() {
-                    match self.select_and_reserve_kv(model_id, select) {
+                    match self.select_and_reserve_kv_input(
+                        model_id,
+                        input.as_ref().is_some_and(|input| input.backend.is_some()),
+                        select,
+                    ) {
                         Some((worker, lease)) => (Some(worker), Some(lease)),
                         None => (None, None),
                     }
@@ -1663,6 +1732,7 @@ impl Router {
                         is_stream,
                         raw_bytes,
                         kv_lease.expect("KV selection reserved exactly one lease"),
+                        input.as_ref().and_then(|input| input.backend.as_ref()),
                     )
                     .await
                 } else {
@@ -1757,7 +1827,7 @@ impl Router {
         is_stream: bool,
     ) -> Response {
         let lease = KvLoadLease::new(worker.clone());
-        self.send_kv_request_bytes(headers, body, route, worker, is_stream, None, lease)
+        self.send_kv_request_bytes(headers, body, route, worker, is_stream, None, lease, None)
             .await
     }
 
@@ -1771,15 +1841,24 @@ impl Router {
         is_stream: bool,
         raw_bytes: Option<&[u8]>,
         lease: KvLoadLease,
+        derived: Option<&DerivedCompletionInput>,
     ) -> Response {
+        let headers = derived.map(|input| &input.headers).or(headers);
         let url = format!("{}{}", worker.url().trim_end_matches('/'), route);
-        let mut request = match raw_bytes {
-            Some(raw) => self
-                .client
+        let mut request = if let Some(derived) = derived {
+            self.client
                 .post(&url)
                 .header(CONTENT_TYPE, "application/json")
-                .body(raw.to_vec()),
-            None => self.client.post(&url).json(body),
+                .body(derived.body.clone())
+        } else {
+            match raw_bytes {
+                Some(raw) => self
+                    .client
+                    .post(&url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(raw.to_vec()),
+                None => self.client.post(&url).json(body),
+            }
         };
         if let Some(headers) = headers {
             for (name, value) in headers {
@@ -1803,6 +1882,15 @@ impl Router {
                 .into_response();
             response.extensions_mut().insert(KvPreDispatchFailure);
             return response;
+        }
+        if route == "/v1/completions" {
+            if let Some(raw) = raw_bytes {
+                RouterMetrics::record_kv_completion_forward(
+                    derived.is_some(),
+                    raw.len(),
+                    derived.map_or(raw.len(), |input| input.body.len()),
+                );
+            }
         }
         let response = {
             // Includes client dispatch and upstream header wait, or its
@@ -1930,6 +2018,7 @@ impl Router {
             // still checks this active contract and the pre-dispatch retry
             // fence, and forwards the untouched request for Worker validation.
             // B/C copy and render the immutable request exactly once.
+            let mut backend = None;
             let tokens = if skip_render {
                 None
             } else {
@@ -1938,6 +2027,20 @@ impl Router {
                         if prepared.contract != contract || !bridge.is_current(&contract) {
                             return (StatusCode::SERVICE_UNAVAILABLE, "Render contract changed")
                                 .into_response();
+                        }
+                        if self.kv_completion_token_input && kind == RequestKind::Completion {
+                            match derive_completion_input(
+                                raw,
+                                headers,
+                                &prepared,
+                                &contract,
+                                self.kv_max_payload_bytes,
+                            ) {
+                                Ok(derived) => backend = Some(derived),
+                                Err(reason) => {
+                                    debug!(reason = reason.reason(), "kv_completion_raw_fallback")
+                                }
+                            }
                         }
                         prepared.cache_eligible.then_some(prepared.token_ids)
                     }
@@ -1986,6 +2089,7 @@ impl Router {
                     Some(PreparedKvInput {
                         tokens,
                         contract: Some(contract),
+                        backend,
                     }),
                     Some(raw),
                 )
@@ -2015,6 +2119,7 @@ impl Router {
                     tokens.map(|tokens| PreparedKvInput {
                         tokens: Some(tokens.into()),
                         contract: None,
+                        backend: None,
                     }),
                     Some(raw),
                 )
@@ -2039,6 +2144,7 @@ impl Router {
                     tokens.map(|tokens| PreparedKvInput {
                         tokens: Some(tokens.into()),
                         contract: None,
+                        backend: None,
                     }),
                     Some(raw),
                 )
@@ -3652,23 +3758,23 @@ mod tests {
 
     #[tokio::test]
     async fn kv_retry_reuses_exact_tokens_preserves_raw_and_releases_each_lease() {
-        kv_retry_case(false, false, None, false).await;
+        kv_retry_case(false, false, None, false, false).await;
     }
 
     #[tokio::test]
     async fn kv_render_bridge_prepares_once_and_retries_original_bytes() {
-        kv_retry_case(true, false, None, false).await;
+        kv_retry_case(true, false, None, false, false).await;
     }
 
     #[tokio::test]
     async fn kv_render_bridge_epoch_change_blocks_retry() {
-        kv_retry_case(true, true, None, false).await;
+        kv_retry_case(true, true, None, false, false).await;
     }
 
     #[tokio::test]
     async fn kv_load_guard_retry_releases_and_retired_target_stays_excluded() {
-        kv_retry_case(true, false, None, true).await;
-        kv_retry_case(true, true, None, true).await;
+        kv_retry_case(true, false, None, true, false).await;
+        kv_retry_case(true, true, None, true, false).await;
     }
 
     #[test]
@@ -3769,8 +3875,8 @@ mod tests {
     #[tokio::test]
     async fn kv_perf_abc_retry_raw_once_and_contract_fencing() {
         for mode in KV_PERF_MODES {
-            kv_retry_case(true, false, Some(mode), false).await;
-            kv_retry_case(true, true, Some(mode), false).await;
+            kv_retry_case(true, false, Some(mode), false, false).await;
+            kv_retry_case(true, true, Some(mode), false, false).await;
         }
     }
 
@@ -3810,6 +3916,7 @@ mod tests {
                 token_ids: Arc::from([1, 2, 3]),
                 contract: contract.clone(),
                 cache_eligible: true,
+                completion_token_input_eligible: false,
             };
             let raw = br#"{ "prompt": "public fixture", "stream":true, "vendor_extension": null }"#;
             let bridge = Arc::new(RenderBridge::for_test(
@@ -3968,11 +4075,21 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn kv_prepared_completion_retry_reuses_body_tokens_and_epoch_fence() {
+        for load_guard in [false, true] {
+            for invalidate_after_first in [false, true] {
+                kv_retry_case(true, invalidate_after_first, None, load_guard, true).await;
+            }
+        }
+    }
+
     async fn kv_retry_case(
         use_bridge: bool,
         invalidate_after_first: bool,
         perf_mode: Option<&str>,
         load_guard: bool,
+        prepared_forward: bool,
     ) {
         // Abort only these test-owned servers on both success and assertion
         // failure. The successful path also joins them with a bounded wait.
@@ -4040,6 +4157,7 @@ mod tests {
             ..Default::default()
         };
         let mut router = create_test_regular_router();
+        router.kv_completion_token_input = prepared_forward;
         router.worker_registry = Arc::new(WorkerRegistry::new());
         router.worker_registry.register(worker0.clone());
         router.worker_registry.register(worker1.clone());
@@ -4098,13 +4216,29 @@ mod tests {
         // Explicit null and omitted default fields distinguish lossless raw
         // forwarding from a typed reserialization. All fields remain within
         // the exact Completion profile, so neither attempt may cold-fallback.
-        let raw = serde_json::json!({
-            "model": "Qwen/Qwen3-0.6B", "prompt": token_ids,
-            "suffix": null, "max_tokens": 1, "temperature": 0.0,
-            "add_special_tokens": false, "user": "synthetic retry fixture"
-        });
         // Deliberately retain whitespace and nonalphabetical object order.
-        let raw_bytes = format!("{{ \"user\":\"synthetic retry fixture\", \"prompt\":{},\n\"model\":\"Qwen/Qwen3-0.6B\",\"suffix\":null,\"max_tokens\":1,\"temperature\":0.0,\"add_special_tokens\":false }}", serde_json::to_string(&token_ids).unwrap()).into_bytes();
+        let raw_bytes = if prepared_forward {
+            // Qualified ordinary text: no suffix, echo, token transform or
+            // batch. The synthetic facade proof is exercised, not fabricated
+            // by the Router from a token-array schema alone.
+            br#"{ "user":"synthetic retry fixture", "prompt":" public text ",
+"model":"Qwen/Qwen3-0.6B","max_tokens":1,"temperature":0.0,"n":1,"stop":null }"#
+                .to_vec()
+        } else {
+            format!("{{ \"user\":\"synthetic retry fixture\", \"prompt\":{},\n\"model\":\"Qwen/Qwen3-0.6B\",\"suffix\":null,\"max_tokens\":1,\"temperature\":0.0,\"add_special_tokens\":false }}", serde_json::to_string(&token_ids).unwrap()).into_bytes()
+        };
+        let original_ingress = raw_bytes.clone();
+        let raw: serde_json::Value = serde_json::from_slice(&raw_bytes).unwrap();
+        let expected_backend = if prepared_forward {
+            format!("{{ \"user\":\"synthetic retry fixture\", \"prompt\":{},\n\"model\":\"Qwen/Qwen3-0.6B\",\"max_tokens\":1,\"temperature\":0.0,\"n\":1,\"stop\":null }}", serde_json::to_string(&token_ids).unwrap()).into_bytes()
+        } else {
+            raw_bytes.clone()
+        };
+        let mut expected_value = raw.clone();
+        if prepared_forward {
+            expected_value["prompt"] = serde_json::json!(token_ids);
+            assert_ne!(expected_backend, original_ingress);
+        }
         let render_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let bridge = if use_bridge {
             let contract = RenderContract {
@@ -4117,6 +4251,7 @@ mod tests {
                 token_ids: token_ids.clone().into(),
                 contract: contract.clone(),
                 cache_eligible: true,
+                completion_token_input_eligible: prepared_forward,
             };
             let observed_worker = worker0.clone();
             let bridge = Arc::new(RenderBridge::for_test(
@@ -4168,18 +4303,36 @@ mod tests {
         .expect("bounded two-attempt request");
         if invalidate_after_first {
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(attempts.lock().as_slice(), &[("w0", raw_bytes.clone())]);
+            assert_eq!(
+                attempts.lock().as_slice(),
+                &[("w0", expected_backend.clone())]
+            );
         } else {
             assert_eq!(response.status(), StatusCode::OK);
             let returned = to_bytes(response.into_body(), 4096).await.unwrap();
-            assert_eq!(returned.as_ref(), raw_bytes);
+            assert_eq!(returned.as_ref(), expected_backend);
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&returned).unwrap(),
-                raw
+                expected_value
             );
             assert_eq!(
                 attempts.lock().as_slice(),
-                &[("w0", raw_bytes.clone()), ("w1", raw_bytes.clone())]
+                &[
+                    ("w0", expected_backend.clone()),
+                    ("w1", expected_backend.clone())
+                ]
+            );
+        }
+        assert_eq!(
+            raw_bytes, original_ingress,
+            "the ingress remains immutable through retries"
+        );
+        for (_, body) in attempts.lock().iter() {
+            let received: serde_json::Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(received["prompt"], serde_json::json!(token_ids));
+            assert_eq!(
+                received, expected_value,
+                "sampling and explicit null/missing semantics survive"
             );
         }
         assert_eq!(
@@ -4268,6 +4421,89 @@ mod tests {
             .build()
             .unwrap();
         (router, index)
+    }
+
+    #[test]
+    fn kv_prepared_completion_without_load_guard_excludes_retired_candidate() {
+        let workers: Vec<Arc<dyn Worker>> = ["http://w0:8000", "http://w1:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        let (mut router, _) = guarded_test_router(&workers);
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                config: Box::new(crate::config::KvAwareConfig::default()),
+            }));
+        let policy = router.policy_registry.get_default_policy();
+        let policy = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+            .unwrap();
+        assert!(!policy.load_guard_enabled());
+        let index = policy.index();
+        router.worker_registry.bind_kv_index(&index);
+        for worker in &workers {
+            index.begin_worker(worker.url());
+        }
+        index.retire_worker(workers[0].url());
+        for _ in 0..3 {
+            workers[1].increment_load();
+        }
+        // Preserve the negative control: without prepared forwarding, the
+        // existing guard-off cold fallback still favors healthy idle W0.
+        assert_eq!(
+            router
+                .select_worker_for_model(None, None, None)
+                .unwrap()
+                .url(),
+            workers[0].url()
+        );
+        for _ in 0..8 {
+            let selected = router
+                .select_worker_for_model_with_tokens_filtered(
+                    None,
+                    None,
+                    None,
+                    Some(&[1; 33]),
+                    true,
+                )
+                .unwrap();
+            assert_eq!(selected.url(), workers[1].url());
+            let (reserved, lease) = router
+                .select_and_reserve_kv_input(None, true, || {
+                    router.select_worker_for_model_with_tokens_filtered(
+                        None,
+                        None,
+                        None,
+                        Some(&[1; 33]),
+                        true,
+                    )
+                })
+                .unwrap();
+            assert_eq!(reserved.url(), workers[1].url());
+            assert_eq!([workers[0].load(), workers[1].load()], [0, 4]);
+            assert!(lease.is_current());
+            drop(lease);
+            assert_eq!([workers[0].load(), workers[1].load()], [0, 3]);
+        }
+        index.retire_worker(workers[1].url());
+        assert!(router
+            .select_and_reserve_kv_input(None, true, || {
+                router.select_worker_for_model_with_tokens_filtered(
+                    None,
+                    None,
+                    None,
+                    Some(&[1; 33]),
+                    true,
+                )
+            })
+            .is_none());
+        assert_eq!([workers[0].load(), workers[1].load()], [0, 3]);
+        for _ in 0..3 {
+            workers[1].decrement_load();
+        }
     }
 
     #[test]
@@ -4364,6 +4600,7 @@ mod tests {
                 false,
                 None,
                 lease,
+                None,
             )
             .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -4432,6 +4669,76 @@ mod tests {
         );
         assert_eq!(worker.circuit_breaker().total_failures(), 0);
         assert_eq!(worker.circuit_breaker().total_successes(), 0);
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn kv_load_guard_stream_error_releases_before_body_drop_exactly_once() {
+        let worker = Arc::new(BasicWorker::new(
+            "http://synthetic:8000".into(),
+            WorkerType::Regular,
+        )) as Arc<dyn Worker>;
+        let (router, _) = guarded_test_router(std::slice::from_ref(&worker));
+        let (_, lease) = router
+            .select_and_reserve_kv(None, || Some(worker.clone()))
+            .unwrap();
+        let source = futures_util::stream::once(async {
+            Err::<bytes::Bytes, _>(std::io::Error::other("synthetic upstream stream error"))
+        })
+        .chain(futures_util::stream::pending());
+        let response = lease.attach(Response::new(Body::from_stream(source)));
+        let mut stream = response.into_body().into_data_stream();
+        assert_eq!(worker.load(), 1);
+        assert!(stream.next().await.unwrap().is_err());
+        assert_eq!(
+            worker.load(),
+            0,
+            "a terminal body error releases without waiting for drop"
+        );
+        worker.increment_load();
+        drop(stream);
+        assert_eq!(
+            worker.load(),
+            1,
+            "dropping an errored body cannot decrement a later lease"
+        );
+        worker.decrement_load();
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn kv_stream_error_aborts_grpc_producer_and_releases_once() {
+        let worker = Arc::new(BasicWorker::new(
+            "grpc://synthetic:8000".into(),
+            WorkerType::Regular,
+        )) as Arc<dyn Worker>;
+        let lease = KvLoadLease::new(worker.clone());
+        let producer = tokio::spawn(std::future::pending::<()>());
+        let source = futures_util::stream::once(async {
+            Err::<bytes::Bytes, _>(std::io::Error::other("synthetic producer stream error"))
+        })
+        .chain(futures_util::stream::pending());
+        let mut response = Response::new(Body::from_stream(source));
+        response
+            .extensions_mut()
+            .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
+        let response = lease.attach(response);
+        let mut stream = response.into_body().into_data_stream();
+        assert_eq!(worker.load(), 1);
+        assert!(stream.next().await.unwrap().is_err());
+        // The retained client body is NOT dropped: only aborting the pending
+        // producer can let its owned completion task release the shared lease.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while worker.load() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal body error must abort the gRPC producer");
+        worker.increment_load();
+        drop(stream);
+        assert_eq!(worker.load(), 1, "errored body drop cannot double-release");
+        worker.decrement_load();
         assert_eq!(worker.load(), 0);
     }
 
@@ -4636,6 +4943,8 @@ mod tests {
         Router {
             kv_runtime: None,
             kv_selection: Mutex::new(()),
+            kv_completion_token_input: false,
+            kv_max_payload_bytes: 512 * 1024 * 1024,
             #[cfg(feature = "kv-perf")]
             kv_perf: None,
             worker_registry,
@@ -4671,6 +4980,8 @@ mod tests {
         Router {
             kv_runtime: None,
             kv_selection: Mutex::new(()),
+            kv_completion_token_input: false,
+            kv_max_payload_bytes: 512 * 1024 * 1024,
             #[cfg(feature = "kv-perf")]
             kv_perf: None,
             worker_registry,
@@ -4939,6 +5250,8 @@ mod tests {
         Router {
             kv_runtime: None,
             kv_selection: Mutex::new(()),
+            kv_completion_token_input: false,
+            kv_max_payload_bytes: 512 * 1024 * 1024,
             #[cfg(feature = "kv-perf")]
             kv_perf: None,
             worker_registry,

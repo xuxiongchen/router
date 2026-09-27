@@ -73,6 +73,14 @@ pub fn init_metrics() {
         "vllm_router_processed_requests_total",
         "Total requests processed by each worker"
     );
+    describe_counter!(
+        "vllm_router_kv_completion_forward_total",
+        "KV Completion backend attempts by original or prepared input; not cache hits"
+    );
+    describe_counter!(
+        "vllm_router_kv_completion_payload_bytes_total",
+        "Original ingress and effective backend bytes on KV Completion attempts"
+    );
 
     // Policy metrics
     describe_counter!(
@@ -405,6 +413,14 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .expect("failed to set duration bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
+    // Register explicit zero series only AFTER the recorder exists. These
+    // are observations, not descriptions; a missing series is never a zero.
+    for mode in ["raw", "prepared"] {
+        counter!("vllm_router_kv_completion_forward_total", "mode" => mode).increment(0);
+    }
+    for kind in ["ingress", "backend"] {
+        counter!("vllm_router_kv_completion_payload_bytes_total", "kind" => kind).increment(0);
+    }
 }
 
 fn set_program_scheduling_buckets(builder: PrometheusBuilder) -> PrometheusBuilder {
@@ -505,6 +521,13 @@ pub struct RouterMetrics;
 pub struct TokenizerMetrics;
 
 impl RouterMetrics {
+    pub fn record_kv_completion_forward(prepared: bool, ingress: usize, backend: usize) {
+        counter!("vllm_router_kv_completion_forward_total", "mode" => if prepared { "prepared" } else { "raw" }).increment(1);
+        counter!("vllm_router_kv_completion_payload_bytes_total", "kind" => "ingress")
+            .increment(ingress as u64);
+        counter!("vllm_router_kv_completion_payload_bytes_total", "kind" => "backend")
+            .increment(backend as u64);
+    }
     // Request metrics
     pub fn record_request(route: &str) {
         counter!("vllm_router_requests_total",

@@ -39,6 +39,7 @@ class RouterArgs:
     kv_events_endpoints: List[str] = dataclasses.field(default_factory=list)
     kv_index_max_entries: int = 100_000
     kv_load_guard: bool = False
+    kv_completion_token_input: bool = False
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
@@ -202,6 +203,10 @@ class RouterArgs:
         parser.add_argument(
             f"--{prefix}kv-load-guard", action="store_true", default=False,
             help="Opt-in cache-first load guard with one excess in-flight request of slack",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-completion-token-input", action="store_true", default=False,
+            help="Opt-in proven single-text Completion token input (requires vllm input backend)",
         )
         parser.add_argument(
             f"--{prefix}prefill-policy",
@@ -608,6 +613,8 @@ class RouterArgs:
 
         if self.kv_input_backend not in ("native", "vllm"):
             raise ValueError("kv_input_backend must be native or vllm")
+        if self.kv_completion_token_input and self.kv_input_backend != "vllm":
+            raise ValueError("kv_completion_token_input requires the vllm input backend")
         if self.kv_input_backend == "vllm":
             if self.policy != "kv_aware" or not self.kv_render_config:
                 raise ValueError("vllm input backend requires kv_aware and kv_render_config")
@@ -625,7 +632,7 @@ class RouterArgs:
                 raise ValueError("native kv_aware requires kv_tokenizer_path")
         elif (self.kv_tokenizer_path is not None or self.kv_model is not None
               or self.kv_hash_algo is not None or self.kv_block_size is not None
-              or self.kv_events_endpoints or self.kv_load_guard):
+              or self.kv_events_endpoints or self.kv_load_guard or self.kv_completion_token_input):
             raise ValueError("KV input/event options require policy=kv_aware")
 
         # Validate configuration based on mode

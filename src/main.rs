@@ -548,6 +548,9 @@ impl CliArgs {
                     worker_endpoints,
                     index_max_entries: self.kv_index_max_entries,
                     load_guard: self.kv_load_guard,
+                    // This binary has no in-process Python facade. Token-input
+                    // forwarding is exposed by the Python/PyO3 vLLM launcher.
+                    completion_token_input: false,
                 }),
             }
         } else {

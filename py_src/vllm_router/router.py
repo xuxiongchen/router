@@ -115,6 +115,8 @@ class Router:
             render_config = kwargs.pop("kv_render_config", None)
             if backend not in ("native", "vllm"):
                 raise ValueError("kv_input_backend must be native or vllm")
+            if kwargs.get("kv_completion_token_input", False) and backend != "vllm":
+                raise ValueError("kv_completion_token_input requires the vllm input backend")
             if backend == "vllm":
                 if kwargs.get("policy") != PolicyType.KvAware or not render_config:
                     raise ValueError("vllm input backend requires kv_aware and kv_render_config")
@@ -127,6 +129,8 @@ class Router:
                 from vllm_router.render_bridge import create_facade
 
                 facade = create_facade(render_config)
+                if kwargs.get("kv_completion_token_input", False) and facade.capability_cohort is None:
+                    raise ValueError("kv_completion_token_input requires automatic Worker capabilities")
                 workers = {url.rstrip("/") for url in kwargs.get("worker_urls", [])}
                 declared = {url.rstrip("/") for url in facade.worker_urls}
                 if not workers or workers != declared:

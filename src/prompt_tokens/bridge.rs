@@ -53,6 +53,9 @@ pub struct PreparedTokens {
     pub token_ids: Arc<[u32]>,
     pub contract: RenderContract,
     pub cache_eligible: bool,
+    /// True only after the facade's full validation of the deliberately narrow
+    /// vLLM 0.29 Completion token-input subset. Never inferred from IDs alone.
+    pub completion_token_input_eligible: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -496,6 +499,11 @@ fn parse_python_result(
                     epoch: epoch.extract()?,
                 },
                 cache_eligible: eligible.extract()?,
+                // Old providers remain compatible and keep original forwarding.
+                completion_token_input_eligible: result
+                    .get_item("completion_token_input_eligible")?
+                    .and_then(|value| value.extract::<bool>().ok())
+                    .unwrap_or(false),
             })
         }
         _ => PreparedResult::Unavailable,
@@ -965,6 +973,7 @@ mod tests {
             token_ids: Arc::from([1, 2, 3]),
             contract: contract(),
             cache_eligible: true,
+            completion_token_input_eligible: false,
         })
     }
 

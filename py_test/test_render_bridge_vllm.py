@@ -338,5 +338,118 @@ class RealVllmRenderTests(unittest.TestCase):
         print("CMB_REAL_RENDER_RESULTS=" + json.dumps(reports, sort_keys=True))
 
 
+@unittest.skipUnless(MODEL_DIRS, "set CMB_RENDER_TEST_MODEL_DIRS for real vLLM CPU validation")
+class RealVllmCompletionInputTests(unittest.TestCase):
+    def test_prepared_completion_tokens_sampling_and_skipped_tokenizer(self):
+        """Real serving/input equivalence, NOT GPU output or Worker evidence.
+
+        No manual profile is needed: this test loads the same automatic Dense
+        renderer adapter for both Qwen and non-Qwen public tokenizer assets.
+        Only vLLM's real preprocessing is used, with no inference engine.
+        """
+        import msgspec
+        from vllm import envs
+
+        reports = []
+        for model_dir in MODEL_DIRS:
+            async def run_model():
+                envs.VLLM_CPU_KVCACHE_SPACE = 0
+                model = "completion-token-input-test"
+                runtime = bridge._load_runtime([
+                    "--model", str(model_dir), "--tokenizer", str(model_dir),
+                    "--served-model-name", model,
+                ], worker_capabilities=True)
+                # Isolate the real per-request facade method. Startup/cohort
+                # conformance is covered by separate integration tests; this
+                # fixture does not claim a remote Worker exists on the CPU.
+                facade = object.__new__(bridge.RenderFacade)
+                facade._runtime = runtime
+                facade.model = model
+                facade.limits = {"max_tokens_per_request": 65536}
+                facade.contract_id = "cpu-input-equivalence-only"
+                facade.epoch = 1
+                tokenize_calls = 0
+                original_tokenize = runtime.renderer._tokenize_prompt_async
+
+                async def counted_tokenize(*args, **kwargs):
+                    nonlocal tokenize_calls
+                    tokenize_calls += 1
+                    return await original_tokenize(*args, **kwargs)
+
+                runtime.renderer._tokenize_prompt_async = counted_tokenize
+                base = {"model": model, "max_tokens": 3, "temperature": 0,
+                        "seed": 17, "add_special_tokens": False}
+                # Include literal special strings, whitespace, Unicode and
+                # longer BPE boundaries; never construct tokens by fragments.
+                cases = [(name, {**base, "prompt": prompt}) for name, prompt in (
+                    ("ascii", "The next number after two is"),
+                    ("unicode", "café e\u0301 中文 🙂\n\tA  B"),
+                    ("special_literals", "<|im_start|>user\nHello<|im_end|>"),
+                    ("whitespace", " \n\t\r\n "),
+                    ("boundary", " word" * 127 + " café"),
+                )]
+                for name, update in (
+                    ("return_ids", {"return_token_ids": True}),
+                    ("stream_usage", {"stream": True, "stream_options": {"include_usage": True}}),
+                    ("stop_sampling", {"temperature": 0.7, "top_p": 0.8,
+                        "top_k": 8, "min_p": 0.1, "stop": ["END"],
+                        "stop_token_ids": [3], "include_stop_str_in_output": True,
+                        "frequency_penalty": 0.2, "presence_penalty": 0.1,
+                        "repetition_penalty": 1.1, "ignore_eos": True, "min_tokens": 1}),
+                    ("nulls_missing", {"temperature": None, "top_p": None,
+                        "stop": None, "stream": None, "return_token_ids": None}),
+                    ("explicit_count", {"n": 1, "use_beam_search": False,
+                        "skip_special_tokens": False, "spaces_between_special_tokens": False}),
+                ):
+                    cases.append((name, {**base, "prompt": "hello café", **update}))
+                passed = []
+                try:
+                    for name, body in cases:
+                        raw = json.dumps(body, ensure_ascii=False).encode()
+                        exact = await facade._render("completion", raw)
+                        self.assertEqual(exact["status"], "exact", (name, exact))
+                        self.assertTrue(exact["completion_token_input_eligible"], name)
+                        original_schema = runtime.schemas["completion"].model_validate_json(raw)
+                        text_result = await runtime.serving.render_completion_request(original_schema)
+                        text_inputs = runtime.capture.engine_inputs
+                        calls_before = tokenize_calls
+                        derived = {**body, "prompt": exact["token_ids"]}
+                        token_schema = runtime.schemas["completion"].model_validate_json(json.dumps(derived).encode())
+                        token_result = await runtime.serving.render_completion_request(token_schema)
+                        token_inputs = runtime.capture.engine_inputs
+                        self.assertEqual(tokenize_calls, calls_before, name)
+                        self.assertEqual(text_inputs[0]["prompt_token_ids"], token_inputs[0]["prompt_token_ids"], name)
+                        self.assertEqual(exact["token_ids"], token_result[0].token_ids, name)
+                        self.assertEqual(msgspec.to_builtins(text_result[0].sampling_params),
+                                         msgspec.to_builtins(token_result[0].sampling_params), name)
+                        self.assertEqual(text_result[0].model_dump(exclude={"request_id", "sampling_params"}),
+                                         token_result[0].model_dump(exclude={"request_id", "sampling_params"}), name)
+                        passed.append(name)
+                    for name, update in (
+                        ("negative_max_tokens", {"max_tokens": -1}),
+                        ("negative_temperature", {"temperature": -1}),
+                        ("null_n", {"n": None}),
+                        ("null_special", {"add_special_tokens": None}),
+                        ("invalid_prompt", {"prompt": {"not": "text"}}),
+                    ):
+                        invalid = await facade._render("completion", json.dumps({
+                            **base, "prompt": "hello", **update}).encode())
+                        self.assertEqual(invalid["status"], "invalid", (name, invalid))
+                        self.assertNotIn("completion_token_input_eligible", invalid)
+                    after_invalid = await facade._render("completion", json.dumps({
+                        **base, "prompt": "valid after client errors"}).encode())
+                    self.assertEqual(after_invalid["status"], "exact")
+                    self.assertTrue(after_invalid["completion_token_input_eligible"])
+                    reports.append({"model_directory": str(model_dir),
+                        "cases": passed, "invalid_cases": 5,
+                        "token_array_text_tokenization_calls": 0,
+                        "gpu_generation": "NOT_RUN"})
+                finally:
+                    runtime.renderer.shutdown()
+            with self.subTest(model_directory=str(model_dir)):
+                asyncio.run(run_model())
+        print("CMB_REAL_COMPLETION_INPUT_RESULTS=" + json.dumps(reports, sort_keys=True))
+
+
 if __name__ == "__main__":
     unittest.main()
