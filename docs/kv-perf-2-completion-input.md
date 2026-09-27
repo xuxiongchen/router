@@ -12,6 +12,29 @@ Native-only startup with the option is rejected, not silently ignored. The
 automatic Worker capability cohort is mandatory: legacy fixed-profile render
 conformance alone cannot detect a remote Worker restart with a new tokenizer,
 and routing-only hints must not become actual generation input on that basis.
+Automatic discovery is necessary but is not an atomic remote identity check;
+the immutable deployment requirement below also applies.
+
+## Required immutable Worker cohort
+
+CT/CLT is opt-in for an **immutable endpoint-to-Worker process, model, tokenizer
+and configuration cohort**. Before any Worker restart/replacement, asset change
+or backend URL switch: stop new ingress, drain/cancel all in-flight requests and
+retries, stop the Router, perform the change, then restart the Router and pass
+startup conformance before reopening traffic. Live/rolling same-URL replacement
+and uncoordinated Worker auto-restarts are unsupported. CL without CT continues
+to forward raw inputs and does not acquire this new token-input restriction.
+
+Per-attempt fences check the generation/contract **already observed by the
+Router**, not the remote process that will receive the POST. Normal metadata
+refresh is every 30 seconds; read failures can delay discovery indefinitely.
+The existing Worker capability proposal does not check an expected boot/tokenizer
+contract atomically on Completion POST. An unobserved incompatible replacement
+can accept valid old IDs with a different meaning; a new local health generation
+alone does not prove fresh input conformance. Background polling therefore does
+not make live replacement safe. Supporting that stronger guarantee requires a
+separately reviewed enforcement mechanism; this increment adds no Worker patch,
+new API or request-level metadata RPC.
 
 ## Deliberately narrow first subset
 
@@ -50,7 +73,8 @@ final payload bound. A larger token JSON array may cost more than the text.
 
 The derived body is created once outside retries. Every attempt rechecks the
 active render contract and binds selection/reservation to the current Worker
-generation, including CT with the load guard off. No per-request metadata RPC,
+generation observed by the Router, including CT with the load guard off. This
+does not supersede the immutable-cohort requirement. No per-request metadata RPC,
 remote render or additional render is introduced. A stale pre-dispatch rejection
 is local, not a backend failure. Existing retry policy is retained; a dispatched
 token request is never blindly retried as original text. Streaming responses

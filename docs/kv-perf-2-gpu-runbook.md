@@ -13,6 +13,21 @@ SHA, Cargo.lock/build overrides, model assets, Worker process identities and
 current `nvidia-smi` UUID. A UUID different from an older preflight is a different
 device observation, not proof that the older device was retested.
 
+CT/CLT requires the [immutable Worker cohort contract](kv-perf-2-completion-input.md#required-immutable-worker-cohort).
+Before the **first** cohort-preparation hook, verify that no previous Router
+remains, both exclusive Workers are drained, and no other clients can use them.
+Initial identity preflight does not prove those conditions. Between arms the
+runner waits for requests and post-window oracles, verifies drained Workers,
+stops and waits for the old Router, then invokes the hook and starts a fresh
+Router with startup conformance. Do not replace Workers while that Router is
+serving or rely on background metadata polling to make token input safe.
+
+Both GPU runners require a clean checkout whose HEAD equals the candidate and
+build-manifest candidate, plus the actual native hash. A later documentation-only
+HEAD is not the SHA compiled into an earlier wheel: retain its original manifest
+and build the GPU candidate at the new exact checkout SHA. Never relabel an old
+native artifact as a newly compiled candidate.
+
 ## Arms and artifacts
 
 | Arm | Render | Load guard | Completion forwarding |
