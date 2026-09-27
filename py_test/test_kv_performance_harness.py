@@ -125,6 +125,27 @@ def server(*, slow=False, connection_close=False):
 
 
 class PerformanceContractTests(unittest.TestCase):
+    def test_version_capture_accepts_three_and_rejects_wrong_third(self):
+        good = (200, {}, json.dumps({"version": perf.prior.VLLM_VERSION}))
+        with patch.object(perf.prior, "save"), patch.object(
+            perf.prior, "request", return_value=good
+        ):
+            self.assertEqual(
+                len(
+                    perf.prior.capture_worker_versions(
+                        ["w0", "w1", "w2"], Path("/fixture")
+                    )
+                ),
+                3,
+            )
+        with patch.object(perf.prior, "save"), patch.object(
+            perf.prior,
+            "request",
+            side_effect=[good, good, (200, {}, '{"version":"wrong"}')],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "all running workers"):
+                perf.prior.capture_worker_versions(["w0", "w1", "w2"], Path("/fixture"))
+
     def test_third_worker_tokens_and_idle_are_not_ignored(self):
         workers = [f"http://127.0.0.1:{8100+i}" for i in range(3)]
         with patch.object(

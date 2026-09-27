@@ -288,8 +288,9 @@ def capture_worker_versions(workers, evidence_path):
             observation["error"] = f"{type(error).__name__}: {error}"
         observations.append(observation)
         save(evidence_path, observations)
-    require(len(observations) == 2 and all(item["status"] == "PASS" for item in observations),
-            "both running workers must expose /version and report the pinned version; see worker_versions.json")
+    require(2 <= len(workers) <= 3 and len(observations) == len(workers)
+            and all(item["status"] == "PASS" for item in observations),
+            "all running workers must expose /version and report the pinned version; see worker_versions.json")
     return observations
 
 
