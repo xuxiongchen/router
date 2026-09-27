@@ -48,6 +48,12 @@ cache_aware is 209.86 tokens/s with TTFT p50 72.66 ms. These are one shared-GPU
 synthetic measurements, not a general acceleration or statistical claim.
 See [exact provenance, failure, results and reproduction](chat-serving-1-gpu-results.md).
 
+The separately authorized [three-Worker follow-up](chat-serving-1-three-workers.md)
+also passes 384/384 measured requests on the same native and trace. CL achieves
+53.49% token hits vs RR 18.40%, but is 1.95% lower throughput and 16.10% higher
+median TTFT. cache_aware is fastest in that round. This does not establish a
+KV-aware speedup or a multi-GPU result; old two-Worker evidence is unchanged.
+
 ## Prepared input decision
 
 Keep raw Chat useful and complete within its reviewed text scope. Prefer a

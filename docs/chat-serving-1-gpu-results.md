@@ -1,5 +1,9 @@
 # Chat Serving 1 — finite GPU results, 2026-09-27
 
+These two-Worker results are preserved. The separately authorized
+[three-Worker follow-up](chat-serving-1-three-workers.md) uses the same measured
+trace and native, with its own evidence, source SHA and memory configuration.
+
 ## Exact scope and artifacts
 
 Fresh user-authorized window ended no later than 2026-09-28 01:00 Asia/Shanghai.
