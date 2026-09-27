@@ -338,6 +338,11 @@ struct KvLoadLease {
     generation: Option<(Arc<crate::kv_index::KVBlockIndex>, u64)>,
 }
 
+/// A bounded retry may follow, but no Worker has received this attempt. Do not
+/// attribute local lifecycle rejection to its circuit breaker or newer epoch.
+#[derive(Clone, Copy, Debug)]
+struct KvPreDispatchFailure;
+
 impl KvLoadLease {
     fn new(worker: Arc<dyn Worker>) -> Self {
         worker.increment_load();
@@ -1676,6 +1681,14 @@ impl Router {
                     .await
                 };
 
+                if response
+                    .extensions()
+                    .get::<KvPreDispatchFailure>()
+                    .is_some()
+                {
+                    return response;
+                }
+
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
                 // should count against the circuit breaker.
                 let status = response.status();
@@ -1759,13 +1772,6 @@ impl Router {
         raw_bytes: Option<&[u8]>,
         lease: KvLoadLease,
     ) -> Response {
-        if !lease.is_current() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Worker generation changed before dispatch",
-            )
-                .into_response();
-        }
         let url = format!("{}{}", worker.url().trim_end_matches('/'), route);
         let mut request = match raw_bytes {
             Some(raw) => self
@@ -1786,6 +1792,17 @@ impl Router {
                     request = request.header(name, value);
                 }
             }
+        }
+        // Body preparation may take time; check at the final synchronous
+        // boundary before sending, without holding lifecycle/policy locks.
+        if !lease.is_current() {
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Worker generation changed before dispatch",
+            )
+                .into_response();
+            response.extensions_mut().insert(KvPreDispatchFailure);
+            return response;
         }
         let response = {
             // Includes client dispatch and upstream header wait, or its
@@ -4364,6 +4381,58 @@ mod tests {
         assert_eq!(worker.load(), 0);
         assert_eq!(replacement.load(), 0);
         assert_eq!(index.current_generation(worker.url()), None);
+    }
+
+    #[tokio::test]
+    async fn kv_load_guard_local_generation_rejection_does_not_retire_new_epoch() {
+        #[derive(Clone)]
+        struct RollDuringSerialization {
+            index: Arc<crate::kv_index::KVBlockIndex>,
+            worker: String,
+        }
+        impl serde::Serialize for RollDuringSerialization {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let generation = self.index.current_generation(&self.worker).unwrap();
+                self.index.roll_worker(&self.worker, generation).unwrap();
+                serde_json::json!({"prompt": "generation race"}).serialize(serializer)
+            }
+        }
+        impl GenerationRequest for RollDuringSerialization {
+            fn is_stream(&self) -> bool {
+                false
+            }
+            fn get_model(&self) -> Option<&str> {
+                None
+            }
+            fn extract_text_for_routing(&self) -> String {
+                String::new()
+            }
+        }
+        let worker = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:1".into(),
+            WorkerType::Regular,
+        )) as Arc<dyn Worker>;
+        let (router, index) = guarded_test_router(std::slice::from_ref(&worker));
+        let old_generation = index.current_generation(worker.url()).unwrap();
+        let request = RollDuringSerialization {
+            index: index.clone(),
+            worker: worker.url().into(),
+        };
+        let response = router
+            .route_request_with_tokens(None, &request, "/v1/completions", None, Some(vec![1; 33]))
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response
+            .extensions()
+            .get::<KvPreDispatchFailure>()
+            .is_some());
+        assert_eq!(
+            index.current_generation(worker.url()),
+            Some(old_generation + 1)
+        );
+        assert_eq!(worker.circuit_breaker().total_failures(), 0);
+        assert_eq!(worker.circuit_breaker().total_successes(), 0);
+        assert_eq!(worker.load(), 0);
     }
 
     #[tokio::test]
