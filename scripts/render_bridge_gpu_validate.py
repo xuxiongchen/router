@@ -15,6 +15,8 @@ as byte-for-byte GPU proof here.
 corpus plus exact Dense block boundaries. It requires opted-in, fully restarted
 Workers; it never installs the linked patch. Metadata counters allow bounded
 background refresh rather than asserting zero total metadata HTTP traffic.
+Perf-2 switches opt into load protection and narrow prepared Completion input.
+Their production regression additionally requires --production-validation.
 """
 
 import argparse
@@ -111,6 +113,15 @@ def mapped_native(pid, native):
             "inode": native.stat().st_ino, "maps": entries}
 
 
+def validate_native_mode(info, production_validation):
+    require(isinstance(info, dict) and info.get("selected_mode") is None,
+            "functional regression must not select an experimental dispatch mode")
+    if production_validation:
+        require(info.get("enabled") is False and info.get("modes") == [],
+                "production regression requires the actual feature-off native artifact")
+    return info
+
+
 def child(manifest_path):
     config = json.loads(Path(manifest_path).read_text())
     native_path = Path(config["native"])
@@ -119,6 +130,13 @@ def child(manifest_path):
     native = importlib.util.module_from_spec(spec)
     sys.modules["vllm_router_rs"] = native
     spec.loader.exec_module(native)
+    require(not config.get("production_validation", False)
+            or callable(getattr(native, "kv_perf_capabilities", None)),
+            "production regression requires an actual native capability handshake")
+    capability = (native.kv_perf_capabilities() if hasattr(native, "kv_perf_capabilities")
+                  else {"enabled": False, "modes": [], "selected_mode": None})
+    save(config["native_mode_identity"], validate_native_mode(
+        capability, config.get("production_validation", False)))
     sys.path.insert(0, str(ROOT / "py_src"))
     from vllm_router.router import Router
     from vllm_router.router_args import RouterArgs
@@ -126,6 +144,8 @@ def child(manifest_path):
     args = RouterArgs(
         host="127.0.0.1", port=config["router_port"], worker_urls=config["workers"],
         policy="kv_aware", kv_input_backend="vllm", kv_render_config=config["render_config"],
+        kv_load_guard=config.get("kv_load_guard", False),
+        kv_completion_token_input=config.get("kv_completion_token_input", False),
         # Automatic mode must obtain hash/unit defaults from actual Workers,
         # and each verified subscriber obtains its epoch-bound exact topic.
         **({"kv_events_topic_filter": ""} if config["automatic_capabilities"] else {
@@ -172,11 +192,14 @@ def child(manifest_path):
 def owned_router(config, out):
     manifest = out / "router-child.json"
     save(manifest, config)
+    environment = os.environ.copy()
+    for key in ("VLLM_ROUTER_KV_PERF_MODE", "VLLM_ROUTER_KV_STAGE_TIMING", "VLLM_ROUTER_KV_STAGE_TRACE"):
+        environment.pop(key, None)
     with (out / "router.log").open("wb") as log:
         process = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()),
                                     "--child", str(manifest)], cwd=ROOT,
                                    stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True, env=os.environ.copy())
+                                   start_new_session=True, env=environment)
         try:
             deadline = time.monotonic() + 200
             while time.monotonic() < deadline:
@@ -191,6 +214,8 @@ def owned_router(config, out):
                 time.sleep(0.2)
             else:
                 raise RuntimeError("Router startup exceeded finite deadline")
+            validate_native_mode(json.loads(Path(config["native_mode_identity"]).read_text()),
+                                 config.get("production_validation", False))
             yield process
         finally:
             if process.poll() is None:
@@ -298,6 +323,37 @@ def generation_tokens(body, stream, chat):
     return lists[0]
 
 
+def completion_semantics(body, stream):
+    """Compare generated text/finish/usage, not IDs, timestamps or SSE boundaries."""
+    if stream:
+        require(b"data: [DONE]" in body, "semantic oracle SSE is incomplete")
+        events = [json.loads(line[5:].strip()) for line in body.splitlines()
+                  if line.startswith(b"data:") and line[5:].strip() not in (b"", b"[DONE]")]
+    else:
+        events = [json.loads(body)]
+    choices, usage = {}, None
+    for event in events:
+        require(isinstance(event, dict) and not event.get("error"), "semantic oracle contains an error")
+        if event.get("usage") is not None:
+            value = event["usage"]
+            usage = {key: value.get(key) for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
+        for choice in event.get("choices", []):
+            index, text = choice.get("index"), choice.get("text")
+            require(type(index) is int and index == 0 and isinstance(text, str),
+                    "semantic fixture requires one ordinary text Completion")
+            current = choices.setdefault(index, {"text": "", "finish_reason": None})
+            current["text"] += text
+            if choice.get("finish_reason") is not None:
+                require(current["finish_reason"] is None, "duplicate terminal Completion choice")
+                current["finish_reason"] = choice["finish_reason"]
+    require(list(choices) == [0] and choices[0]["finish_reason"] in ("stop", "length"),
+            "semantic oracle did not complete one successful choice")
+    require(usage is not None and all(type(value) is int and value >= 0 for value in usage.values())
+            and usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"],
+            "semantic oracle lacks consistent real usage")
+    return {"choices": [choices[0]], "usage": usage}
+
+
 def public_render_tokens(body, chat):
     rendered = json.loads(body)
     if not chat:
@@ -341,10 +397,29 @@ class Validation(prior.Validation):
         self.model = args.model
         self.worker_logs = [args.worker0_log, args.worker1_log]
         self.automatic_capabilities = args.automatic_capabilities
+        self.perf2 = args.kv_load_guard or args.kv_completion_token_input
 
     def case(self, name, callback):
         require(time.monotonic() < self.args.deadline, "finite GPU matrix budget exhausted")
-        return super().case(name, callback)
+        result = super().case(name, callback)
+        if self.perf2:
+            require(self.results[-1]["status"] == "PASS", "Perf-2 functional case failed; stop the matrix")
+        return result
+
+    def forwarding_snapshot(self):
+        if not self.perf2:
+            return None
+        # The existing performance runner owns the exact metric parser. This
+        # local import is after module initialization (that runner imports us).
+        from kv_capabilities_performance import metric_snapshot
+        return metric_snapshot(f"http://127.0.0.1:{self.args.metrics_port}")[0]
+
+    def forwarding_evidence(self, before, prepared, completion=True, dispatched=True):
+        if before is None:
+            return None
+        from kv_capabilities_performance import forwarding_window
+        return forwarding_window(before, self.forwarding_snapshot(), int(completion and dispatched),
+                                 prepared, completion=completion and dispatched)
 
     def oracle(self, payload, name):
         route = "/v1/chat/completions" if "messages" in payload else "/v1/completions"
@@ -361,7 +436,8 @@ class Validation(prior.Validation):
         require(values[0] == values[1], "real Workers disagree on complete token IDs")
         return raw, values[0], route
 
-    def routed(self, name, payload, expected=None, unsupported=False, cold=False):
+    def routed(self, name, payload, expected=None, unsupported=False, cold=False,
+               expect_prepared=None):
         self.idle()
         payload = {**payload, "return_token_ids": True}
         raw, tokens, route = self.oracle(payload, name)
@@ -371,6 +447,7 @@ class Validation(prior.Validation):
         before_observation = len(read_observations(self.observations))
         before_access = render_access_count(self.worker_logs)
         before_metadata = metadata_access_count(self.worker_logs)
+        forwarding_before = self.forwarding_snapshot()
         request_started = time.monotonic()
         offset = Path(self.args.router_log).stat().st_size
         status, headers, body = raw_request(self.args.router, route, raw)
@@ -396,6 +473,12 @@ class Validation(prior.Validation):
         require(len(observations) == 1, "request was not rendered exactly once")
         observed = observations[0]
         require(observed["raw_sha256"] == hashlib.sha256(raw).hexdigest(), "facade did not receive original bytes")
+        prepared = (self.args.kv_completion_token_input and route == "/v1/completions"
+                    and observed["result"].get("completion_token_input_eligible") is True)
+        if expect_prepared is not None:
+            require(prepared == expect_prepared, "explicit Completion proof fixture eligibility changed")
+        forwarding = self.forwarding_evidence(forwarding_before, prepared,
+                                              completion=route == "/v1/completions")
         scores = {item["worker"].rstrip("/"): item["prefix_blocks"] for item in decision["scores"]}
         require(set(scores) == set(self.workers), "decision lacks both worker scores")
         if self.automatic_capabilities:
@@ -449,6 +532,9 @@ class Validation(prior.Validation):
                   "decision": decision, "completed_request_deltas": delta,
                   "worker_token_count": len(tokens), "worker_token_ids_sha256": prior.token_digest(tokens),
                   "actual_generation_token_ids": actual_generation_tokens,
+                  "completion_forwarding": forwarding,
+                  "forwarding_scope": ("derived prepared token body; original facade ingress remains unchanged"
+                                       if prepared else "original backend path; exact bytes covered by CPU wire tests"),
                   "facade_observation": observed, "prefix_cache_metric_deltas": prefix_delta,
                   "prefix_cache_token_hit_ratios": [
                       value.get("vllm:prefix_cache_hits_total", 0) / value["vllm:prefix_cache_queries_total"]
@@ -462,6 +548,90 @@ class Validation(prior.Validation):
                   "reusable_prediction_scope": "Observed-subset lower bound, not complete cached inventory or guaranteed future work savings."}
         save(self.out / f"{name}.json", result)
         return result
+
+    def completion_equivalence(self, name, stream, extra=None, stop_probe=False):
+        """Untimed real original-vs-Router generation; no Worker API/patch change."""
+        payload = {"model": self.model,
+                   "prompt": f"{uuid.uuid4().hex}\n  café 中文 🙂\t\nComplete this sentence: Water flows",
+                   "add_special_tokens": False, "n": 1, "temperature": 0,
+                   "top_p": 0.95, "seed": 7, "max_tokens": 16,
+                   "stream": stream, "return_token_ids": True, **(extra or {})}
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
+        if stop_probe:
+            raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+            self.idle()
+            status, _, body = raw_request(self.workers[0], "/v1/completions", raw)
+            (self.out / f"{name}.stop-probe.response.bin").write_bytes(body)
+            require(status == 200, "stop-discovery generation failed")
+            generated = completion_semantics(body, stream)["choices"][0]["text"]
+            require(generated, "stop fixture needs actual nonempty deterministic reference text")
+            payload["stop"] = generated[:4]
+        self.idle()
+        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+        (self.out / f"{name}.direct-original.request.json").write_bytes(raw)
+        status, headers, direct = raw_request(self.workers[0], "/v1/completions", raw)
+        (self.out / f"{name}.direct-original.response.bin").write_bytes(direct)
+        require(status == 200, "direct original Completion failed")
+        reference = completion_semantics(direct, stream)
+        expected_prepared = self.args.kv_completion_token_input and not extra
+        routed = self.routed(name, payload, expect_prepared=expected_prepared)
+        backend = (self.out / f"{name}.response.bin").read_bytes()
+        actual = completion_semantics(backend, stream)
+        require(actual == reference, "deterministic Completion text/finish/usage differs from original path")
+        require(generation_tokens(direct, stream, False) == routed["actual_generation_token_ids"],
+                "original-vs-Router actual Worker prompt IDs differ")
+        if stop_probe:
+            require(actual["choices"][0]["finish_reason"] == "stop", "stop fixture did not actually stop")
+        result = {"name": name, "status": "PASS", "direct_original_headers": headers,
+                  "original_semantics": reference, "router_semantics": actual,
+                  "actual_generation_token_ids": routed["actual_generation_token_ids"],
+                  "completion_forwarding": routed["completion_forwarding"],
+                  "scope": "temperature=0, fixed seed; exact text, finish and core token usage. "
+                           "IDs/timestamps/chunk boundaries/cache-usage details and logprob float values are not compared; raw responses retained."}
+        save(self.out / f"{name}.equivalence.json", result)
+        return result
+
+    def invalid_completion(self, name, raw):
+        self.idle()
+        observed = []
+        before = self.forwarding_snapshot()
+        for label, endpoint in (("direct-original", self.workers[0]), ("router", self.args.router)):
+            status, headers, body = raw_request(endpoint, "/v1/completions", raw)
+            (self.out / f"{name}.{label}.response.bin").write_bytes(body)
+            observed.append({"path": label, "http_status": status, "headers": headers})
+            require(400 <= status < 500, "invalid request was converted into a successful generation")
+        require(observed[0]["http_status"] == observed[1]["http_status"],
+                "invalid Completion Router status differs from direct Worker")
+        self.idle()
+        result = {"name": name, "status": "PASS", "request_utf8": raw.decode(), "responses": observed,
+                  "completion_forwarding": self.forwarding_evidence(before, False, dispatched=False),
+                  "scope": "Invalid schema/JSON remains invalid and produces no backend dispatch; error text need not be byte-identical."}
+        save(self.out / f"{name}.json", result)
+        return result
+
+    def cancel_payload(self):
+        return getattr(self, "_cancel_payload_override", None) or super().cancel_payload()
+
+    def cancel_cleanup(self):
+        if not self.perf2:
+            return super().cancel_cleanup()
+        payload = super().cancel_payload()
+        payload.update(add_special_tokens=False, return_token_ids=True)
+        self._cancel_payload_override = payload
+        try:
+            _raw, tokens, _route = self.oracle(payload, "stream_cancel_cleanup")
+            before = self.forwarding_snapshot()
+            result = super().cancel_cleanup()
+            actual = generation_tokens(json.dumps(result["first_nonterminal_event"]).encode(), False, False)
+            require(actual == tokens, "cancelled request actual Worker prompt IDs differ")
+            result.update(actual_generation_token_ids=actual,
+                          completion_forwarding=self.forwarding_evidence(
+                              before, self.args.kv_completion_token_input))
+            save(self.out / "stream_cancel_cleanup.json", result)
+            return result
+        finally:
+            self._cancel_payload_override = None
 
     def positive(self, name, kind, target, stream=False):
         payload = positive_payload(self.model, name, kind, stream)
@@ -619,7 +789,7 @@ def run(args):
     prior.MODEL = args.model
     out = prior.output_directory(args.output, args.source)
     report = {"status": "RUNNING", "started_at_unix": time.time(), "command": sys.argv,
-              "limitations": ["No tokens-in/out; generation repeats preprocessing.",
+              "limitations": ["Chat remains original forwarding. Eligible Completion tokens-in is opt-in; Worker still validates and owns text output.",
                               "Queued cancellation uses existing CPU synthetic lifecycle proof; no artificial GPU delay is injected.",
                               "Raw facade ingress is recorded; stock Worker does not export raw generation bytes."]}
     save(out / "summary.json", report)
@@ -646,6 +816,10 @@ def run(args):
                   "render_config": str(Path(args.render_config).resolve()),
                   "serving_args": deployment["serving_args"],
                   "automatic_capabilities": args.automatic_capabilities,
+                  "kv_load_guard": args.kv_load_guard,
+                  "kv_completion_token_input": args.kv_completion_token_input,
+                  "production_validation": args.production_validation,
+                  "native_mode_identity": str(out / "native-mode-identity.json"),
                   "observations": str(out / "facade-observations.jsonl"),
                   "facade_identity": str(out / "facade-identity.json")}
         if args.automatic_capabilities:
@@ -666,6 +840,9 @@ def run(args):
         report.update(identity, native_sha256=native_hash, native=str(Path(args.native).resolve()),
                       build_manifest_sha256=prior.sha256(args.build_manifest),
                       render_config_sha256=prior.sha256(args.render_config), workers=worker_processes,
+                      kv_load_guard=args.kv_load_guard,
+                      kv_completion_token_input=args.kv_completion_token_input,
+                      production_validation=args.production_validation,
                       python=sys.version, platform=platform.platform(),
                       installed_versions={name: importlib.metadata.version(name) for name in
                                           ("vllm", "torch", "transformers", "tokenizers", "pydantic")})
@@ -678,8 +855,10 @@ def run(args):
         with owned_router(config, out) as process:
             report["router_process"] = prior.process(process.pid)
             report["mapped_native"] = mapped_native(process.pid, args.native)
+            report["native_mode"] = json.loads(Path(config["native_mode_identity"]).read_text())
             save(out / "summary.json", report)
             validation = Validation(args, out)
+            report["cases"] = validation.results
             metadata_before = metadata_access_count(validation.worker_logs)
             if args.automatic_capabilities:
                 require(all(value > 0 for value in metadata_before),
@@ -710,6 +889,23 @@ def run(args):
                                     lambda token_count=token_count, target=index % 2:
                                     validation.dense_boundary(token_count, target))
             validation.case("salt_fairness", validation.salt_fairness)
+            if validation.perf2:
+                for stream in (False, True):
+                    kind = "sse" if stream else "json"
+                    for stopping in (False, True):
+                        name = f"perf2-completion-{kind}-{'stop' if stopping else 'ordinary'}"
+                        validation.case(name, lambda name=name, stream=stream, stopping=stopping:
+                                        validation.completion_equivalence(name, stream, stop_probe=stopping))
+                for name, extra in (("echo", {"echo": True}), ("logprobs", {"logprobs": 1})):
+                    name = "perf2-original-fallback-" + name
+                    validation.case(name, lambda name=name, extra=extra:
+                                    validation.completion_equivalence(name, False, extra=extra))
+                invalid = json.dumps({"model": args.model, "prompt": "invalid fixture",
+                                      "add_special_tokens": False, "max_tokens": -1}).encode()
+                validation.case("perf2-invalid-negative-length", lambda:
+                                validation.invalid_completion("perf2-invalid-negative-length", invalid))
+                validation.case("perf2-invalid-json", lambda:
+                                validation.invalid_completion("perf2-invalid-json", b'{"prompt":'))
             # Existing helper has full first-record/active-before-close checks,
             # log/PID/ID correlation and no natural completion masquerading as abort.
             validation.case("stream_cancel_cleanup", validation.cancel_cleanup)
@@ -814,6 +1010,39 @@ def self_check():
             and completion_fixture["prompt"].startswith(nonce + " ")
             and completion_fixture["add_special_tokens"] is True,
             "positive Completion fixture changed unexpectedly")
+    ordinary = {"enabled": False, "modes": [], "selected_mode": None}
+    validate_native_mode(ordinary, True)
+    validate_native_mode({**ordinary, "enabled": True}, False)
+    for invalid_mode in ({**ordinary, "enabled": True}, {**ordinary, "selected_mode": "render_kv"}):
+        try:
+            validate_native_mode(invalid_mode, True)
+        except RuntimeError:
+            continue
+        raise RuntimeError("experimental native accepted as production functional proof")
+    usage = {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    original = json.dumps({"id": "original", "usage": usage,
+                           "choices": [{"index": 0, "text": "onetwo", "finish_reason": "length"}]}).encode()
+    streamed = b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in (
+        {"id": "different", "choices": [{"index": 0, "text": "one", "finish_reason": None}]},
+        {"id": "different", "choices": [{"index": 0, "text": "two", "finish_reason": "length"}]},
+        {"choices": [], "usage": usage},
+    )) + b"data: [DONE]\n\n"
+    require(completion_semantics(original, False) == completion_semantics(streamed, True),
+            "semantic comparison incorrectly depends on IDs or stream chunk boundaries")
+    for invalid_semantics, stream in ((streamed.replace(b"data: [DONE]", b""), True),
+                                     (b'{"choices":[]}', False)):
+        try:
+            completion_semantics(invalid_semantics, stream)
+        except RuntimeError:
+            continue
+        raise RuntimeError("incomplete semantic response was accepted")
+    legacy_cancel = object.__new__(prior.Validation).cancel_payload()
+    require("add_special_tokens" not in legacy_cancel and "return_token_ids" not in legacy_cancel,
+            "legacy cancellation fixture changed")
+    overridden = object.__new__(Validation)
+    overridden._cancel_payload_override = {**legacy_cancel, "add_special_tokens": False, "return_token_ids": True}
+    require(overridden.cancel_payload() is overridden._cancel_payload_override,
+            "prepared cancellation did not reuse the exact oracle fixture")
     # Exercise the real run entry ordering, stopping before its first filesystem
     # operation. No process, network call or output directory is created.
     from types import SimpleNamespace
@@ -836,7 +1065,7 @@ def self_check():
             raise RuntimeError("model ordering probe did not stop before filesystem access")
     finally:
         prior.MODEL, prior.output_directory = original_model, original_output
-    print("PASS render bridge GPU parsers/fixtures/bootstrap (21 checks; no hardware)")
+    print("PASS render bridge GPU parsers/fixtures/bootstrap/Perf-2 semantic contracts (no hardware)")
     return 0
 
 
@@ -851,6 +1080,12 @@ def main():
     parser.add_argument("--render-config")
     parser.add_argument("--automatic-capabilities", action="store_true",
                         help="Require proposed Worker capabilities, generic shapes and Dense boundary evidence")
+    parser.add_argument("--kv-load-guard", action="store_true",
+                        help="Exercise the public cache-first load-protection switch")
+    parser.add_argument("--kv-completion-token-input", action="store_true",
+                        help="Exercise proven Completion token forwarding, not Chat tokens-in/out")
+    parser.add_argument("--production-validation", action="store_true",
+                        help="Require actual native extension built without the experimental kv-perf feature")
     parser.add_argument("--worker-vllm-root",
                         help="Explicit shared Worker vllm package directory for on-disk source hashes, not loaded-module attestation")
     parser.add_argument("--output")
@@ -876,6 +1111,8 @@ def main():
                  "worker1_pid", "engine0_pid", "engine1_pid", "worker0_log", "worker1_log", "event0", "event1"):
         require(getattr(args, name) is not None, "missing --" + name.replace("_", "-"))
     require(0 <= args.event_wait <= 10, "event wait must be finite and at most ten seconds")
+    require(not (args.kv_load_guard or args.kv_completion_token_input) or args.automatic_capabilities,
+            "Perf-2 acceptance requires verified automatic Worker capabilities")
     require(60 <= args.budget_seconds <= 1800, "matrix budget must be 60..1800 seconds")
     def interrupted(_signal, _frame):
         raise KeyboardInterrupt("supervised matrix interrupted")

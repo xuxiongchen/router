@@ -87,6 +87,72 @@ and its **new** production native/build manifest in `perf_common`; never reuse
 the ablation manifest. Re-read the current Worker PIDs before every separate
 invocation because a previous fresh-cohort run replaced them.
 
+## Functional regression must enable the new production switches
+
+The older functional matrix with both defaults off is baseline evidence only.
+Use the new flags in the existing acceptance runner to exercise the production
+changes. This runner attaches the already authorized exclusive Workers; it does
+not accept the performance runner's cohort-hook arguments. Supply current PIDs:
+
+```bash
+functional_common=(
+  --source "$PERF2_SOURCE" --candidate "$PERF2_SHA"
+  --native "$PERF2_NATIVE" --build-manifest "$PERF2_BUILD_MANIFEST"
+  --render-config "$PERF2_RENDER_CONFIG" --worker-vllm-root "$PERF2_VLLM_ROOT"
+  --automatic-capabilities --production-validation --model "$PERF2_MODEL"
+  --worker0 http://127.0.0.1:8100 --worker1 http://127.0.0.1:8101
+  --worker0-pid "$PERF2_WORKER0_PID" --worker1-pid "$PERF2_WORKER1_PID"
+  --engine0-pid "$PERF2_ENGINE0_PID" --engine1-pid "$PERF2_ENGINE1_PID"
+  --worker0-log "$PERF2_WORKER0_LOG" --worker1-log "$PERF2_WORKER1_LOG"
+  --event0 tcp://127.0.0.1:5557 --event1 tcp://127.0.0.1:5558
+  --publisher0 'tcp://*:5557' --publisher1 'tcp://*:5558'
+)
+python -B scripts/render_bridge_gpu_validate.py "${functional_common[@]}" \
+  --kv-load-guard --kv-completion-token-input \
+  --budget-seconds 1200 --output "$PERF2_FUNCTIONAL_OUT"
+```
+
+Use the production native and its matching build manifest, not the ablation
+artifact. Absence of an actual native feature handshake is not accepted as
+production proof. The runner clears inherited experimental dispatch/stage
+environment settings. Its observation of facade results is a functional test
+observer, not headline performance instrumentation.
+
+Without either new switch the previous corpus remains unchanged. With either
+switch active, it adds bounded single-text Completion original-vs-Router
+equivalence cases: JSON/SSE, real stop-triggering output, Unicode/whitespace,
+fixed sampling settings, exact complete Worker prompt IDs, core usage and finish
+reason. Explicit prepared cases require the prepared counter to increment, so
+silent raw fallback cannot pass. Echo/logprobs cases must remain original;
+existing token-array/truncation/special-token and Chat cases remain covered by
+the old corpus. Original ingress hashes remain checked for every routed case;
+no GPU raw-backend-byte claim is made for transformed bodies or old paths.
+
+Invalid JSON and negative output-length requests must retain direct-Worker
+error status and make no backend dispatch. The existing active-stream abort
+proof now uses an eligible prepared fixture when the token switch is enabled,
+checks actual Worker IDs before closing the stream, proves abort rather than
+natural completion, and checks the forwarding counter and final zero load.
+Any failed Perf-2 functional case stops the matrix with partial evidence saved.
+
+The deterministic comparison excludes request IDs, timestamps, SSE boundaries,
+cache-hit details and logprob floating-point values; raw responses are retained
+for review. It does not weaken the production API or omit those response fields.
+JSON/SSE stop/usage equivalence is an explicit measured assertion, not a claim
+that arbitrary stochastic generations match bitwise.
+
+GPU acceptance does not mutate profiles/epochs or stop Workers to simulate
+staleness. Keep the focused Rust CPU tests
+`kv_prepared_completion_retry_reuses_body_tokens_and_epoch_fence`,
+`kv_render_bridge_epoch_change_blocks_retry`,
+`kv_load_guard_generation_change_before_dispatch_releases_lease`, and
+`kv_load_guard_completion_chat_json_sse_and_timeout_share_lease` as separate
+gates, plus `completion_input` header/payload-limit tests and the separate
+`render_bridge_native_probe.py` actual-extension transport/lifetime probe. Run the production
+functional command again for the approved Smol configuration on the same native
+artifact, with fresh recorded model/Worker identities. Do not claim Smol
+performance from these functional results.
+
 Two distinct optional windows reuse the same runner:
 
 - `--scenarios natural --concurrencies 4 --natural-warmup-requests 32`:

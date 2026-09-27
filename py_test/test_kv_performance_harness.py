@@ -186,6 +186,19 @@ class PerformanceContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "production validation supports"):
             perf.arm_configuration("B", production_validation=True)
 
+    def test_production_cannot_infer_feature_off_from_missing_native_handshake(self):
+        for native in (SimpleNamespace(), SimpleNamespace(kv_perf_capabilities=None)):
+            with self.subTest(native=native), self.assertRaisesRegex(
+                RuntimeError, "actual native capability handshake"
+            ):
+                perf.native_benchmark_capabilities(native, production_validation=True)
+        ordinary = {"enabled": False, "modes": [], "selected_mode": None}
+        native = SimpleNamespace(kv_perf_capabilities=lambda: ordinary)
+        self.assertIs(
+            perf.native_benchmark_capabilities(native, production_validation=True),
+            ordinary,
+        )
+
     def test_arm_order_repeats_without_cherry_picking(self):
         arms = ["product_rr", "A", "B", "C"]
         orders = [perf.arm_order(arms, index, 0) for index in range(3)]

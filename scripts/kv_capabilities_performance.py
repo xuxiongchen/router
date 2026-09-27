@@ -314,6 +314,14 @@ def validate_benchmark_capabilities(info, arm, production_validation=False):
     return info
 
 
+def native_benchmark_capabilities(native, production_validation=False):
+    handshake = getattr(native, "kv_perf_capabilities", None)
+    require(not production_validation or callable(handshake),
+            "production validation requires an actual native capability handshake")
+    return (handshake() if callable(handshake)
+            else {"enabled": False, "modes": [], "selected_mode": None})
+
+
 def counters(workers):
     names = ("vllm:request_success_total", "vllm:prefix_cache_hits_total",
              "vllm:prefix_cache_queries_total", "vllm:num_requests_running")
@@ -347,8 +355,7 @@ def child(path):
     native = importlib.util.module_from_spec(spec)
     sys.modules["vllm_router_rs"] = native
     spec.loader.exec_module(native)
-    capability = (native.kv_perf_capabilities() if hasattr(native, "kv_perf_capabilities")
-                  else {"enabled": False, "modes": [], "selected_mode": None})
+    capability = native_benchmark_capabilities(native, config.get("production_validation", False))
     save(config["benchmark_identity"], validate_benchmark_capabilities(
         capability, config["arm"], config.get("production_validation", False)))
     sys.path.insert(0, str(ROOT / "py_src"))

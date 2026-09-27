@@ -587,6 +587,11 @@ class Validation:
                                if name == self.args.request_counter and 'finished_reason="abort"' in labels)
                            for worker in values]}
 
+    def cancel_payload(self):
+        """Overridable fixture only; the default legacy request remains unchanged."""
+        return {"model": MODEL, "prompt": uuid.uuid4().hex + " cancellation fixture " * 40,
+                "max_tokens": 1024, "ignore_eos": True, "stream": True}
+
     def cancel_cleanup(self):
         name = "stream_cancel_cleanup"
         evidence = {"name": name, "status": "RUNNING", "started_at_unix": time.time()}
@@ -611,8 +616,7 @@ class Validation:
             cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
             connection = cls(parsed.hostname, parsed.port, timeout=60)
             response = None
-            payload = {"model": MODEL, "prompt": uuid.uuid4().hex + " cancellation fixture " * 40,
-                       "max_tokens": 1024, "ignore_eos": True, "stream": True}
+            payload = self.cancel_payload()
             evidence["request"] = payload
             try:
                 evidence["dispatch_at_unix"] = time.time()
