@@ -474,10 +474,10 @@ impl Router {
             &ctx.router_config.policy
         {
             if config.completion_token_input
-                && !ctx
+                && ctx
                     .render_bridge
                     .as_ref()
-                    .is_some_and(|bridge| bridge.capability_cohort.is_some())
+                    .is_none_or(|bridge| bridge.capability_cohort.is_none())
             {
                 return Err("kv_completion_token_input requires the vllm input backend with automatic Worker capabilities".into());
             }
