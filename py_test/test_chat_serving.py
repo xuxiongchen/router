@@ -56,6 +56,7 @@ class ChatContractTests(unittest.TestCase):
             "build.rs",
             "py_src/vllm_router/router.py",
             "setup.py",
+            "scripts/build_wheel.sh",
         ):
             with self.subTest(changed=changed), patch(
                 "kv_aware_cuda_validate.command", side_effect=["", changed]

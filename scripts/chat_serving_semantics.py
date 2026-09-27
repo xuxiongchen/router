@@ -291,6 +291,10 @@ def semantic_cases(model):
 def check_semantics(result, expected):
     message = result["message"]
     if expected == "tool":
+        require(
+            result["finish_reason"] in ("tool_calls", "stop"),
+            "tool response was truncated",
+        )
         outputs = execute_tools(message)
         require(
             all(json.loads(x["content"]) == {"result": 42} for x in outputs),
@@ -424,6 +428,12 @@ def run_gpu_cases(validation):
                 )
                 check_semantics(direct, expected)
                 check_semantics(routed, expected)
+                if payload.get("tool_choice") == "none":
+                    require(
+                        not direct["message"].get("tool_calls")
+                        and not routed["message"].get("tool_calls"),
+                        "tool_choice=none produced tool calls",
+                    )
                 evidence.update(
                     direct_semantics=direct,
                     routed_semantics=routed,
