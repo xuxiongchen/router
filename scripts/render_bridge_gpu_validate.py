@@ -936,22 +936,24 @@ def run(args):
             else:
                 from test_render_bridge_vllm import actual_cases
                 shape_cases = actual_cases(args.model)
-            for name, _, payload in shape_cases:
+            cancel_only = args.chat_cancel_only
+            for name, _, payload in ([] if cancel_only else shape_cases):
                 validation.case("tokens-" + name, lambda name=name, payload=payload:
                                 validation.routed("tokens-" + name, payload))
-            for kind in ("completion", "chat"):
+            for kind in (() if cancel_only else ("completion", "chat")):
                 for target in (0, 1):
                     for stream in (False, True):
                         name = f"positive-{kind}-w{target}-{'sse' if stream else 'json'}"
                         validation.case(name, lambda name=name, kind=kind, target=target, stream=stream:
                                         validation.positive(name, kind, target, stream))
-            if args.automatic_capabilities:
+            if args.automatic_capabilities and not cancel_only:
                 for index, token_count in enumerate(boundary_lengths(args.block_size)):
                     validation.case(f"boundary-n{token_count}",
                                     lambda token_count=token_count, target=index % 2:
                                     validation.dense_boundary(token_count, target))
-            validation.case("salt_fairness", validation.salt_fairness)
-            if validation.perf2:
+            if not cancel_only:
+                validation.case("salt_fairness", validation.salt_fairness)
+            if validation.perf2 and not cancel_only:
                 for stream in (False, True):
                     kind = "sse" if stream else "json"
                     for stopping in (False, True):
@@ -970,10 +972,12 @@ def run(args):
                                 validation.invalid_completion("perf2-invalid-json", b'{"prompt":'))
             # Existing helper has full first-record/active-before-close checks,
             # log/PID/ID correlation and no natural completion masquerading as abort.
-            validation.case("stream_cancel_cleanup", validation.cancel_cleanup)
+            if not cancel_only:
+                validation.case("stream_cancel_cleanup", validation.cancel_cleanup)
             if args.chat_agent:
                 from chat_serving_semantics import run_gpu_cases
-                run_gpu_cases(validation)
+                if not cancel_only:
+                    run_gpu_cases(validation)
                 validation.case("agent-cancel", validation.chat_cancel_cleanup)
                 validation.case("agent-cancel-recovery", lambda: validation.routed(
                     "agent-cancel-recovery", {"model": args.model, "messages": [
@@ -1160,6 +1164,8 @@ def main():
                         help="Require actual native extension built without the experimental kv-perf feature")
     parser.add_argument("--chat-agent", action="store_true",
                         help="Finite raw Chat output semantics and real synthetic-tool round trips; no model retry")
+    parser.add_argument("--chat-cancel-only", action="store_true",
+                        help="Focused Chat abort/recovery slice; explicitly excludes model semantic matrix")
     parser.add_argument("--worker-vllm-root",
                         help="Explicit shared Worker vllm package directory for on-disk source hashes, not loaded-module attestation")
     parser.add_argument("--output")
@@ -1190,6 +1196,7 @@ def main():
     require(not args.chat_agent or (args.automatic_capabilities and args.production_validation
                                    and args.kv_load_guard),
             "Chat Agent acceptance requires automatic capabilities, production native and raw load-guarded Chat")
+    require(not args.chat_cancel_only or args.chat_agent, "--chat-cancel-only requires --chat-agent")
     require(60 <= args.budget_seconds <= 1800, "matrix budget must be 60..1800 seconds")
     def interrupted(_signal, _frame):
         raise KeyboardInterrupt("supervised matrix interrupted")

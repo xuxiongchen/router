@@ -368,10 +368,12 @@ def first_nonterminal_sse(response):
     raise RuntimeError("no complete nonterminal SSE record")
 
 
-def matching_abort_lines(text, response_id, worker_pid):
-    # One Completion prompt/n=1 yields response.id + '-0'. Stock vLLM may add
+def matching_abort_lines(text, response_id, worker_pid, *, chat=False):
+    # One Completion prompt/n=1 yields response.id + '-0'; single-input Chat
+    # uses response.id directly (pinned OpenAIServingChat create_chat_completion).
+    # Stock vLLM may add
     # exactly eight hex characters for its internal ID; never substring-match.
-    request_id = re.compile(re.escape(response_id) + r"-0(?:-[0-9a-f]{8})?")
+    request_id = re.compile(re.escape(response_id) + ("" if chat else "-0") + r"(?:-[0-9a-f]{8})?")
     matched = []
     for line in text.splitlines():
         clean = ANSI.sub("", line)
@@ -667,7 +669,8 @@ class Validation:
                         stream.seek(log["offset"])
                         tail = stream.read().decode(errors="replace")
                     (self.out / f"{name}.worker{index}.log").write_text(tail)
-                    matches[index] = matching_abort_lines(tail, event["id"], log["worker_pid"])
+                    matches[index] = matching_abort_lines(tail, event["id"], log["worker_pid"],
+                                                          chat="messages" in payload)
                 evidence["matching_abort_log_lines"] = matches
                 if log_offsets:
                     proof = bool(matches[target]) and not matches[1 - target]
@@ -913,6 +916,15 @@ def self_check():
         abort_line = "(APIServer pid=123) INFO [async_llm.py:836] Aborted request(s) cmpl-fixture-0-97467303."
         require(matching_abort_lines(abort_line, "cmpl-fixture", 123) == [abort_line],
                 "exact vLLM internal abort ID was not recognized")
+        chat_abort = abort_line.replace("cmpl-fixture-0", "chatcmpl-fixture")
+        require(matching_abort_lines(chat_abort, "chatcmpl-fixture", 123, chat=True) == [chat_abort],
+                "single-input Chat abort ID was not recognized")
+        for bad in (chat_abort.replace("fixture", "fixture-extra"),
+                    chat_abort.replace("97467303", "974673031"),
+                    chat_abort.replace("pid=123", "pid=124"),
+                    chat_abort.replace("fixture-", "fixture-0-")):
+            require(not matching_abort_lines(bad, "chatcmpl-fixture", 123, chat=True),
+                    "wrong Chat request/worker abort accepted")
         for wrong_line in (abort_line.replace("cmpl-fixture-0", "cmpl-fixture-extra-0"),
                            abort_line.replace("-0-97467303", "-1-97467303"),
                            abort_line.replace("97467303", "974673031"),
