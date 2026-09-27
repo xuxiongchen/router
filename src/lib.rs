@@ -53,6 +53,7 @@ struct Router {
     kv_events_port: u16,
     kv_events_endpoints: Vec<String>,
     kv_index_max_entries: usize,
+    kv_load_guard: bool,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
     cache_threshold: f32,
@@ -159,11 +160,13 @@ impl Router {
                 default_port: self.kv_events_port,
                 worker_endpoints,
                 index_max_entries: self.kv_index_max_entries,
+                load_guard: self.kv_load_guard,
             }
         } else {
             if self.kv_tokenizer_path.is_some()
                 || self.kv_hash_algo.is_some()
                 || !self.kv_events_endpoints.is_empty()
+                || self.kv_load_guard
             {
                 return Err(config::ConfigError::ValidationFailed {
                     reason: "KV options require policy=kv_aware".into(),
@@ -397,6 +400,7 @@ impl Router {
         kv_events_port = 5557,
         kv_events_endpoints = vec![],
         kv_index_max_entries = 100_000,
+        kv_load_guard = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -473,6 +477,7 @@ impl Router {
         kv_events_port: u16,
         kv_events_endpoints: Vec<String>,
         kv_index_max_entries: usize,
+        kv_load_guard: bool,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
@@ -503,6 +508,7 @@ impl Router {
             kv_events_port,
             kv_events_endpoints,
             kv_index_max_entries,
+            kv_load_guard,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
             cache_threshold,

@@ -127,6 +127,13 @@ class TestKvRenderEntrypoint(unittest.TestCase):
         self.module.Router.from_args(args)
         self.assertEqual(vars(args), before)
 
+    def test_load_guard_is_opt_in_and_forwarded(self):
+        self.assertFalse(self.module.Router.from_args(self.args())._router.kwargs["kv_load_guard"])
+        router = self.module.Router.from_args(self.args(kv_load_guard=True))
+        self.assertTrue(router._router.kwargs["kv_load_guard"])
+        with self.assertRaisesRegex(ValueError, "require policy=kv_aware"):
+            RouterArgs(policy="round_robin", kv_load_guard=True)._validate_router_args()
+
     def test_explicit_matching_overrides_are_permitted(self):
         self.module.Router.from_args(self.args(
             kv_model=self.facade.model, kv_tokenizer_path=self.facade.tokenizer_path,

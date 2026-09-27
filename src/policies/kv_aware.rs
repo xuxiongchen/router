@@ -18,7 +18,12 @@ pub struct KvAwarePolicy {
     generator: BlockKeyGenerator,
     cursor: AtomicUsize,
     dense_reuse: AtomicBool,
+    load_guard: bool,
 }
+
+// Experimental cache-first slack, not a calibrated queueing/cost model. A hot
+// worker may retain one more in-flight request than the least-loaded candidate.
+const CACHE_LOAD_SLACK: usize = 1;
 
 struct CandidateScore {
     worker_index: usize,
@@ -34,11 +39,16 @@ impl KvAwarePolicy {
             generator: BlockKeyGenerator::new(config.block_size, u64::from(config.hash_seed)),
             cursor: AtomicUsize::new(0),
             dense_reuse: AtomicBool::new(false),
+            load_guard: config.load_guard,
         }
     }
 
     pub fn index(&self) -> Arc<KVBlockIndex> {
         self.index.clone()
+    }
+
+    pub(crate) fn load_guard_enabled(&self) -> bool {
+        self.load_guard
     }
 
     /// Enable only after the automatic vLLM capability path has verified Normal,
@@ -85,6 +95,12 @@ impl LoadBalancingPolicy for KvAwarePolicy {
         let index = StageTimer::start("index_candidates");
         let candidates: Vec<_> = get_healthy_worker_indices(workers)
             .into_iter()
+            // Empty but active generations remain legitimate cold targets.
+            // A retired generation must not be revived as a cheap alternative.
+            // The opt-out path deliberately preserves legacy cold fallback.
+            .filter(|&i| {
+                !self.load_guard || self.index.current_generation(workers[i].url()).is_some()
+            })
             .map(|i| {
                 let matched_blocks = self.index.prefix_score(workers[i].url(), &keys);
                 CandidateScore {
@@ -104,14 +120,32 @@ impl LoadBalancingPolicy for KvAwarePolicy {
             })
             .collect();
         drop(index);
-        let best_score = candidates.iter().map(|candidate| candidate.score).max()?;
+        let cache_best_score = candidates.iter().map(|candidate| candidate.score).max()?;
+        let cache_best_load = candidates
+            .iter()
+            .filter(|candidate| candidate.score == cache_best_score)
+            .map(|candidate| candidate.load)
+            .min()?;
+        let min_load = candidates.iter().map(|candidate| candidate.load).min()?;
+        let load_ceiling = min_load.saturating_add(CACHE_LOAD_SLACK);
+        let guarded = self.load_guard && cache_best_load > load_ceiling;
+        // Retain the highest genuine reuse among candidates within the slack;
+        // do not force least-load routing or invent residency on a cold target.
+        let eligible = |candidate: &&CandidateScore| !guarded || candidate.load <= load_ceiling;
+        let best_score = candidates
+            .iter()
+            .filter(eligible)
+            .map(|candidate| candidate.score)
+            .max()?;
         let least_load = candidates
             .iter()
+            .filter(eligible)
             .filter(|candidate| candidate.score == best_score)
             .map(|candidate| candidate.load)
             .min()?;
         let mut tied: Vec<_> = candidates
             .iter()
+            .filter(eligible)
             .filter(|candidate| candidate.score == best_score && candidate.load == least_load)
             .map(|candidate| candidate.worker_index)
             .collect();
@@ -135,6 +169,7 @@ impl LoadBalancingPolicy for KvAwarePolicy {
                         "worker": workers[candidate.worker_index].url(),
                         "prefix_blocks": candidate.matched_blocks,
                         "reusable_prefix_tokens": dense_reuse.then_some(candidate.score),
+                        "inflight": candidate.load,
                     })
                 })
                 .collect();
@@ -153,6 +188,13 @@ impl LoadBalancingPolicy for KvAwarePolicy {
                 "prefix_blocks": selected_candidate.matched_blocks,
                 "reusable_prefix_tokens": dense_reuse.then_some(selected_candidate.score),
                 "score_kind": if dense_reuse { "reusable_prefix_tokens" } else { "stored_prefix_blocks" },
+                "inflight": selected_candidate.load,
+                "cache_best_workers": candidates.iter().filter(|candidate|
+                    candidate.score == cache_best_score && candidate.load == cache_best_load)
+                    .map(|candidate| workers[candidate.worker_index].url()).collect::<Vec<_>>(),
+                "cache_best_inflight": cache_best_load, "minimum_inflight": min_load,
+                "load_guard": guarded,
+                "load_guard_reason": if guarded { "excess_inflight" } else if self.load_guard { "within_slack" } else { "disabled" },
                 "query_tokens": query_tokens, "complete_blocks": keys.len(), "scores": scores,
                 "token_ids_sha256": token_ids_sha256});
             tracing::debug!(decision = %decision, "kv_route_decision");
@@ -189,6 +231,156 @@ mod tests {
             })
             .collect();
         (policy, workers)
+    }
+
+    fn guarded_policy() -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<u32>) {
+        let policy = KvAwarePolicy::new(&KvAwareConfig {
+            load_guard: true,
+            ..KvAwareConfig::default()
+        });
+        policy.enable_dense_reuse();
+        let (_, workers) = dense_policy(16);
+        let ids: Vec<u32> = (0..49).collect();
+        for worker in &workers {
+            policy.index.begin_worker(worker.url());
+        }
+        let generation = policy.index.current_generation(workers[1].url()).unwrap();
+        assert!(policy.index.store(
+            workers[1].url(),
+            generation,
+            &policy.generator.generate_block_keys(&ids),
+        ));
+        (policy, workers, ids)
+    }
+
+    #[test]
+    fn load_guard_keeps_idle_and_near_load_cache_owner() {
+        let (policy, workers, ids) = guarded_policy();
+        for load in 0..=1 {
+            assert_eq!(workers[1].load(), load);
+            assert_eq!(
+                policy.select_worker_with_tokens(&workers, None, Some(&ids), None),
+                Some(1),
+            );
+            workers[1].increment_load();
+        }
+        assert_eq!(
+            policy.select_worker_with_tokens(&workers, None, Some(&ids), None),
+            Some(0),
+        );
+        // Dispatching to a cold worker is not evidence of stored cache blocks.
+        assert_eq!(
+            policy.index.prefix_score(
+                workers[0].url(),
+                &policy.generator.generate_block_keys(&ids)
+            ),
+            0
+        );
+        assert_eq!(policy.index.ownership_count(), 3);
+    }
+
+    #[test]
+    fn load_guard_keeps_best_real_reuse_inside_slack_not_forced_least_load() {
+        let (policy, mut workers, ids) = guarded_policy();
+        let partial = Arc::new(BasicWorker::new(
+            "http://w2:8000".into(),
+            WorkerType::Regular,
+        )) as Arc<dyn Worker>;
+        let generation = policy.index.begin_worker(partial.url());
+        let keys = policy.generator.generate_block_keys(&ids);
+        assert!(policy.index.store(partial.url(), generation, &keys[..2]));
+        partial.increment_load();
+        workers[1].increment_load();
+        workers[1].increment_load();
+        workers.push(partial);
+        assert_eq!(
+            policy.select_worker_with_tokens(&workers, None, Some(&ids), None),
+            Some(2),
+        );
+    }
+
+    #[test]
+    fn load_guard_cold_and_equal_reuse_remain_fair() {
+        let (policy, workers, ids) = guarded_policy();
+        let cold = vec![777; 49];
+        let choices: Vec<_> = (0..4)
+            .map(|_| policy.select_worker_with_tokens(&workers, None, Some(&cold), None))
+            .collect();
+        assert_eq!(choices, [Some(0), Some(1), Some(0), Some(1)]);
+        let generation = policy.index.current_generation(workers[0].url()).unwrap();
+        assert!(policy.index.store(
+            workers[0].url(),
+            generation,
+            &policy.generator.generate_block_keys(&ids)
+        ));
+        let choices: Vec<_> = (0..4)
+            .map(|_| policy.select_worker_with_tokens(&workers, None, Some(&ids), None))
+            .collect();
+        assert_eq!(choices, [Some(0), Some(1), Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn load_guard_never_reintroduces_unhealthy_or_retired_candidates() {
+        let (policy, workers, ids) = guarded_policy();
+        for _ in 0..8 {
+            workers[1].increment_load();
+        }
+        workers[0].set_healthy(false);
+        assert_eq!(
+            policy.select_worker_with_tokens(&workers, None, Some(&ids), None),
+            Some(1)
+        );
+        workers[0].set_healthy(true);
+        policy.index.retire_worker(workers[0].url());
+        assert_eq!(
+            policy.select_worker_with_tokens(&workers, None, Some(&ids), None),
+            Some(1)
+        );
+        policy.index.begin_worker(workers[0].url());
+        assert_eq!(
+            policy.select_worker_with_tokens(&workers, None, Some(&ids), None),
+            Some(0)
+        );
+        policy.index.retire_worker(workers[0].url());
+        policy.index.retire_worker(workers[1].url());
+        assert_eq!(
+            policy.select_worker_with_tokens(&workers, None, Some(&ids), None),
+            None
+        );
+    }
+
+    #[test]
+    fn load_guard_all_busy_and_single_eligible_do_not_queue_or_force_balance() {
+        let (policy, workers, ids) = guarded_policy();
+        for worker in &workers {
+            for _ in 0..20 {
+                worker.increment_load();
+            }
+        }
+        assert_eq!(
+            policy.select_worker_with_tokens(&workers, None, Some(&ids), None),
+            Some(1)
+        );
+        workers[0].set_healthy(false);
+        assert_eq!(
+            policy.select_worker_with_tokens(&workers, None, Some(&ids), None),
+            Some(1)
+        );
+        // The opt-out path is still strict cache affinity, regardless of load.
+        let (legacy, legacy_workers) = dense_policy(16);
+        let generation = legacy.index.begin_worker(legacy_workers[1].url());
+        assert!(legacy.index.store(
+            legacy_workers[1].url(),
+            generation,
+            &legacy.generator.generate_block_keys(&ids)
+        ));
+        for _ in 0..20 {
+            legacy_workers[1].increment_load();
+        }
+        assert_eq!(
+            legacy.select_worker_with_tokens(&legacy_workers, None, Some(&ids), None),
+            Some(1)
+        );
     }
 
     #[test]

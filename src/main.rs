@@ -142,6 +142,9 @@ struct CliArgs {
     kv_events_endpoints: Vec<String>,
     #[arg(long, default_value_t = 100_000, help_heading = "KV Events")]
     kv_index_max_entries: usize,
+    /// Opt-in cache-first protection against excess in-flight load (slack 1).
+    #[arg(long, default_value_t = false, help_heading = "KV Events")]
+    kv_load_guard: bool,
 
     /// Enable Program-level scheduling independently of the request-level
     /// load-balancing policy.
@@ -544,12 +547,14 @@ impl CliArgs {
                     default_port: self.kv_events_port,
                     worker_endpoints,
                     index_max_entries: self.kv_index_max_entries,
+                    load_guard: self.kv_load_guard,
                 }),
             }
         } else {
             if self.kv_tokenizer_path.is_some()
                 || self.kv_hash_algo.is_some()
                 || !self.kv_events_endpoints.is_empty()
+                || self.kv_load_guard
             {
                 return Err(ConfigError::ValidationFailed {
                     reason: "KV options require --policy kv_aware".into(),

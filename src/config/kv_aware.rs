@@ -18,6 +18,9 @@ pub struct KvAwareConfig {
     pub worker_endpoints: HashMap<String, String>,
     /// Hard bound on (worker, block) ownership records.
     pub index_max_entries: usize,
+    /// Opt-in cache-first guard: retain affinity within one excess in-flight
+    /// request of the least-loaded eligible worker. Not a universal cost model.
+    pub load_guard: bool,
 }
 
 impl Default for KvAwareConfig {
@@ -31,6 +34,7 @@ impl Default for KvAwareConfig {
             default_port: 5557,
             worker_endpoints: HashMap::new(),
             index_max_entries: 100_000,
+            load_guard: false,
         }
     }
 }

@@ -333,22 +333,36 @@ impl GenerationRequest for RenderRoutingRequest {
 
 /// Own the selected worker itself, so removal/replacement cannot redirect
 /// cleanup to a different instance with the same URL.
-struct KvLoadLease(Option<Arc<dyn Worker>>);
+struct KvLoadLease {
+    worker: Option<Arc<dyn Worker>>,
+    generation: Option<(Arc<crate::kv_index::KVBlockIndex>, u64)>,
+}
 
 impl KvLoadLease {
     fn new(worker: Arc<dyn Worker>) -> Self {
         worker.increment_load();
         RouterMetrics::set_running_requests(worker.url(), worker.load());
-        Self(Some(worker))
+        Self {
+            worker: Some(worker),
+            generation: None,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        self.generation.as_ref().is_none_or(|(index, generation)| {
+            self.worker.as_ref().is_some_and(|worker| {
+                worker.is_available() && index.current_generation(worker.url()) == Some(*generation)
+            })
+        })
     }
     fn attach(mut self, response: Response) -> Response {
-        hold_load_until_body_done(response, self.0.take().expect("live KV load lease"))
+        hold_load_until_body_done(response, self.worker.take().expect("live KV load lease"))
     }
 }
 
 impl Drop for KvLoadLease {
     fn drop(&mut self) {
-        if let Some(worker) = self.0.take() {
+        if let Some(worker) = self.worker.take() {
             worker.decrement_load();
             RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
@@ -359,6 +373,9 @@ impl Drop for KvLoadLease {
 #[derive(Debug)]
 pub struct Router {
     kv_runtime: Option<KvRuntime>,
+    // Serialize only policy choice and the existing per-attempt increment.
+    // Never hold this guard across render, admission, network or an await.
+    kv_selection: Mutex<()>,
     #[cfg(feature = "kv-perf")]
     kv_perf: Option<KvPerf>,
     worker_registry: Arc<WorkerRegistry>,
@@ -668,6 +685,7 @@ impl Router {
 
         Ok(Router {
             kv_runtime,
+            kv_selection: Mutex::new(()),
             #[cfg(feature = "kv-perf")]
             kv_perf,
             worker_registry: ctx.worker_registry.clone(),
@@ -1378,6 +1396,58 @@ impl Router {
         Some(available[idx].clone())
     }
 
+    fn select_and_reserve_kv(
+        &self,
+        model_id: Option<&str>,
+        select: impl FnOnce() -> Option<Arc<dyn Worker>>,
+    ) -> Option<(Arc<dyn Worker>, KvLoadLease)> {
+        let _selection = self.kv_selection.lock();
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let guarded_index = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+            .filter(|policy| policy.load_guard_enabled())
+            .map(crate::policies::KvAwarePolicy::index);
+        // Bind the subsequent score to the generation observed BEFORE choice.
+        // If a clear/retire/replacement intervenes, fail this bounded attempt
+        // rather than attaching an old-affinity choice to the new generation.
+        let generations: HashMap<_, _> = guarded_index
+            .as_ref()
+            .map(|index| {
+                self.worker_registry
+                    .get_all()
+                    .into_iter()
+                    .filter_map(|worker| {
+                        index
+                            .current_generation(worker.url())
+                            .map(|generation| (worker.url().to_string(), (worker, generation)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let worker = select()?;
+        let lease = if let Some(index) = guarded_index {
+            // Re-check the current generation and reserve under its read fence.
+            // Empty current generations are valid. No network runs here.
+            let (observed_worker, generation) = generations.get(worker.url())?;
+            let generation = *generation;
+            if !Arc::ptr_eq(&worker, observed_worker) || !worker.is_available() {
+                return None;
+            }
+            let mut lease = index.with_current_generation(worker.url(), generation, || {
+                KvLoadLease::new(worker.clone())
+            })?;
+            lease.generation = Some((index, generation));
+            lease
+        } else {
+            KvLoadLease::new(worker.clone())
+        };
+        Some((worker, lease))
+    }
+
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -1501,26 +1571,34 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
-                let selected_worker = if let Some(target) = forced_worker_url {
-                    let worker = self
-                        .worker_registry
-                        .get_by_url(target)
-                        .filter(|worker| worker.is_available());
-                    let Some(worker) = worker else {
-                        return Self::program_target_unavailable_response(route);
-                    };
-                    Some(worker)
+                let select = || {
+                    if let Some(target) = forced_worker_url {
+                        self.worker_registry
+                            .get_by_url(target)
+                            .filter(|worker| worker.is_available())
+                    } else {
+                        self.select_worker_for_model_with_tokens(
+                            model_id,
+                            Some(&text),
+                            headers,
+                            input.as_ref().and_then(|input| input.tokens.as_deref()),
+                        )
+                    }
+                };
+                let (selected_worker, kv_lease) = if self.kv_runtime.is_some() {
+                    match self.select_and_reserve_kv(model_id, select) {
+                        Some((worker, lease)) => (Some(worker), Some(lease)),
+                        None => (None, None),
+                    }
                 } else {
-                    self.select_worker_for_model_with_tokens(
-                        model_id,
-                        Some(&text),
-                        headers,
-                        input.as_ref().and_then(|input| input.tokens.as_deref()),
-                    )
+                    (select(), None)
                 };
                 let worker = match selected_worker {
                     Some(w) => w,
                     None => {
+                        if forced_worker_url.is_some() {
+                            return Self::program_target_unavailable_response(route);
+                        }
                         RouterMetrics::record_request_error(route, "no_available_workers");
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -1537,14 +1615,15 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented =
-                    if policy.name() == "cache_aware" || program_completion.is_some() {
-                        worker.increment_load();
-                        RouterMetrics::set_running_requests(worker.url(), worker.load());
-                        true
-                    } else {
-                        false
-                    };
+                let load_incremented = if self.kv_runtime.is_none()
+                    && (policy.name() == "cache_aware" || program_completion.is_some())
+                {
+                    worker.increment_load();
+                    RouterMetrics::set_running_requests(worker.url(), worker.load());
+                    true
+                } else {
+                    false
+                };
 
                 // Keep a clone for potential cleanup on retry
                 let worker_for_cleanup = if load_incremented {
@@ -1554,6 +1633,23 @@ impl Router {
                 };
 
                 let response = if self.kv_runtime.is_some() {
+                    // Selection and reservation are synchronous; nevertheless a
+                    // concurrent metadata refresh can invalidate the contract.
+                    if let Some(contract) = input.as_ref().and_then(|input| input.contract.as_ref())
+                    {
+                        if !self
+                            .kv_runtime
+                            .as_ref()
+                            .and_then(|runtime| runtime.render_bridge.as_ref())
+                            .is_some_and(|bridge| bridge.is_current(contract))
+                        {
+                            return (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Render contract is no longer current",
+                            )
+                                .into_response();
+                        }
+                    }
                     self.send_kv_request_bytes(
                         headers,
                         typed_req,
@@ -1561,6 +1657,7 @@ impl Router {
                         worker.clone(),
                         is_stream,
                         raw_bytes,
+                        kv_lease.expect("KV selection reserved exactly one lease"),
                     )
                     .await
                 } else {
@@ -1646,10 +1743,12 @@ impl Router {
         worker: Arc<dyn Worker>,
         is_stream: bool,
     ) -> Response {
-        self.send_kv_request_bytes(headers, body, route, worker, is_stream, None)
+        let lease = KvLoadLease::new(worker.clone());
+        self.send_kv_request_bytes(headers, body, route, worker, is_stream, None, lease)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_kv_request_bytes<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -1658,8 +1757,15 @@ impl Router {
         worker: Arc<dyn Worker>,
         is_stream: bool,
         raw_bytes: Option<&[u8]>,
+        lease: KvLoadLease,
     ) -> Response {
-        let lease = KvLoadLease::new(worker.clone());
+        if !lease.is_current() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Worker generation changed before dispatch",
+            )
+                .into_response();
+        }
         let url = format!("{}{}", worker.url().trim_end_matches('/'), route);
         let mut request = match raw_bytes {
             Some(raw) => self
@@ -3529,17 +3635,23 @@ mod tests {
 
     #[tokio::test]
     async fn kv_retry_reuses_exact_tokens_preserves_raw_and_releases_each_lease() {
-        kv_retry_case(false, false, None).await;
+        kv_retry_case(false, false, None, false).await;
     }
 
     #[tokio::test]
     async fn kv_render_bridge_prepares_once_and_retries_original_bytes() {
-        kv_retry_case(true, false, None).await;
+        kv_retry_case(true, false, None, false).await;
     }
 
     #[tokio::test]
     async fn kv_render_bridge_epoch_change_blocks_retry() {
-        kv_retry_case(true, true, None).await;
+        kv_retry_case(true, true, None, false).await;
+    }
+
+    #[tokio::test]
+    async fn kv_load_guard_retry_releases_and_retired_target_stays_excluded() {
+        kv_retry_case(true, false, None, true).await;
+        kv_retry_case(true, true, None, true).await;
     }
 
     #[test]
@@ -3640,8 +3752,8 @@ mod tests {
     #[tokio::test]
     async fn kv_perf_abc_retry_raw_once_and_contract_fencing() {
         for mode in KV_PERF_MODES {
-            kv_retry_case(true, false, Some(mode)).await;
-            kv_retry_case(true, true, Some(mode)).await;
+            kv_retry_case(true, false, Some(mode), false).await;
+            kv_retry_case(true, true, Some(mode), false).await;
         }
     }
 
@@ -3843,6 +3955,7 @@ mod tests {
         use_bridge: bool,
         invalidate_after_first: bool,
         perf_mode: Option<&str>,
+        load_guard: bool,
     ) {
         // Abort only these test-owned servers on both success and assertion
         // failure. The successful path also joins them with a bounded wait.
@@ -3905,7 +4018,10 @@ mod tests {
             publishers.push(publisher);
         }
 
-        let config = crate::config::KvAwareConfig::default();
+        let config = crate::config::KvAwareConfig {
+            load_guard,
+            ..Default::default()
+        };
         let mut router = create_test_regular_router();
         router.worker_registry = Arc::new(WorkerRegistry::new());
         router.worker_registry.register(worker0.clone());
@@ -4067,13 +4183,18 @@ mod tests {
         {
             router.kv_perf = None;
         }
-        // Without exact tokens, the production retry would prefer low-load W0.
+        // Legacy fallback may reuse healthy W0 cold. Guard-on instead excludes
+        // its retired generation, even though its circuit is still available.
         assert_eq!(
             router
                 .select_worker_for_model(None, None, None)
                 .unwrap()
                 .url(),
-            worker0.url()
+            if load_guard {
+                worker1.url()
+            } else {
+                worker0.url()
+            }
         );
 
         if let Some(bridge) = bridge {
@@ -4090,6 +4211,276 @@ mod tests {
                 .expect("test HTTP server shutdown");
             assert!(stopped.unwrap_err().is_cancelled());
         }
+    }
+
+    fn guarded_test_router(
+        workers: &[Arc<dyn Worker>],
+    ) -> (Router, Arc<crate::kv_index::KVBlockIndex>) {
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                config: Box::new(crate::config::KvAwareConfig {
+                    load_guard: true,
+                    ..Default::default()
+                }),
+            }));
+        let policy = router.policy_registry.get_default_policy();
+        let policy = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+            .unwrap();
+        policy.enable_dense_reuse();
+        let index = policy.index();
+        for worker in workers {
+            router.worker_registry.register(worker.clone());
+            index.begin_worker(worker.url());
+        }
+        router.worker_registry.bind_kv_index(&index);
+        router.kv_runtime = Some(KvRuntime {
+            _pool: None,
+            _capability_pool: None,
+            tokenizer: None,
+            render_bridge: None,
+            model: "synthetic".into(),
+        });
+        router.retry_config.max_retries = 0;
+        router.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        (router, index)
+    }
+
+    #[test]
+    fn kv_load_guard_concurrent_burst_reserves_before_next_choice() {
+        let workers: Vec<Arc<dyn Worker>> = ["http://w0:8000", "http://w1:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(BasicWorker::new(url.into(), WorkerType::Regular)) as Arc<dyn Worker>
+            })
+            .collect();
+        let (router, index) = guarded_test_router(&workers);
+        let ids: Vec<u32> = (0..49).collect();
+        let keys = crate::kv_index::BlockKeyGenerator::new(16, 0).generate_block_keys(&ids);
+        assert!(index.store(
+            workers[1].url(),
+            index.current_generation(workers[1].url()).unwrap(),
+            &keys
+        ));
+        let router = Arc::new(router);
+        let barrier = Arc::new(std::sync::Barrier::new(32));
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let router = router.clone();
+                let barrier = barrier.clone();
+                let ids = ids.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    router
+                        .select_and_reserve_kv(None, || {
+                            router.select_worker_for_model_with_tokens(None, None, None, Some(&ids))
+                        })
+                        .unwrap()
+                        .1
+                })
+            })
+            .collect();
+        // JoinHandle results retain every reservation until this whole burst
+        // has selected; no dispatch completion can accidentally hide the race.
+        let leases: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let loads = [workers[0].load(), workers[1].load()];
+        assert_eq!(loads.iter().sum::<usize>(), 32);
+        assert!(
+            loads[0] > 0,
+            "the busy owner must not receive the entire burst"
+        );
+        assert!(
+            loads[1] >= loads[0],
+            "cache preference is preserved within slack"
+        );
+        assert!(
+            loads[1] <= loads[0] + 2,
+            "each next choice sees prior reservations"
+        );
+        assert_eq!(index.ownership_count(), 3);
+        assert_eq!(index.prefix_score(workers[0].url(), &keys), 0);
+        drop(leases);
+        assert_eq!([workers[0].load(), workers[1].load()], [0, 0]);
+    }
+
+    #[tokio::test]
+    async fn kv_load_guard_generation_change_before_dispatch_releases_lease() {
+        let worker = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:1".into(),
+            WorkerType::Regular,
+        )) as Arc<dyn Worker>;
+        let (router, index) = guarded_test_router(std::slice::from_ref(&worker));
+        let no_lease = router.select_and_reserve_kv(None, || {
+            let selected =
+                router.select_worker_for_model_with_tokens(None, None, None, Some(&[1; 33]));
+            let old = index.current_generation(worker.url()).unwrap();
+            index.roll_worker(worker.url(), old).unwrap();
+            selected
+        });
+        assert!(
+            no_lease.is_none(),
+            "a score must not be rebound to a newer generation"
+        );
+        assert_eq!(worker.load(), 0);
+        let (_, lease) = router
+            .select_and_reserve_kv(None, || Some(worker.clone()))
+            .unwrap();
+        assert_eq!(worker.load(), 1);
+        let old = index.current_generation(worker.url()).unwrap();
+        index.roll_worker(worker.url(), old).unwrap();
+        let response = router
+            .send_kv_request_bytes(
+                None,
+                &serde_json::json!({}),
+                "/v1/completions",
+                worker.clone(),
+                false,
+                None,
+                lease,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(worker.load(), 0);
+        assert!(index.current_generation(worker.url()).is_some());
+
+        let (_, lease) = router
+            .select_and_reserve_kv(None, || Some(worker.clone()))
+            .unwrap();
+        let replacement =
+            Arc::new(BasicWorker::new(worker.url().into(), WorkerType::Regular)) as Arc<dyn Worker>;
+        router.worker_registry.register(replacement.clone());
+        assert!(!lease.is_current());
+        drop(lease);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(replacement.load(), 0);
+        assert_eq!(index.current_generation(worker.url()), None);
+    }
+
+    #[tokio::test]
+    async fn kv_load_guard_completion_chat_json_sse_and_timeout_share_lease() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/completions",
+                axum::routing::post(|| async { "complete" }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async { "complete" }),
+            )
+            .route(
+                "/error",
+                axum::routing::post(|| async { StatusCode::BAD_REQUEST }),
+            )
+            .route(
+                "/timeout",
+                axum::routing::post(|| async { std::future::pending::<StatusCode>().await }),
+            )
+            .route(
+                "/stream",
+                axum::routing::post(|| async {
+                    Response::new(Body::from_stream(
+                        futures_util::stream::once(async {
+                            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: {}\n\n"))
+                        })
+                        .chain(futures_util::stream::pending()),
+                    ))
+                }),
+            );
+        let (worker, server) = kv_test_server(app).await;
+        for (route, stream, expected) in [
+            ("/v1/completions", false, StatusCode::OK),
+            ("/v1/chat/completions", false, StatusCode::OK),
+            ("/v1/completions", true, StatusCode::OK),
+            ("/error", true, StatusCode::BAD_REQUEST),
+            ("/timeout", false, StatusCode::BAD_GATEWAY),
+            ("/stream", true, StatusCode::OK),
+        ] {
+            let (router, _) = guarded_test_router(std::slice::from_ref(&worker));
+            let request = RenderRoutingRequest {
+                model: None,
+                stream,
+            };
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                router.route_request_with_tokens(None, &request, route, None, Some(vec![1; 33])),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), expected, "{route}");
+            if stream && expected.is_success() {
+                assert_eq!(worker.load(), 1, "headers do not finish the lease");
+                if route == "/stream" {
+                    drop(response);
+                } else {
+                    assert_eq!(
+                        to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+                        b"complete"
+                    );
+                }
+            } else {
+                drop(response);
+            }
+            assert_eq!(worker.load(), 0, "{route}");
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn kv_load_guard_cancel_before_headers_releases_reservation() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = entered.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let notify = notify.clone();
+                async move {
+                    notify.notify_one();
+                    std::future::pending::<StatusCode>().await
+                }
+            }),
+        );
+        let (worker, server) = kv_test_server(app).await;
+        let (mut router, _) = guarded_test_router(std::slice::from_ref(&worker));
+        router.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let request = RenderRoutingRequest {
+            model: None,
+            stream: true,
+        };
+        let task = tokio::spawn(async move {
+            router
+                .route_request_with_tokens(
+                    None,
+                    &request,
+                    "/v1/chat/completions",
+                    None,
+                    Some(vec![1; 33]),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(worker.load(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(worker.load(), 0);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -4175,6 +4566,7 @@ mod tests {
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
             kv_runtime: None,
+            kv_selection: Mutex::new(()),
             #[cfg(feature = "kv-perf")]
             kv_perf: None,
             worker_registry,
@@ -4209,6 +4601,7 @@ mod tests {
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
             kv_runtime: None,
+            kv_selection: Mutex::new(()),
             #[cfg(feature = "kv-perf")]
             kv_perf: None,
             worker_registry,
@@ -4476,6 +4869,7 @@ mod tests {
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
             kv_runtime: None,
+            kv_selection: Mutex::new(()),
             #[cfg(feature = "kv-perf")]
             kv_perf: None,
             worker_registry,

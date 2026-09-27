@@ -38,6 +38,7 @@ class RouterArgs:
     kv_events_port: int = 5557
     kv_events_endpoints: List[str] = dataclasses.field(default_factory=list)
     kv_index_max_entries: int = 100_000
+    kv_load_guard: bool = False
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
@@ -198,6 +199,10 @@ class RouterArgs:
             help="Repeat WORKER_URL=KV_EVENT_ENDPOINT; existing port fallback remains supported",
         )
         parser.add_argument(f"--{prefix}kv-index-max-entries", type=int, default=100_000)
+        parser.add_argument(
+            f"--{prefix}kv-load-guard", action="store_true", default=False,
+            help="Opt-in cache-first load guard with one excess in-flight request of slack",
+        )
         parser.add_argument(
             f"--{prefix}prefill-policy",
             type=str,
@@ -620,7 +625,7 @@ class RouterArgs:
                 raise ValueError("native kv_aware requires kv_tokenizer_path")
         elif (self.kv_tokenizer_path is not None or self.kv_model is not None
               or self.kv_hash_algo is not None or self.kv_block_size is not None
-              or self.kv_events_endpoints):
+              or self.kv_events_endpoints or self.kv_load_guard):
             raise ValueError("KV input/event options require policy=kv_aware")
 
         # Validate configuration based on mode
