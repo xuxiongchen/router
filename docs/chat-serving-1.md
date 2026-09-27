@@ -2,20 +2,22 @@
 
 ## Scope and status
 
-CPU acceptance is implemented and executed. **Real model / GPU acceptance is
-NOT RUN in this increment yet: fresh authorization is required.** Chat was
+CPU acceptance and the newly authorized finite real-model GPU acceptance are
+executed; see [GPU results and retained failure](chat-serving-1-gpu-results.md). Chat was
 already supported; this change does not implement or advertise Chat tokens-in/out.
 
 Dependency base: `98c024e81b67a0eba85e7312cc07ad0c6b248566` (Perf-2 documentation
 HEAD). New branch: `codex/cmb-chat-serving-1`. Frozen branches remain unchanged.
 Only public acceptance helpers/tests and documentation change. No production
 renderer, Rust parser, Worker protocol, model whitelist or scheduling change.
-Final tested acceptance source: `25089b9d0d1f06c60093463d089133ecdd57c81b`;
-subsequent documentation commits do not change those executable tests.
+CPU semantic replay was rerun at `a64c7d111eb8a80c6bd1e9dfe0078026dbe0bf79`.
+GPU semantic matrix uses that SHA; focused abort/recovery and performance use
+`1763ecf0192b4228b5599a8e11a67d2348e3653a`. The latter only fixes the test
+log matcher and adds a focused test slice; no production code changed.
 
 The separately attached Release-Closeout task is not executed implicitly. Its
-remaining full-CI/publication gates still apply. No GPU, SSH, Worker patch
-installation, push or PR was performed for this CPU increment.
+remaining full-CI/publication gates still apply. A fresh GPU window followed the
+CPU handoff. No Worker patch installation, push or PR was performed.
 
 ## Evidence layers and supported contract
 
@@ -37,12 +39,12 @@ altering the production parser.
 
 | Text case | Actual CPU input/render | Official JSON/SSE replay | Router transport | Real model |
 | --- | --- | --- | --- | --- |
-| String, text-parts, Unicode, history | PASS, inherited actual renderer corpus rerun | PASS Unicode at steps 1/3/11 | Existing raw path; SDK wire replay PASS | NOT RUN |
-| Auto, required, named tools | PASS selected configuration | PASS, official structural-tag semantics | SDK auto-tool JSON/SSE PASS | NOT RUN |
-| Multiple tool calls and actual tool results in history | PASS replay follow-up inputs | PASS; unique IDs, validated arguments, real local addition | Single-call loop JSON/SSE PASS | NOT RUN |
-| Thinking/reasoning and suppression | PASS selected flags/history | PASS, no reasoning leakage into content | Unchanged raw forwarding | NOT RUN |
-| JSON object/schema and structured choice | PASS official preprocessing | PASS actual fixture output validation | Unchanged raw forwarding | NOT RUN; no claim of model grammar compliance |
-| Engine errors / cancelled generator / next request | Not model generation | PASS official output behavior | Existing native lifecycle probes PASS | Chat backend abort/recovery NOT RUN |
+| String, text-parts, Unicode, history | PASS, inherited actual renderer corpus rerun | PASS Unicode at steps 1/3/11 | Existing raw path; SDK wire replay PASS | PASS selected JSON/SSE fixtures |
+| Auto, required, named tools | PASS selected configuration | PASS, official structural-tag semantics | SDK auto-tool JSON/SSE PASS | PASS; 12 direct/Router real tool loops |
+| Multiple tool calls and actual tool results in history | PASS replay follow-up inputs | PASS; unique IDs, validated arguments, real local addition | Single-call loop JSON/SSE PASS | Single-call loop PASS; multiple calls NOT RUN on model |
+| Thinking/reasoning and suppression | PASS selected flags/history | PASS, no reasoning leakage into content | Unchanged raw forwarding | PASS selected flags |
+| JSON object/schema and structured choice | PASS official preprocessing | PASS actual fixture output validation | Unchanged raw forwarding | PASS selected actual outputs, not arbitrary schemas |
+| Engine errors / cancelled generator / next request | Not model generation | PASS official output behavior | Existing native lifecycle probes PASS | Request errors and actual Chat abort/recovery PASS; retained initial matcher failure |
 | Ordinary SDK headers | Not a tokenizer feature | SDK parses official outputs | PASS auth, user-agent, stainless headers and raw body | NOT RUN |
 | n>1, logprobs, other parser/model configurations | Outside this new acceptance slice | NOT RUN | No new API prohibition introduced | NOT RUN |
 | Prepared Chat | Not implemented | Not applicable | Always original body | Not implemented |
@@ -78,7 +80,7 @@ read-only mounts.
 - Existing actual renderer regression: **2 test methods PASS**, covering its
   existing 27 named cases, 2 invalid and 5 unsupported cases; overlapping tests,
   not additional unique model-quality coverage.
-- Existing performance harness: **31 tests PASS**.
+- Existing performance harness plus the 128/32/four-repeat fixture: **32 tests PASS**.
 - Existing render GPU runner and CUDA helper CPU self-checks: PASS. An initial
   invocation used `--self-check` for the older helper; its documented positional
   `self-check` invocation then passed. Preserve the initial usage error.
@@ -138,7 +140,7 @@ python scripts/kv_aware_cuda_validate.py self-check
 Without the opt-in variables, dependency-free helper tests run and optional
 tests explicitly SKIP. Do not report these skips as real-vLLM acceptance.
 
-## GPU next step (fresh permission required)
+## Reproduce GPU acceptance (new permission required for another window)
 
 **One NVIDIA GPU with 24–32 GiB is sufficient for the proposed correctness
 window**, with two exclusive independent DP=1/TP=1 Workers sharing that card.
@@ -162,7 +164,7 @@ Add these switches to the existing `render_bridge_gpu_validate.py` command from
 --automatic-capabilities --production-validation --kv-load-guard --chat-agent
 ```
 
-`--native-source-candidate` checks ancestry and permits only docs/Python tests/three reviewed harness files
+`--native-source-candidate` checks ancestry and permits only docs/Python tests/four reviewed harness files
 differences; any product/build-input change requires a new build. The build
 manifest still names the actual old native source. The report records both
 harness and native identities. No old manifest is rewritten.
@@ -184,7 +186,8 @@ is asserted retroactively from successful samples.
 
 ## Remaining gates
 
-Real model tool loops, output grammar compliance, actual Chat cancellation and
-Worker token/counter evidence; complete applicable CI; human authorship/license
-and semantic review; upstream interface coordination; publication approval.
+Complete applicable CI; broader models/parser combinations and real multiple-call
+coverage; human authorship/license and semantic review; upstream interface
+coordination; publication approval. The finite Qwen3-0.6B GPU slice is now
+recorded separately, not generalized to all Agent behavior.
 See `chat-serving-1-reuse-route.md` for why prepared Chat is not enabled.

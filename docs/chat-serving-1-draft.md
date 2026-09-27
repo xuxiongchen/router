@@ -1,6 +1,6 @@
 # Draft: source-backed text Chat / Agent acceptance on the raw serving path
 
-**Draft preparation only; not submitted. GPU/model evidence is pending.**
+**Draft preparation only; not submitted. Finite CPU/GPU evidence recorded.**
 
 Base: Perf-2 `98c024e81b67a0eba85e7312cc07ad0c6b248566`.
 Do not close Router RFC #294 or #295 with this bounded increment.
@@ -25,7 +25,7 @@ No production Rust/Python module, dependency lock or default changes.
 
 ## Validation
 
-CPU: 14 new test methods; 31 existing harness tests; official renderer regression
+CPU: 14 new test methods; 32 performance harness tests; official renderer regression
 with its 27 named cases and negative cases; three actual native lifecycle scenarios;
 helper self-checks. These are overlapping evidence layers, not a combined unique
 model-coverage count. Changed-file Ruff and newly added Python Black checks pass.
@@ -36,8 +36,17 @@ Production native source is still `2a0d179ec5413f5486dd9dbd2cf8cb6bb22a9110`;
 SHA-256 `f17ccc17cc343b5cea68145a3e73d6442cbd38e2413f6f9a75606a23928e683b`.
 No rebuild was necessary for test/document-only changes.
 
-Real model tool competence, generation grammar compliance, actual GPU Worker
-input/abort metrics and any new performance claim: **NOT RUN**, pending permission.
+Real Qwen3-0.6B: 62 initial cases pass, including 12 actual direct/Router tool
+loops; initial cancellation evidence matcher fails and remains in the record.
+Source-backed matcher correction passes focused abort/recovery (two cases).
+No model retry-to-success. Same production native, no production code changes.
+
+One cold-start 128-request / 32-prefix / four-occurrence Chat round compares true
+RR, cache_aware and CL; 384/384 requests succeed. CL does not outperform RR:
+TTFT p50 83.63 vs 70.71 ms; output throughput 200.95 vs 202.99 tokens/s.
+cache_aware is 209.86 tokens/s with TTFT p50 72.66 ms. These are one shared-GPU
+synthetic measurements, not a general acceleration or statistical claim.
+See [exact provenance, failure, results and reproduction](chat-serving-1-gpu-results.md).
 
 ## Prepared input decision
 
