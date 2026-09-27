@@ -24,9 +24,11 @@ serving or rely on background metadata polling to make token input safe.
 
 Both GPU runners require a clean checkout whose HEAD equals the candidate and
 build-manifest candidate, plus the actual native hash. A later documentation-only
-HEAD is not the SHA compiled into an earlier wheel: retain its original manifest
-and build the GPU candidate at the new exact checkout SHA. Never relabel an old
-native artifact as a newly compiled candidate.
+HEAD is not the SHA compiled into an earlier wheel. Either deploy the original
+clean compiled candidate with its original wheel/manifest and verify its actual
+installation, or rebuild at the newly selected exact checkout SHA. Never relabel
+an old native artifact as a newly compiled candidate. The finite run is
+documented in [GPU results](kv-perf-2-gpu-results.md).
 
 ## Arms and artifacts
 

@@ -3,6 +3,11 @@
 This is CPU functionality/build evidence, **not a GPU or performance result**.
 Both production increments default off. No push or PR publication was performed.
 
+The pending GPU statements below describe the CPU-stage handoff. Subsequent
+authorized hardware evidence is reported separately in
+[Perf-2 GPU results](kv-perf-2-gpu-results.md); it does not change these CPU counts
+or relabel the compiled candidate.
+
 ## Source and build identity
 
 - Base: `6b17f5a54f4713bdf75474d2b40131fafd8fd499` (its runtime is unchanged
