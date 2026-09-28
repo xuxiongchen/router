@@ -61,6 +61,15 @@ with 75:75 request allocation, but mean TTFT remained higher. Standalone
 cache_aware had lower TTFT but allocated 150:0. No stable speedup, history
 causality or saturated-capacity claim is made from one trial per policy.
 
+The [10240-input C=1/C=2 follow-up](rfc295-b1-benchmark-10240.md) passed all
+eight 150-request arms with the same production native. KV improved mean TTFT
+versus same-concurrency RR but did not improve total throughput materially;
+C=2 throughput and P99 TTFT regressed. Worker prefill savings and per-node
+hit/allocation counters are recorded separately. A source audit also clarified
+that standalone cache_aware Chat uses session_id/empty routing text for these
+session-less official requests, not message-prefix matching. No policy code
+was changed, and the earlier single-node-affinity explanation was corrected.
+
 Before posting: resolve the integration base/interface assignment, handle
 outstanding CI gates, and complete human correctness, authorship/license and
 release review. Hardware acceptance is limited to the explicitly recorded slice.

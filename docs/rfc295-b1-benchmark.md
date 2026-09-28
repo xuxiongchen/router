@@ -108,9 +108,14 @@ short scheduling wait ever occurred. Router load counters remain unknown.
 
 - Relative to RR, standalone cache_aware had 12.98% lower mean TTFT, 1.84%
   higher output throughput and 1.81% lower mean E2E, but sent all requests to
-  Worker 0. Existing low-match `min_by_key(worker.load())` selection prefers
-  the first eligible Worker when serial requests leave both idle; affinity
-  retains repeated prefixes there. No balancing modification was introduced.
+  Worker 0. Follow-up source audit during the 10240-input comparison clarified
+  that Chat `extract_text_for_routing()` supplies session_id or an empty string,
+  not message text. This official client supplies no session_id, so there is
+  no message-prefix match: low-match `min_by_key(worker.load())` prefers the
+  first eligible Worker when serial requests leave both idle. Repeats benefit
+  from incidental single-node locality, not demonstrated string-prefix
+  recognition. This corrects the earlier affinity explanation without changing
+  the measurements. No balancing modification was introduced.
 - KV routing doubled physical token-hit rate from 28.83% to 57.66% while
   distributing 75 requests to each Worker. Nonetheless its mean TTFT was
   9.68% higher than RR, throughput 0.47% lower and E2E 0.47% higher. Better
