@@ -183,6 +183,8 @@ def child(manifest_path):
         host="127.0.0.1", port=config["router_port"], worker_urls=config["workers"],
         policy="kv_aware", kv_input_backend="vllm", kv_render_config=config["render_config"],
         kv_load_guard=config.get("kv_load_guard", False),
+        kv_fallback_policy="cache_aware" if config.get("exact_history_only") else "least_load",
+        kv_fallback_history_ttl_secs=60,
         kv_completion_token_input=config.get("kv_completion_token_input", False),
         # Automatic mode must obtain hash/unit defaults from actual Workers,
         # and each verified subscriber obtains its epoch-bound exact topic.
@@ -431,6 +433,43 @@ def positive_payload(model, name, kind, stream=False, *, nonce=None):
 
 
 class Validation(prior.Validation):
+    def exact_history(self):
+        """Six finite requests: advisory affinity with real zero-block inputs."""
+        count = min(3, self.args.block_size - 2)
+        require(count > 0, "history fixture requires block size >= 3")
+        rng = random.Random(295)
+        owners = []
+        rows = []
+        for prefix in range(2):
+            ids = rng.sample(self.args.fixture_vocabulary, count)
+            owner = None
+            for repetition in range(3):
+                name = f"history-p{prefix}-r{repetition}"
+                result = self.routed(name, {
+                    "model": self.model, "prompt": ids, "add_special_tokens": False,
+                    "max_tokens": 1, "temperature": 0, "stream": repetition == 2,
+                }, cold=True)
+                decision = result["decision"]
+                require(result["actual_generation_token_ids"] == ids,
+                        "short-input fixture differs from actual Worker tokens")
+                require(decision["reusable_prefix_tokens"] == 0 and decision["history_reserved"],
+                        "history must reserve without manufacturing reusable tokens")
+                expected_stage = "least_load" if repetition == 0 else "exact_history"
+                require(decision["stage"] == expected_stage, "unexpected history decision stage")
+                commit_log = (self.out / f"{name}.router.log").read_text()
+                require("kv_history_commit" in commit_log and "committed=true" in commit_log,
+                        "Regular history commit observation is absent")
+                if owner is None:
+                    owner = result["actual_backend"]
+                    owners.append(owner)
+                require(result["actual_backend"] == owner, "advisory repeat selected another Worker")
+                rows.append({"case": name, "worker": owner, "stage": decision["stage"],
+                             "history_matched_tokens": decision["history_matched_tokens"],
+                             "reusable_tokens": 0, "worker_request_deltas": result["completed_request_deltas"]})
+        require(len(set(owners)) == 2, "cold exact misses must retain the fair cursor")
+        return {"name": "exact_history", "status": "PASS", "requests": rows,
+                "scope": "six real Completion JSON/SSE requests, zero full input blocks; not Chat quality or performance"}
+
     def __init__(self, args, out):
         super().__init__(args, out)
         self.observations = out / "facade-observations.jsonl"
@@ -883,6 +922,7 @@ def run(args):
                   "serving_args": deployment["serving_args"],
                   "automatic_capabilities": args.automatic_capabilities,
                   "kv_load_guard": args.kv_load_guard,
+                  "exact_history_only": args.exact_history_only,
                   "kv_completion_token_input": args.kv_completion_token_input,
                   "production_validation": args.production_validation,
                   "native_mode_identity": str(out / "native-mode-identity.json"),
@@ -907,6 +947,7 @@ def run(args):
                       build_manifest_sha256=prior.sha256(args.build_manifest),
                       render_config_sha256=prior.sha256(args.render_config), workers=worker_processes,
                       kv_load_guard=args.kv_load_guard,
+                      exact_history_only=args.exact_history_only,
                       kv_completion_token_input=args.kv_completion_token_input,
                       production_validation=args.production_validation,
                       python=sys.version, platform=platform.platform(),
@@ -940,7 +981,9 @@ def run(args):
             else:
                 from test_render_bridge_vllm import actual_cases
                 shape_cases = actual_cases(args.model)
-            cancel_only = args.chat_cancel_only
+            cancel_only = args.chat_cancel_only or args.exact_history_only
+            if args.exact_history_only:
+                validation.case("exact_history", validation.exact_history)
             for name, _, payload in ([] if cancel_only else shape_cases):
                 validation.case("tokens-" + name, lambda name=name, payload=payload:
                                 validation.routed("tokens-" + name, payload))
@@ -1151,6 +1194,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--child")
     parser.add_argument("--self-check", action="store_true")
+    parser.add_argument("--exact-history-only", action="store_true",
+                        help="Only six zero-HBM exact-history requests; requires automatic capabilities and production native")
     parser.add_argument("--source", default=str(ROOT))
     parser.add_argument("--candidate")
     parser.add_argument("--native-source-candidate",
@@ -1201,6 +1246,9 @@ def main():
                                    and args.kv_load_guard),
             "Chat Agent acceptance requires automatic capabilities, production native and raw load-guarded Chat")
     require(not args.chat_cancel_only or args.chat_agent, "--chat-cancel-only requires --chat-agent")
+    require(not args.exact_history_only or (args.automatic_capabilities and args.production_validation
+            and not args.chat_agent and not args.kv_completion_token_input),
+            "history-only requires production automatic capabilities; no Chat/CT matrix")
     require(60 <= args.budget_seconds <= 1800, "matrix budget must be 60..1800 seconds")
     def interrupted(_signal, _frame):
         raise KeyboardInterrupt("supervised matrix interrupted")

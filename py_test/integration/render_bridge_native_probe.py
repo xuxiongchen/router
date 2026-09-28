@@ -127,9 +127,11 @@ def child(config_path):
         kv_tokenizer_path=str(config_path),  # unused: synthetic bridge replaces native tokenizer
         kv_model="synthetic-probe", kv_hash_algo="sha256_cbor",
         kv_events_endpoints=config["endpoints"], worker_startup_timeout_secs=10,
-        worker_startup_check_interval=1, log_level="warn", disable_retries=True,
+        worker_startup_check_interval=1, log_level="debug" if config.get("kv_exact_history") else "warn", disable_retries=True,
         health_check_interval_secs=60, prometheus_host="127.0.0.1",
         prometheus_port=config["metrics_port"],
+        **({"kv_fallback_policy": "cache_aware", "kv_fallback_history_ttl_secs": 60,
+            "max_tree_size": 4096} if config.get("kv_exact_history") else {}),
         **({"kv_load_guard": config["kv_load_guard"],
             "kv_completion_token_input": config["kv_completion_token_input"]}
            if config.get("kv_load_guard") or config.get("kv_completion_token_input") else {}),
@@ -312,7 +314,7 @@ def require_complete_metrics(port):
     return values if set(values) == {"raw", "prepared", "ingress", "backend"} else None
 
 
-def run_case(name, extension, output, *, kv_load_guard=False, kv_completion_token_input=False):
+def run_case(name, extension, output, *, kv_load_guard=False, kv_completion_token_input=False, kv_exact_history=False):
     case_dir = output / name
     case_dir.mkdir()
     event_path = case_dir / "events.jsonl"
@@ -323,6 +325,7 @@ def run_case(name, extension, output, *, kv_load_guard=False, kv_completion_toke
                       port=free_port(), deadline_ms=100 if name == "deadline" else 2000,
                       metrics_port=free_port(),
                       kv_load_guard=kv_load_guard, kv_completion_token_input=kv_completion_token_input,
+                      kv_exact_history=kv_exact_history,
                       cohort=({"workers": workers.descriptors, "api_key_env": None}
                               if kv_completion_token_input else None),
                       endpoints=workers.endpoints)
@@ -446,6 +449,14 @@ def run_case(name, extension, output, *, kv_load_guard=False, kv_completion_toke
                 "heartbeat leaked after native start returned")
         forwarded = [e for e in observed if e["event"] == "worker_request"]
         if name == "json_sse":
+            if kv_exact_history and not kv_completion_token_input:
+                require(len({e["worker"] for e in forwarded}) == 1,
+                        "equivalent exact Completion/Chat did not share advisory history")
+                router_log = (case_dir / "router.log").read_text()
+                require('"stage":"exact_history"' in router_log
+                        and '"prefix_blocks":0' in router_log
+                        and "kv_history_commit" in router_log,
+                        "missing actual native zero-ownership history/commit decision")
             require(len(starts) == len(payloads) and {e["kind"] for e in starts} == {"completion", "chat"},
                     "did not exercise both raw ingress types")
             require(len(forwarded) == len(payloads), "unexpected dispatch/replay count")
@@ -485,6 +496,7 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--child", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--kv-load-guard", action="store_true")
+    parser.add_argument("--kv-exact-history", action="store_true")
     parser.add_argument("--kv-completion-token-input", action="store_true")
     args = parser.parse_args()
     if args.child:
@@ -499,13 +511,15 @@ def main():
                     claims_excluded=["actual vLLM rendering", "KV events/hits", "GPU", "TTFT"],
                     extension=str(extension), extension_sha256=sha256(extension),
                     kv_load_guard=args.kv_load_guard, kv_completion_token_input=args.kv_completion_token_input,
+                    kv_exact_history=args.kv_exact_history,
                     capability_evidence=("synthetic descriptor via real Rust control plane"
                         if args.kv_completion_token_input else "legacy synthetic transport only"),
                     harness_sha256=sha256(__file__), python=sys.version, cases=[])
     try:
         for name in ("json_sse", "deadline", "disconnect"):
             manifest["cases"].append(run_case(name, extension, output,
-                kv_load_guard=args.kv_load_guard, kv_completion_token_input=args.kv_completion_token_input))
+                kv_load_guard=args.kv_load_guard, kv_completion_token_input=args.kv_completion_token_input,
+                kv_exact_history=args.kv_exact_history))
         require(sha256(extension) == manifest["extension_sha256"], "native artifact changed during probe")
         manifest["status"] = "PASS"
     except Exception as error:

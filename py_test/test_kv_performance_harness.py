@@ -823,5 +823,52 @@ class PerformanceContractTests(unittest.TestCase):
         self.assertEqual(save.call_args.args[1], rows)
 
 
+class ExactHistoryHardwareEntryTests(unittest.TestCase):
+    def test_finite_history_entry_is_six_requests_and_rejects_fake_reuse(self):
+        for fake_reuse in (False, True):
+            calls = []
+
+            def routed(name, payload, **kwargs):
+                number = len(calls)
+                calls.append((name, payload, kwargs))
+                return {
+                    "actual_generation_token_ids": payload["prompt"],
+                    "actual_backend": number // 3,
+                    "completed_request_deltas": [int(number < 3), int(number >= 3)],
+                    "decision": {
+                        "reusable_prefix_tokens": 16 if fake_reuse else 0,
+                        "history_reserved": True,
+                        "stage": "least_load" if number % 3 == 0 else "exact_history",
+                        "history_matched_tokens": 0 if number % 3 == 0 else 3,
+                    },
+                }
+
+            fixture = SimpleNamespace(
+                args=SimpleNamespace(
+                    block_size=16, fixture_vocabulary=list(range(256))
+                ),
+                out=Path("/synthetic-evidence"),
+                model="public-fixture",
+                routed=routed,
+            )
+            with patch.object(
+                Path, "read_text", return_value="kv_history_commit committed=true"
+            ):
+                if fake_reuse:
+                    with self.assertRaises(Exception):
+                        perf.acceptance.Validation.exact_history(fixture)
+                    self.assertEqual(len(calls), 1)
+                else:
+                    result = perf.acceptance.Validation.exact_history(fixture)
+                    self.assertEqual(result["status"], "PASS")
+                    self.assertEqual(len(calls), 6)
+                    self.assertEqual(
+                        sum(bool(payload["stream"]) for _, payload, _ in calls), 2
+                    )
+                    self.assertTrue(
+                        all(options == {"cold": True} for _, _, options in calls)
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
