@@ -64,6 +64,38 @@ def _facade():
 
 
 class TestKvRenderEntrypoint(unittest.TestCase):
+    def test_exact_history_args_and_native_kwargs_are_opt_in(self):
+        self.assertEqual(RouterArgs().kv_fallback_policy, "least_load")
+        args = self.args(kv_fallback_policy="cache_aware", kv_fallback_history_ttl_secs=45,
+                         max_tree_size=1024, cache_threshold=0.7, kv_load_guard=True)
+        router = self.module.Router.from_args(args)
+        for key in ("kv_fallback_policy", "kv_fallback_history_ttl_secs", "max_tree_size",
+                    "cache_threshold", "kv_load_guard"):
+            self.assertEqual(router._router.kwargs[key], getattr(args, key))
+        for overrides in ({"kv_fallback_policy": "unknown"},
+                          {"kv_fallback_policy": "cache_aware", "kv_fallback_history_ttl_secs": 0},
+                          {"policy": "round_robin", "kv_fallback_policy": "cache_aware"}):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                self.args(**overrides)._validate_router_args()
+
+    def test_exact_history_cli_round_trip(self):
+        for prefix in ("", "router-"):
+            parser = argparse.ArgumentParser()
+            RouterArgs.add_cli_args(parser, use_router_prefix=bool(prefix))
+            argv = [
+                f"--{prefix}policy", "kv_aware",
+                f"--{prefix}kv-tokenizer-path", "/public/tokenizer.json",
+                f"--{prefix}kv-hash-algo", "sha256_cbor",
+                f"--{prefix}kv-fallback-policy", "cache_aware",
+                f"--{prefix}kv-fallback-history-ttl-secs", "45",
+            ]
+            if not prefix:
+                argv.extend(["--worker-urls", "http://127.0.0.1:8000"])
+            namespace = parser.parse_args(argv)
+            args = RouterArgs.from_cli_args(namespace, use_router_prefix=bool(prefix))
+            self.assertEqual(args.kv_fallback_policy, "cache_aware")
+            self.assertEqual(args.kv_fallback_history_ttl_secs, 45)
+
     def setUp(self):
         self.module = _wrapper()
         self.facade = _facade()

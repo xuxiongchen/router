@@ -1,5 +1,9 @@
 //! Real-event prefix affinity, with fair least-load fallback on a cold miss.
 
+use super::exact_history::{
+    ExactHistoryStore, HistoricalRoutingRequest, HistoricalSelectionStage, HistoryReservation,
+    ProcessTokenizerContractId,
+};
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
 use crate::config::KvAwareConfig;
 use crate::core::Worker;
@@ -19,6 +23,8 @@ pub struct KvAwarePolicy {
     cursor: AtomicUsize,
     dense_reuse: AtomicBool,
     load_guard: bool,
+    history: Option<Arc<ExactHistoryStore>>,
+    pub(crate) history_contract: ProcessTokenizerContractId,
 }
 
 // Experimental cache-first slack, not a calibrated queueing/cost model. A hot
@@ -34,8 +40,20 @@ struct CandidateScore {
 
 impl KvAwarePolicy {
     pub fn new(config: &KvAwareConfig) -> Self {
+        let index = Arc::new(KVBlockIndex::new(config.index_max_entries));
+        let history = config.history.enabled.then(|| {
+            Arc::new(
+                ExactHistoryStore::new(config.history.store_config())
+                    .expect("validated exact-history configuration"),
+            )
+        });
+        if let Some(history) = &history {
+            index.attach_history(history.clone());
+        }
         Self {
-            index: Arc::new(KVBlockIndex::new(config.index_max_entries)),
+            index,
+            history,
+            history_contract: ProcessTokenizerContractId::mint(),
             generator: BlockKeyGenerator::new(config.block_size, u64::from(config.hash_seed)),
             cursor: AtomicUsize::new(0),
             dense_reuse: AtomicBool::new(false),
@@ -45,6 +63,15 @@ impl KvAwarePolicy {
 
     pub fn index(&self) -> Arc<KVBlockIndex> {
         self.index.clone()
+    }
+
+    pub(crate) fn history_enabled(&self) -> bool {
+        self.history.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history(&self) -> Option<&Arc<ExactHistoryStore>> {
+        self.history.as_ref()
     }
 
     pub(crate) fn load_guard_enabled(&self) -> bool {
@@ -61,29 +88,14 @@ impl KvAwarePolicy {
     }
 }
 
-/// Pinned Normal Dense semantics, not a general Hybrid/speculative cache rule.
-/// The cap also guarantees multiplication cannot exceed `query_tokens - 1`.
-fn dense_reusable_tokens(matched_blocks: usize, query_tokens: usize, block_size: usize) -> usize {
-    block_size * matched_blocks.min(query_tokens.saturating_sub(1) / block_size)
-}
-
-impl LoadBalancingPolicy for KvAwarePolicy {
-    fn select_worker_with_headers(
+impl KvAwarePolicy {
+    /// Router serializes this selection, reservation and the single load lease.
+    pub(crate) fn select_attempt(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
-        headers: Option<&RequestHeaders>,
-    ) -> Option<usize> {
-        self.select_worker_with_tokens(workers, None, None, headers)
-    }
-
-    fn select_worker_with_tokens(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
         token_ids: Option<&[u32]>,
-        _headers: Option<&RequestHeaders>,
-    ) -> Option<usize> {
+        history_request: Option<&HistoricalRoutingRequest>,
+    ) -> Option<(usize, Option<HistoryReservation>)> {
         let _selector = StageTimer::start("selector_total");
         let hash = StageTimer::start("block_hash");
         let keys = token_ids
@@ -99,7 +111,8 @@ impl LoadBalancingPolicy for KvAwarePolicy {
             // A retired generation must not be revived as a cheap alternative.
             // The opt-out path deliberately preserves legacy cold fallback.
             .filter(|&i| {
-                !self.load_guard || self.index.current_generation(workers[i].url()).is_some()
+                !(self.load_guard || (self.history.is_some() && history_request.is_some()))
+                    || self.index.current_generation(workers[i].url()).is_some()
             })
             .map(|i| {
                 let matched_blocks = self.index.prefix_score(workers[i].url(), &keys);
@@ -153,10 +166,51 @@ impl LoadBalancingPolicy for KvAwarePolicy {
         // A unique cache hit must not consume a fallback turn: alternating
         // hot and cold requests would otherwise always send cold requests to
         // the same worker in a two-worker pool.
-        let selected = if tied.len() == 1 {
-            tied[0]
+        let fallback = || {
+            if tied.len() == 1 {
+                tied[0]
+            } else {
+                tied[self.cursor.fetch_add(1, Ordering::Relaxed) % tied.len()]
+            }
+        };
+        let mut stage = if best_score > 0 { "hbm" } else { "least_load" };
+        let mut matched_history_tokens = 0;
+        let (selected, reservation) = if let Some((history, request)) =
+            self.history.as_ref().zip(history_request)
+        {
+            if best_score > 0 {
+                let selected = fallback();
+                (
+                    selected,
+                    history.reserve_selected(request, &workers[selected]),
+                )
+            } else {
+                // CL remains authoritative: advisory affinity cannot route above
+                // its existing one-request slack when enabled.
+                let eligible_workers: Vec<_> = candidates
+                    .iter()
+                    .filter(|c| !self.load_guard || c.load <= load_ceiling)
+                    .map(|c| workers[c.worker_index].clone())
+                    .collect();
+                let decision = history.select_and_reserve(request, &eligible_workers, || {
+                    let selected = fallback();
+                    eligible_workers
+                        .iter()
+                        .position(|w| Arc::ptr_eq(w, &workers[selected]))
+                })?;
+                stage = match decision.stage {
+                    HistoricalSelectionStage::ExactHistory => "exact_history",
+                    HistoricalSelectionStage::Session => "session",
+                    HistoricalSelectionStage::LeastLoad => "least_load",
+                };
+                matched_history_tokens = decision.matched_tokens;
+                let selected = workers
+                    .iter()
+                    .position(|w| Arc::ptr_eq(w, &eligible_workers[decision.worker_index]))?;
+                (selected, decision.reservation)
+            }
         } else {
-            tied[self.cursor.fetch_add(1, Ordering::Relaxed) % tied.len()]
+            (fallback(), None)
         };
         if tracing::enabled!(tracing::Level::DEBUG) {
             // `prefix_blocks` retains its existing raw stored-coverage meaning.
@@ -187,6 +241,8 @@ impl LoadBalancingPolicy for KvAwarePolicy {
             let decision = serde_json::json!({"worker": workers[selected].url(),
                 "prefix_blocks": selected_candidate.matched_blocks,
                 "reusable_prefix_tokens": dense_reuse.then_some(selected_candidate.score),
+                "stage": stage, "history_matched_tokens": matched_history_tokens,
+                "history_reserved": reservation.is_some(),
                 "score_kind": if dense_reuse { "reusable_prefix_tokens" } else { "stored_prefix_blocks" },
                 "inflight": selected_candidate.load,
                 "cache_best_workers": candidates.iter().filter(|candidate|
@@ -202,7 +258,35 @@ impl LoadBalancingPolicy for KvAwarePolicy {
         workers[selected].increment_processed();
         RouterMetrics::record_processed_request(workers[selected].url());
         RouterMetrics::record_policy_decision(self.name(), workers[selected].url());
-        Some(selected)
+        Some((selected, reservation))
+    }
+}
+
+/// Pinned Normal Dense semantics, not a general Hybrid/speculative cache rule.
+/// The cap also guarantees multiplication cannot exceed `query_tokens - 1`.
+fn dense_reusable_tokens(matched_blocks: usize, query_tokens: usize, block_size: usize) -> usize {
+    block_size * matched_blocks.min(query_tokens.saturating_sub(1) / block_size)
+}
+
+impl LoadBalancingPolicy for KvAwarePolicy {
+    fn select_worker_with_headers(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        _request_text: Option<&str>,
+        headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        self.select_worker_with_tokens(workers, None, None, headers)
+    }
+
+    fn select_worker_with_tokens(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        _request_text: Option<&str>,
+        token_ids: Option<&[u32]>,
+        _headers: Option<&RequestHeaders>,
+    ) -> Option<usize> {
+        self.select_attempt(workers, token_ids, None)
+            .map(|(selected, _)| selected)
     }
 
     fn name(&self) -> &'static str {
@@ -217,6 +301,138 @@ impl LoadBalancingPolicy for KvAwarePolicy {
 mod tests {
     use super::*;
     use crate::core::{BasicWorker, WorkerType};
+    use crate::policies::exact_history::{
+        ExactHistoryRequest, ExactHistoryScope, ModelHistoryScope,
+    };
+
+    fn history_policy() -> (KvAwarePolicy, Vec<Arc<dyn Worker>>) {
+        let mut config = KvAwareConfig {
+            load_guard: true,
+            ..Default::default()
+        };
+        config.history.enabled = true;
+        config.history.eviction_interval_secs = 0;
+        config.history.cache_threshold = 0.5;
+        let policy = KvAwarePolicy::new(&config);
+        policy.enable_dense_reuse();
+        let (_, workers) = dense_policy(16);
+        for worker in &workers {
+            policy.index.begin_worker(worker.url());
+        }
+        (policy, workers)
+    }
+
+    fn history_input(policy: &KvAwarePolicy, tokens: &[u32]) -> HistoricalRoutingRequest {
+        let model = ModelHistoryScope::new("verified-model-and-contract").unwrap();
+        HistoricalRoutingRequest::new(
+            model.clone(),
+            ExactHistoryRequest::new(
+                ExactHistoryScope::new(model, policy.history_contract),
+                Arc::from(tokens),
+            ),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn history_zero_hbm_is_advisory_and_does_not_consume_fair_cursor() {
+        let (policy, workers) = history_policy();
+        let tokens = [1, 2, 3]; // Shorter than a physical block.
+        let request = history_input(&policy, &tokens);
+        let (cold, pending) = policy
+            .select_attempt(&workers, Some(&tokens), Some(&request))
+            .unwrap();
+        let (_, repeat) = policy
+            .select_attempt(&workers, Some(&tokens), Some(&request))
+            .unwrap();
+        assert_eq!(policy.cursor.load(Ordering::Relaxed), 1);
+        assert_eq!(policy.history().unwrap().stats().exact_lookup_hits, 1);
+        assert_eq!(policy.index.ownership_count(), 0);
+        assert_eq!(dense_reusable_tokens(0, tokens.len(), 16), 0);
+        drop(repeat);
+        drop(pending);
+        let (next, pending) = policy
+            .select_attempt(&workers, Some(&tokens), Some(&request))
+            .unwrap();
+        assert_ne!(cold, next);
+        drop(pending);
+        assert_eq!(policy.history().unwrap().stats().reservation_count, 0);
+    }
+
+    #[test]
+    fn physical_owner_beats_history_and_history_respects_cl_slack() {
+        let (policy, workers) = history_policy();
+        let tokens: Vec<u32> = (0..49).collect();
+        let request = history_input(&policy, &tokens);
+        policy
+            .history()
+            .unwrap()
+            .reserve_selected(&request, &workers[0])
+            .unwrap()
+            .commit();
+        let generation = policy.index.current_generation(workers[1].url()).unwrap();
+        let keys = policy.generator.generate_block_keys(&tokens);
+        policy.index.store(workers[1].url(), generation, &keys);
+        let (selected, pending) = policy
+            .select_attempt(&workers, Some(&tokens), Some(&request))
+            .unwrap();
+        assert_eq!(selected, 1);
+        drop(pending);
+        policy.index.clear(workers[1].url(), generation);
+        // History remains only on W0, but cannot bypass CL.
+        workers[0].increment_load();
+        workers[0].increment_load();
+        let (selected, pending) = policy
+            .select_attempt(&workers, Some(&tokens), Some(&request))
+            .unwrap();
+        assert_eq!(selected, 1);
+        drop(pending);
+        workers[0].decrement_load();
+        workers[0].decrement_load();
+        assert_eq!(policy.index.ownership_count(), 0);
+    }
+
+    #[test]
+    fn history_clear_roll_retire_and_replacement_fence_late_commits() {
+        for invalidation in 0..4 {
+            let (policy, workers) = history_policy();
+            let request = history_input(&policy, &[1, 2, 3]);
+            let mut pending = policy
+                .history()
+                .unwrap()
+                .reserve_selected(&request, &workers[0])
+                .unwrap();
+            let generation = policy.index.current_generation(workers[0].url()).unwrap();
+            match invalidation {
+                0 => {
+                    policy.index.clear(workers[0].url(), generation);
+                }
+                1 => {
+                    policy.index.roll_worker(workers[0].url(), generation);
+                }
+                2 => policy.index.retire_worker(workers[0].url()),
+                _ => {
+                    policy.index.begin_worker(workers[0].url());
+                }
+            }
+            assert!(!pending.commit());
+            assert_eq!(policy.history().unwrap().stats().entry_count, 0);
+        }
+    }
+
+    #[test]
+    fn history_off_preserves_no_store_and_no_learning() {
+        let (policy, workers) = dense_policy(16);
+        assert!(!policy.history_enabled());
+        let request = history_input(&policy, &[1, 2, 3]);
+        assert!(policy
+            .select_attempt(&workers, Some(&[1, 2, 3]), Some(&request))
+            .unwrap()
+            .1
+            .is_none());
+        assert_eq!(policy.index.ownership_count(), 0);
+    }
 
     fn dense_policy(block_size: usize) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>) {
         let policy = KvAwarePolicy::new(&KvAwareConfig {

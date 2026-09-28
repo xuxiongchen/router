@@ -279,6 +279,13 @@ impl ConfigValidator {
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
             PolicyConfig::KvAware { config } => {
+                if config.history.enabled {
+                    config
+                        .history
+                        .store_config()
+                        .validate()
+                        .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+                }
                 if config.block_size == 0
                     || config.index_max_entries == 0
                     || config.default_port == 0
@@ -792,6 +799,34 @@ mod tests {
         // Both HTTP workers share a host: the legacy single-port fallback
         // cannot distinguish their publisher ownership.
         assert!(ConfigValidator::validate(&ambiguous).is_err());
+    }
+
+    #[test]
+    fn kv_history_defaults_roundtrip_and_invalid_bounds() {
+        let config = static_kv_config();
+        let default: crate::config::KvHistoryConfig = serde_json::from_str("{}").unwrap();
+        assert!(!default.enabled);
+        assert_eq!(default.history_ttl_secs, 300);
+        let mut enabled = config.clone();
+        if let PolicyConfig::KvAware { config } = &mut enabled.policy {
+            config.history.enabled = true;
+        }
+        let serialized = serde_json::to_string(&enabled).unwrap();
+        let roundtrip = serde_json::from_str(&serialized).unwrap();
+        assert!(ConfigValidator::validate(&roundtrip).is_ok());
+        for invalid in ["ttl", "capacity", "cache_threshold", "relative_load"] {
+            let mut config = enabled.clone();
+            if let PolicyConfig::KvAware { config } = &mut config.policy {
+                match invalid {
+                    "ttl" => config.history.history_ttl_secs = 0,
+                    "capacity" => config.history.max_tree_size = 0,
+                    "cache_threshold" => config.history.cache_threshold = f32::NAN,
+                    "relative_load" => config.history.balance_rel_threshold = 0.5,
+                    _ => unreachable!(),
+                }
+            }
+            assert!(ConfigValidator::validate(&config).is_err(), "{invalid}");
+        }
     }
 
     #[test]

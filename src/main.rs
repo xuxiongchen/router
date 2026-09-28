@@ -145,6 +145,11 @@ struct CliArgs {
     /// Opt-in cache-first protection against excess in-flight load (slack 1).
     #[arg(long, default_value_t = false, help_heading = "KV Events")]
     kv_load_guard: bool,
+    /// Advisory exact-token history, separate from the cache_aware policy.
+    #[arg(long, default_value = "least_load", value_parser = ["least_load", "cache_aware"], help_heading = "KV Events")]
+    kv_fallback_policy: String,
+    #[arg(long, default_value_t = 300, help_heading = "KV Events")]
+    kv_fallback_history_ttl_secs: u64,
 
     /// Enable Program-level scheduling independently of the request-level
     /// load-balancing policy.
@@ -548,6 +553,15 @@ impl CliArgs {
                     worker_endpoints,
                     index_max_entries: self.kv_index_max_entries,
                     load_guard: self.kv_load_guard,
+                    history: vllm_router_rs::config::KvHistoryConfig {
+                        enabled: self.kv_fallback_policy == "cache_aware",
+                        history_ttl_secs: self.kv_fallback_history_ttl_secs,
+                        cache_threshold: self.cache_threshold,
+                        balance_abs_threshold: self.balance_abs_threshold,
+                        balance_rel_threshold: self.balance_rel_threshold,
+                        eviction_interval_secs: self.eviction_interval,
+                        max_tree_size: self.max_tree_size,
+                    },
                     // This binary has no in-process Python facade. Token-input
                     // forwarding is exposed by the Python/PyO3 vLLM launcher.
                     completion_token_input: false,
@@ -558,6 +572,7 @@ impl CliArgs {
                 || self.kv_hash_algo.is_some()
                 || !self.kv_events_endpoints.is_empty()
                 || self.kv_load_guard
+                || self.kv_fallback_policy != "least_load"
             {
                 return Err(ConfigError::ValidationFailed {
                     reason: "KV options require --policy kv_aware".into(),
@@ -828,6 +843,64 @@ Provide --worker-urls or PD flags as usual.",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_cli_is_opt_in_and_reuses_bounded_cache_controls() {
+        let common = [
+            "vllm-router",
+            "--backend",
+            "vllm",
+            "--policy",
+            "kv_aware",
+            "--worker-urls",
+            "http://worker:8000",
+            "--kv-tokenizer-path",
+            "/public/tokenizer.json",
+            "--kv-hash-algo",
+            "sha256_cbor",
+        ];
+        let default = CliArgs::try_parse_from(common)
+            .unwrap()
+            .to_router_config(vec![])
+            .unwrap();
+        let PolicyConfig::KvAware { config } = default.policy else {
+            panic!("wrong policy")
+        };
+        assert!(!config.history.enabled);
+        let mut args = common.to_vec();
+        args.extend([
+            "--kv-fallback-policy",
+            "cache_aware",
+            "--kv-fallback-history-ttl-secs",
+            "45",
+            "--max-tree-size",
+            "1024",
+            "--cache-threshold",
+            "0.7",
+            "--kv-load-guard",
+        ]);
+        let parsed = CliArgs::try_parse_from(args)
+            .unwrap()
+            .to_router_config(vec![])
+            .unwrap();
+        parsed.validate().unwrap();
+        let PolicyConfig::KvAware { config } = parsed.policy else {
+            panic!("wrong policy")
+        };
+        assert!(config.history.enabled && config.load_guard);
+        assert_eq!(config.history.history_ttl_secs, 45);
+        assert_eq!(config.history.max_tree_size, 1024);
+        assert_eq!(config.history.cache_threshold, 0.7);
+        let wrong = CliArgs::try_parse_from([
+            "vllm-router",
+            "--policy",
+            "round_robin",
+            "--kv-fallback-policy",
+            "cache_aware",
+        ])
+        .unwrap();
+        assert!(wrong.to_router_config(vec![]).is_err());
+    }
 
     #[test]
     fn kv_cli_requires_explicit_hash_contract_and_preserves_endpoint_mapping() {

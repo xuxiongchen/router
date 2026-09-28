@@ -3,6 +3,13 @@
 use super::BlockHash;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Weak};
+
+/// Advisory consumers only. Called under the index write fence; implementations
+/// must not call back into the index, perform I/O, or acquire the selection lock.
+pub(crate) trait WorkerInvalidationObserver: Send + Sync {
+    fn invalidate_worker(&self, worker: &str);
+}
 
 #[derive(Debug, Clone)]
 struct OwnershipOrderEntry {
@@ -34,6 +41,7 @@ struct IndexState {
 pub struct KVBlockIndex {
     state: RwLock<IndexState>,
     max_entries: usize,
+    history: RwLock<Option<Weak<dyn WorkerInvalidationObserver>>>,
 }
 
 impl std::fmt::Debug for KVBlockIndex {
@@ -54,12 +62,14 @@ impl KVBlockIndex {
         Self {
             state: RwLock::new(IndexState::default()),
             max_entries,
+            history: RwLock::new(None),
         }
     }
 
     /// Start a new subscriber/lifecycle generation and purge older ownership.
     pub fn begin_worker(&self, worker: &str) -> u64 {
         let mut state = self.state.write();
+        self.invalidate_history(worker);
         clear_worker(&mut state, worker);
         let generation = next_generation(state.generations.get(worker).copied().unwrap_or(0));
         state.generations.insert(worker.to_string(), generation);
@@ -74,6 +84,7 @@ impl KVBlockIndex {
         if !is_current(&state, worker, expected_generation) {
             return None;
         }
+        self.invalidate_history(worker);
         clear_worker(&mut state, worker);
         let generation = next_generation(expected_generation);
         state.generations.insert(worker.to_string(), generation);
@@ -83,6 +94,7 @@ impl KVBlockIndex {
     /// Retire a worker. Late events carrying the prior generation are ignored.
     pub fn retire_worker(&self, worker: &str) {
         let mut state = self.state.write();
+        self.invalidate_history(worker);
         clear_worker(&mut state, worker);
         let generation = next_generation(state.generations.get(worker).copied().unwrap_or(0));
         state.generations.insert(worker.to_string(), generation);
@@ -127,7 +139,10 @@ impl KVBlockIndex {
                         remove_block(&mut state, worker, block);
                     }
                 }
-                OwnershipEvent::Clear => clear_worker(&mut state, worker),
+                OwnershipEvent::Clear => {
+                    self.invalidate_history(worker);
+                    clear_worker(&mut state, worker);
+                }
             }
         }
         true
@@ -147,6 +162,16 @@ impl KVBlockIndex {
 
     pub fn ownership_count(&self) -> usize {
         self.state.read().ownership_count
+    }
+
+    pub(crate) fn attach_history(&self, observer: Arc<dyn WorkerInvalidationObserver>) {
+        *self.history.write() = Some(Arc::downgrade(&observer));
+    }
+
+    fn invalidate_history(&self, worker: &str) {
+        if let Some(observer) = self.history.read().as_ref().and_then(Weak::upgrade) {
+            observer.invalidate_worker(worker);
+        }
     }
 
     /// None means health/removal retired this worker. Only begin_worker may

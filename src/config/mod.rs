@@ -1,6 +1,6 @@
 mod kv_aware;
 pub mod types;
-pub use kv_aware::KvAwareConfig;
+pub use kv_aware::{KvAwareConfig, KvHistoryConfig};
 pub mod validation;
 
 pub use types::*;

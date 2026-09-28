@@ -54,6 +54,8 @@ struct Router {
     kv_events_endpoints: Vec<String>,
     kv_index_max_entries: usize,
     kv_load_guard: bool,
+    kv_fallback_policy: String,
+    kv_fallback_history_ttl_secs: u64,
     kv_completion_token_input: bool,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
@@ -162,6 +164,15 @@ impl Router {
                 worker_endpoints,
                 index_max_entries: self.kv_index_max_entries,
                 load_guard: self.kv_load_guard,
+                history: config::KvHistoryConfig {
+                    enabled: self.kv_fallback_policy == "cache_aware",
+                    history_ttl_secs: self.kv_fallback_history_ttl_secs,
+                    cache_threshold: self.cache_threshold,
+                    balance_abs_threshold: self.balance_abs_threshold,
+                    balance_rel_threshold: self.balance_rel_threshold,
+                    eviction_interval_secs: self.eviction_interval_secs,
+                    max_tree_size: self.max_tree_size,
+                },
                 completion_token_input: self.kv_completion_token_input,
             }
         } else {
@@ -169,6 +180,7 @@ impl Router {
                 || self.kv_hash_algo.is_some()
                 || !self.kv_events_endpoints.is_empty()
                 || self.kv_load_guard
+                || self.kv_fallback_policy != "least_load"
                 || self.kv_completion_token_input
             {
                 return Err(config::ConfigError::ValidationFailed {
@@ -177,6 +189,15 @@ impl Router {
             }
             config::KvAwareConfig::default()
         };
+
+        if !matches!(
+            self.kv_fallback_policy.as_str(),
+            "least_load" | "cache_aware"
+        ) {
+            return Err(config::ConfigError::ValidationFailed {
+                reason: "kv_fallback_policy must be least_load or cache_aware (exact-token advisory history)".into()
+            });
+        }
 
         // Convert policy helper function
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
@@ -404,6 +425,8 @@ impl Router {
         kv_events_endpoints = vec![],
         kv_index_max_entries = 100_000,
         kv_load_guard = false,
+        kv_fallback_policy = "least_load".to_string(),
+        kv_fallback_history_ttl_secs = 300,
         kv_completion_token_input = false,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -482,6 +505,8 @@ impl Router {
         kv_events_endpoints: Vec<String>,
         kv_index_max_entries: usize,
         kv_load_guard: bool,
+        kv_fallback_policy: String,
+        kv_fallback_history_ttl_secs: u64,
         kv_completion_token_input: bool,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
@@ -514,6 +539,8 @@ impl Router {
             kv_events_endpoints,
             kv_index_max_entries,
             kv_load_guard,
+            kv_fallback_policy,
+            kv_fallback_history_ttl_secs,
             kv_completion_token_input,
             worker_startup_timeout_secs,
             worker_startup_check_interval,

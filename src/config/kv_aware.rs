@@ -24,6 +24,7 @@ pub struct KvAwareConfig {
     /// Opt-in derived single-text Completion body, only with the vLLM bridge.
     /// Unsupported shapes/headers remain on the original byte-forward path.
     pub completion_token_input: bool,
+    pub history: KvHistoryConfig,
 }
 
 impl Default for KvAwareConfig {
@@ -39,6 +40,49 @@ impl Default for KvAwareConfig {
             index_max_entries: 100_000,
             load_guard: false,
             completion_token_input: false,
+            history: KvHistoryConfig::default(),
+        }
+    }
+}
+
+/// Bounded advisory exact-token history, not the standalone cache_aware policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KvHistoryConfig {
+    pub enabled: bool,
+    pub history_ttl_secs: u64,
+    pub cache_threshold: f32,
+    pub balance_abs_threshold: usize,
+    pub balance_rel_threshold: f32,
+    pub eviction_interval_secs: u64,
+    /// Total prefix-token + session associations, including pending attempts.
+    pub max_tree_size: usize,
+}
+
+impl Default for KvHistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            history_ttl_secs: 300,
+            cache_threshold: 0.3,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 120,
+            max_tree_size: 1 << 26,
+        }
+    }
+}
+
+impl KvHistoryConfig {
+    pub(crate) fn store_config(&self) -> crate::policies::exact_history::ExactHistoryConfig {
+        use std::time::Duration;
+        crate::policies::exact_history::ExactHistoryConfig {
+            cache_threshold: self.cache_threshold,
+            balance_abs_threshold: self.balance_abs_threshold,
+            balance_rel_threshold: self.balance_rel_threshold,
+            history_ttl: Duration::from_secs(self.history_ttl_secs),
+            eviction_interval: Duration::from_secs(self.eviction_interval_secs),
+            max_tree_size: self.max_tree_size,
         }
     }
 }

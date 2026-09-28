@@ -350,6 +350,8 @@ impl GenerationRequest for RenderRoutingRequest {
 struct KvLoadLease {
     worker: Option<Arc<dyn Worker>>,
     generation: Option<(Arc<crate::kv_index::KVBlockIndex>, u64)>,
+    history: Option<crate::policies::exact_history::HistoryReservation>,
+    history_contract: Option<(Arc<RenderBridge>, RenderContract)>,
 }
 
 /// A bounded retry may follow, but no Worker has received this attempt. Do not
@@ -364,6 +366,8 @@ impl KvLoadLease {
         Self {
             worker: Some(worker),
             generation: None,
+            history: None,
+            history_contract: None,
         }
     }
 
@@ -373,6 +377,33 @@ impl KvLoadLease {
                 worker.is_available() && index.current_generation(worker.url()) == Some(*generation)
             })
         })
+    }
+    fn commit_history(&mut self) {
+        let Some(mut reservation) = self.history.take() else {
+            return;
+        };
+        let mut commit = || {
+            self.generation
+                .as_ref()
+                .and_then(|(index, generation)| {
+                    let worker = self.worker.as_ref()?;
+                    if !worker.is_available() {
+                        return None;
+                    }
+                    index
+                        .with_current_generation(worker.url(), *generation, || reservation.commit())
+                })
+                .unwrap_or(false)
+        };
+        let committed = if let Some((bridge, contract)) = &self.history_contract {
+            bridge
+                .with_current_contract(contract, commit)
+                .unwrap_or(false)
+        } else {
+            commit()
+        };
+        metrics::counter!("vllm_router_kv_history_commit_total", "outcome" => if committed { "committed" } else { "fenced" }).increment(1);
+        debug!(committed, "kv_history_commit");
     }
     fn attach(mut self, response: Response) -> Response {
         hold_load_until_body_done(response, self.worker.take().expect("live KV load lease"))
@@ -1477,7 +1508,9 @@ impl Router {
         let guarded_index = policy
             .as_any()
             .downcast_ref::<crate::policies::KvAwarePolicy>()
-            .filter(|policy| policy.load_guard_enabled() || prepared_forward)
+            .filter(|policy| {
+                policy.load_guard_enabled() || policy.history_enabled() || prepared_forward
+            })
             .map(crate::policies::KvAwarePolicy::index);
         // Bind the subsequent score to the generation observed BEFORE choice.
         // If a clear/retire/replacement intervenes, fail this bounded attempt
@@ -1500,7 +1533,18 @@ impl Router {
         let lease = if let Some(index) = guarded_index {
             // Re-check the current generation and reserve under its read fence.
             // Empty current generations are valid. No network runs here.
-            let (observed_worker, generation) = generations.get(worker.url())?;
+            let Some((observed_worker, generation)) = generations.get(worker.url()) else {
+                // Event trust is not execution safety. With CL/prepared-input
+                // disabled, retain the prior independently valid raw fallback,
+                // without an advisory reservation or a generation claim.
+                let kv_policy = policy
+                    .as_any()
+                    .downcast_ref::<crate::policies::KvAwarePolicy>()?;
+                if !prepared_forward && !kv_policy.load_guard_enabled() && worker.is_available() {
+                    return Some((worker.clone(), KvLoadLease::new(worker)));
+                }
+                return None;
+            };
             let generation = *generation;
             if !Arc::ptr_eq(&worker, observed_worker) || !worker.is_available() {
                 return None;
@@ -1607,6 +1651,10 @@ impl Router {
 
         let text = typed_req.extract_text_for_routing();
 
+        // Construct one identity over the already prepared tokens. Retries
+        // reuse it; only reservations are attempt-local.
+        let history_request = self.history_request(input.as_ref(), headers, raw_bytes);
+
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
@@ -1640,11 +1688,17 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
+                let history_reservation = Mutex::new(None);
                 let select = || {
                     if let Some(target) = forced_worker_url {
                         self.worker_registry
                             .get_by_url(target)
                             .filter(|worker| worker.is_available())
+                    } else if let Some(request) = &history_request {
+                        let (worker, reservation) =
+                            self.select_history_worker(model_id, input.as_ref(), request)?;
+                        *history_reservation.lock() = reservation;
+                        Some(worker)
                     } else {
                         self.select_worker_for_model_with_tokens_filtered(
                             model_id,
@@ -1661,7 +1715,17 @@ impl Router {
                         input.as_ref().is_some_and(|input| input.backend.is_some()),
                         select,
                     ) {
-                        Some((worker, lease)) => (Some(worker), Some(lease)),
+                        Some((worker, mut lease)) => {
+                            lease.history = history_reservation.into_inner();
+                            if lease.history.is_some() {
+                                lease.history_contract = self
+                                    .kv_runtime
+                                    .as_ref()
+                                    .and_then(|runtime| runtime.render_bridge.clone())
+                                    .zip(input.as_ref().and_then(|input| input.contract.clone()));
+                            }
+                            (Some(worker), Some(lease))
+                        }
                         None => (None, None),
                     }
                 } else {
@@ -1840,7 +1904,7 @@ impl Router {
         worker: Arc<dyn Worker>,
         is_stream: bool,
         raw_bytes: Option<&[u8]>,
-        lease: KvLoadLease,
+        mut lease: KvLoadLease,
         derived: Option<&DerivedCompletionInput>,
     ) -> Response {
         let headers = derived.map(|input| &input.headers).or(headers);
@@ -1920,6 +1984,11 @@ impl Router {
             }
         };
         let status = response.status();
+        if status.is_success() {
+            // Regular observation at successful headers, not proof of GPU work
+            // completion or HBM residency. Body/SSE failure cannot upgrade it.
+            lease.commit_history();
+        }
         let response_headers = header_utils::preserve_response_headers(response.headers());
         let mut outgoing = if is_stream && status.is_success() {
             // No detached producer or unbounded queue: dropping the client
@@ -1940,6 +2009,122 @@ impl Router {
         *outgoing.status_mut() = status;
         *outgoing.headers_mut() = response_headers;
         outgoing
+    }
+
+    fn history_request(
+        &self,
+        input: Option<&PreparedKvInput>,
+        headers: Option<&HeaderMap>,
+        raw: Option<&[u8]>,
+    ) -> Option<crate::policies::exact_history::HistoricalRoutingRequest> {
+        use crate::policies::exact_history::*;
+        use sha2::{Digest, Sha256};
+        let policy = self.policy_registry.get_default_policy();
+        let policy = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()?;
+        if !policy.history_enabled() {
+            return None;
+        }
+        #[cfg(feature = "kv-perf")]
+        if self
+            .kv_perf
+            .as_ref()
+            .is_some_and(|p| p.mode != KvPerfMode::RenderKv)
+        {
+            return None;
+        }
+        let runtime = self.kv_runtime.as_ref()?;
+        let input = input?;
+        let tokens = input.tokens.clone()?;
+        // Unsupported salt/adapter/multimodal input never supplies exact tokens.
+        // Header namespaces are conservative: unknown headers partition rather
+        // than accidentally merge tenants. No sensitive value enters diagnostics.
+        let mut namespace_headers: Vec<_> = headers
+            .into_iter()
+            .flat_map(|h| h.iter())
+            .filter(|(name, _)| {
+                !matches!(
+                    name.as_str(),
+                    "content-type"
+                        | "content-length"
+                        | "accept"
+                        | "accept-encoding"
+                        | "connection"
+                        | "host"
+                        | "user-agent"
+                        | "x-request-id"
+                        | "x-session-id"
+                        | "traceparent"
+                        | "tracestate"
+                )
+            })
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        namespace_headers.sort_unstable();
+        let value: serde_json::Value = raw
+            .and_then(|r| serde_json::from_slice(r).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let namespace = serde_json::to_vec(&(namespace_headers, value.get("user"))).ok()?;
+        let namespace = format!("{:x}", Sha256::digest(namespace));
+        let scope = ModelHistoryScope::new(
+            serde_json::to_string(&(
+                &runtime.model,
+                input.contract.as_ref().map(|c| (&c.id, c.epoch)),
+                namespace,
+            ))
+            .ok()?,
+        )?;
+        let session = value
+            .get("session_params")
+            .and_then(|v| v.get("session_id"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                headers
+                    .and_then(|h| h.get("x-session-id"))
+                    .and_then(|v| v.to_str().ok())
+            })
+            .and_then(SessionHistoryKey::new);
+        let exact = ExactHistoryRequest::new(
+            ExactHistoryScope::new(scope.clone(), policy.history_contract),
+            tokens,
+        );
+        HistoricalRoutingRequest::new(scope, exact, session).ok()
+    }
+
+    fn select_history_worker(
+        &self,
+        model_id: Option<&str>,
+        input: Option<&PreparedKvInput>,
+        request: &crate::policies::exact_history::HistoricalRoutingRequest,
+    ) -> Option<(
+        Arc<dyn Worker>,
+        Option<crate::policies::exact_history::HistoryReservation>,
+    )> {
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        let policy = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()?;
+        let workers = match model_id {
+            Some(model) => self.worker_registry.get_by_model_fast(model),
+            None => self.worker_registry.get_all(),
+        };
+        let (selected, reservation) = policy
+            .select_attempt(
+                &workers,
+                input.and_then(|i| i.tokens.as_deref()),
+                Some(request),
+            )
+            .or_else(|| {
+                if policy.load_guard_enabled() {
+                    return None;
+                }
+                policy.select_attempt(&workers, None, None)
+            })?;
+        Some((workers[selected].clone(), reservation))
     }
 
     fn kv_tokens(
@@ -3723,6 +3908,345 @@ mod tests {
         )
     }
 
+    async fn history_test_router(worker: Arc<dyn Worker>) -> (Router, Arc<RenderBridge>) {
+        history_test_router_with_guard(worker, true).await
+    }
+
+    async fn history_test_router_with_guard(
+        worker: Arc<dyn Worker>,
+        load_guard: bool,
+    ) -> (Router, Arc<RenderBridge>) {
+        let contract = RenderContract {
+            id: "public-history-contract".into(),
+            epoch: 1,
+        };
+        let prepared = crate::prompt_tokens::bridge::PreparedTokens {
+            token_ids: Arc::from([1, 2, 3]),
+            contract: contract.clone(),
+            cache_eligible: true,
+            completion_token_input_eligible: false,
+        };
+        let bridge = Arc::new(RenderBridge::for_test(
+            contract,
+            Default::default(),
+            move |_, _| PreparedResult::Exact(prepared.clone()),
+        ));
+        bridge.wait_ready(Duration::from_secs(2)).await.unwrap();
+        let mut router = create_test_regular_router();
+        router.worker_registry = Arc::new(WorkerRegistry::new());
+        router.worker_registry.register(worker.clone());
+        let mut config = crate::config::KvAwareConfig {
+            load_guard,
+            ..Default::default()
+        };
+        config.history.enabled = true;
+        config.history.eviction_interval_secs = 0;
+        router.policy_registry =
+            Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::KvAware {
+                config: Box::new(config),
+            }));
+        router
+            .policy_registry
+            .get_default_policy()
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+            .unwrap()
+            .index()
+            .begin_worker(worker.url());
+        router.kv_runtime = Some(KvRuntime {
+            _pool: None,
+            _capability_pool: None,
+            tokenizer: None,
+            render_bridge: Some(bridge.clone()),
+            model: "synthetic".into(),
+        });
+        router.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        router.retry_config.max_retries = 0;
+        (router, bridge)
+    }
+
+    #[tokio::test]
+    async fn history_regular_headers_json_sse_error_and_disconnect() {
+        for stream in [false, true] {
+            for status in [StatusCode::OK, StatusCode::BAD_REQUEST] {
+                let app = axum::Router::new().route(
+                    "/v1/completions",
+                    axum::routing::post(move || async move {
+                        let mut response = if stream && status.is_success() {
+                            Response::new(Body::from_stream(futures_util::stream::pending::<
+                                Result<bytes::Bytes, std::io::Error>,
+                            >()))
+                        } else {
+                            Response::new(Body::from("public fixture"))
+                        };
+                        *response.status_mut() = status;
+                        response
+                    }),
+                );
+                let (worker, server) = kv_test_server(app).await;
+                let (router, bridge) = history_test_router(worker.clone()).await;
+                let policy = router.policy_registry.get_default_policy();
+                let policy = policy
+                    .as_any()
+                    .downcast_ref::<crate::policies::KvAwarePolicy>()
+                    .unwrap();
+                let raw =
+                    serde_json::to_vec(&serde_json::json!({"prompt":"fixture", "stream":stream}))
+                        .unwrap();
+                let response = router.route_completion_bytes(None, &raw, None).await;
+                assert_eq!(response.status(), status);
+                assert_eq!(policy.history().unwrap().stats().reservation_count, 0);
+                assert_eq!(
+                    policy.history().unwrap().stats().entry_count,
+                    if status.is_success() { 3 } else { 0 }
+                );
+                assert_eq!(worker.load(), usize::from(stream && status.is_success()));
+                drop(response); // Disconnect after committed headers retains only a hint.
+                assert_eq!(worker.load(), 0);
+                assert_eq!(policy.index().ownership_count(), 0);
+                bridge.shutdown();
+                assert!(bridge.wait_closed(Duration::from_secs(2)).await);
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn history_preheader_cancel_clear_and_contract_fence_late_success() {
+        for invalidation in ["cancel", "clear", "retire", "contract"] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let e = entered.clone();
+            let r = release.clone();
+            let app = axum::Router::new().route(
+                "/v1/completions",
+                axum::routing::post(move || {
+                    let e = e.clone();
+                    let r = r.clone();
+                    async move {
+                        e.notify_one();
+                        r.notified().await;
+                        StatusCode::OK
+                    }
+                }),
+            );
+            let (worker, server) = kv_test_server(app).await;
+            let (router, bridge) = history_test_router(worker.clone()).await;
+            let policy = router.policy_registry.get_default_policy();
+            let policy = policy
+                .as_any()
+                .downcast_ref::<crate::policies::KvAwarePolicy>()
+                .unwrap();
+            let mut request =
+                Box::pin(router.route_completion_bytes(None, br#"{"prompt":"fixture"}"#, None));
+            tokio::select! {
+                _ = &mut request => panic!("headers must wait for release"),
+                _ = entered.notified() => {},
+                _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("request did not dispatch"),
+            }
+            assert_eq!(worker.load(), 1);
+            assert_eq!(policy.history().unwrap().stats().reservation_count, 1);
+            match invalidation {
+                "clear" => {
+                    let index = policy.index();
+                    index.clear(
+                        worker.url(),
+                        index.current_generation(worker.url()).unwrap(),
+                    );
+                }
+                "retire" => policy.index().retire_worker(worker.url()),
+                "contract" => bridge.invalidate(),
+                _ => {}
+            }
+            if invalidation != "cancel" {
+                release.notify_one();
+                assert_eq!(request.as_mut().await.status(), StatusCode::OK);
+            }
+            drop(request);
+            assert_eq!(worker.load(), 0);
+            assert_eq!(policy.history().unwrap().stats().reservation_count, 0);
+            assert_eq!(policy.history().unwrap().stats().entry_count, 0);
+            bridge.shutdown();
+            assert!(bridge.wait_closed(Duration::from_secs(2)).await);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn history_untrusted_events_allow_only_existing_execution_safe_raw_fallback() {
+        for load_guard in [false, true] {
+            let app = axum::Router::new().route(
+                "/v1/completions",
+                axum::routing::post(|| async { StatusCode::OK }),
+            );
+            let (worker, server) = kv_test_server(app).await;
+            let (router, bridge) = history_test_router_with_guard(worker.clone(), load_guard).await;
+            let policy = router.policy_registry.get_default_policy();
+            let policy = policy
+                .as_any()
+                .downcast_ref::<crate::policies::KvAwarePolicy>()
+                .unwrap();
+            policy.index().retire_worker(worker.url());
+            let raw = br#"{"prompt":"public history fixture"}"#;
+            let response = router.route_completion_bytes(None, raw, None).await;
+            assert_eq!(
+                response.status(),
+                if load_guard {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::OK
+                }
+            );
+            drop(response);
+            assert_eq!(worker.load(), 0);
+            assert_eq!(policy.history().unwrap().stats().entry_count, 0);
+            bridge.invalidate();
+            let response = router.route_completion_bytes(None, raw, None).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            bridge.shutdown();
+            assert!(bridge.wait_closed(Duration::from_secs(2)).await);
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn history_concurrent_pending_reservations_share_one_load_lease_and_roll_back() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://w0:8000".into(),
+            WorkerType::Regular,
+        ));
+        let other: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://w1:8000".into(),
+            WorkerType::Regular,
+        ));
+        let (router, bridge) = history_test_router(worker.clone()).await;
+        router.worker_registry.register(other.clone());
+        let policy = router.policy_registry.get_default_policy();
+        let policy = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+            .unwrap();
+        policy.index().begin_worker(other.url());
+        let input = PreparedKvInput {
+            tokens: Some(Arc::from([1, 2, 3])),
+            contract: bridge.current_contract(),
+            backend: None,
+        };
+        let request = router.history_request(Some(&input), None, None).unwrap();
+        let router = Arc::new(router);
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let router = router.clone();
+                let barrier = barrier.clone();
+                let request = request.clone();
+                let input = PreparedKvInput {
+                    tokens: input.tokens.clone(),
+                    contract: input.contract.clone(),
+                    backend: None,
+                };
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut history = None;
+                    let (_, mut lease) = router
+                        .select_and_reserve_kv(None, || {
+                            let (worker, reservation) =
+                                router.select_history_worker(None, Some(&input), &request)?;
+                            history = reservation;
+                            Some(worker)
+                        })
+                        .unwrap();
+                    lease.history = history;
+                    lease
+                })
+            })
+            .collect();
+        let leases: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(worker.load() + other.load(), 16);
+        assert!(
+            worker.load().abs_diff(other.load()) <= 2,
+            "history must respect existing CL slack"
+        );
+        assert_eq!(policy.history().unwrap().stats().reservation_count, 16);
+        assert_eq!(policy.index().ownership_count(), 0);
+        drop(leases);
+        assert_eq!([worker.load(), other.load()], [0, 0]);
+        assert_eq!(policy.history().unwrap().stats().reservation_count, 0);
+        assert_eq!(policy.history().unwrap().stats().entry_count, 0);
+        bridge.shutdown();
+        assert!(bridge.wait_closed(Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn history_namespace_contract_and_unsupported_input_do_not_cross() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:1".into(),
+            WorkerType::Regular,
+        ));
+        let (router, bridge) = history_test_router(worker.clone()).await;
+        let policy = router.policy_registry.get_default_policy();
+        let policy = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+            .unwrap();
+        let mut input = PreparedKvInput {
+            tokens: Some(Arc::from([1, 2, 3])),
+            contract: bridge.current_contract(),
+            backend: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer public-a".parse().unwrap());
+        let initial = router
+            .history_request(Some(&input), Some(&headers), None)
+            .unwrap();
+        policy
+            .history()
+            .unwrap()
+            .reserve_selected(&initial, &worker)
+            .unwrap()
+            .commit();
+        for change in ["authorization", "x-tenant-id", "x-unknown-scope"] {
+            let mut other = headers.clone();
+            other.insert(change, "different".parse().unwrap());
+            let request = router
+                .history_request(Some(&input), Some(&other), None)
+                .unwrap();
+            let result = policy
+                .history()
+                .unwrap()
+                .select_and_reserve(&request, std::slice::from_ref(&worker), || Some(0))
+                .unwrap();
+            assert_eq!(
+                result.stage,
+                crate::policies::exact_history::HistoricalSelectionStage::LeastLoad
+            );
+        }
+        input.contract.as_mut().unwrap().epoch += 1;
+        let request = router
+            .history_request(Some(&input), Some(&headers), None)
+            .unwrap();
+        let result = policy
+            .history()
+            .unwrap()
+            .select_and_reserve(&request, std::slice::from_ref(&worker), || Some(0))
+            .unwrap();
+        assert_eq!(
+            result.stage,
+            crate::policies::exact_history::HistoricalSelectionStage::LeastLoad
+        );
+        input.tokens = None;
+        assert!(router
+            .history_request(Some(&input), Some(&headers), None)
+            .is_none());
+        bridge.shutdown();
+        assert!(bridge.wait_closed(Duration::from_secs(2)).await);
+    }
+
     #[tokio::test]
     async fn kv_dispatch_releases_json_and_http_error_leases() {
         let app = axum::Router::new()
@@ -4091,6 +4615,35 @@ mod tests {
         load_guard: bool,
         prepared_forward: bool,
     ) {
+        kv_retry_history_case(
+            use_bridge,
+            invalidate_after_first,
+            perf_mode,
+            load_guard,
+            prepared_forward,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn history_retry_rolls_back_failed_attempt_and_commits_only_current_success() {
+        for load_guard in [false, true] {
+            for invalidate in [false, true] {
+                kv_retry_history_case(true, invalidate, None, load_guard, false, true).await;
+            }
+        }
+        kv_retry_history_case(false, false, None, true, false, true).await;
+    }
+
+    async fn kv_retry_history_case(
+        use_bridge: bool,
+        invalidate_after_first: bool,
+        perf_mode: Option<&str>,
+        load_guard: bool,
+        prepared_forward: bool,
+        history: bool,
+    ) {
         // Abort only these test-owned servers on both success and assertion
         // failure. The successful path also joins them with a bounded wait.
         struct TestServers(Vec<tokio::task::JoinHandle<()>>);
@@ -4152,10 +4705,12 @@ mod tests {
             publishers.push(publisher);
         }
 
-        let config = crate::config::KvAwareConfig {
+        let mut config = crate::config::KvAwareConfig {
             load_guard,
             ..Default::default()
         };
+        config.history.enabled = history;
+        config.history.eviction_interval_secs = 0;
         let mut router = create_test_regular_router();
         router.kv_completion_token_input = prepared_forward;
         router.worker_registry = Arc::new(WorkerRegistry::new());
@@ -4347,6 +4902,25 @@ mod tests {
         assert_eq!(index.prefix_score(worker0.url(), &keys), 0);
         assert_eq!(index.current_generation(worker0.url()), None);
         assert_eq!(index.prefix_score(worker1.url(), &keys), 1);
+        if history {
+            let policy = policy
+                .as_any()
+                .downcast_ref::<crate::policies::KvAwarePolicy>()
+                .unwrap();
+            let stats = policy.history().unwrap().stats();
+            assert_eq!(
+                stats.reservation_count, 0,
+                "no failed or retried attempt leaks"
+            );
+            assert_eq!(
+                stats.entry_count,
+                if invalidate_after_first {
+                    0
+                } else {
+                    token_ids.len()
+                }
+            );
+        }
         // This final negative control exercises the production KV policy,
         // not the A/B RR override used by the completed request above.
         #[cfg(feature = "kv-perf")]

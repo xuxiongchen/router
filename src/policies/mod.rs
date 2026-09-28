@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 mod cache_aware;
 mod consistent_hash;
+pub(crate) mod exact_history;
 mod factory;
 pub(crate) mod hash_key;
 mod kv_aware;

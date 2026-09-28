@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use pyo3::{
     prelude::*,
     types::{PyBytes, PyDict, PyList},
@@ -139,6 +139,7 @@ impl Budget {
 }
 
 struct Shared {
+    lifecycle: RwLock<()>,
     accepting: AtomicBool,
     stopping: AtomicBool,
     budget: Mutex<Budget>,
@@ -147,6 +148,11 @@ struct Shared {
 }
 
 impl Shared {
+    fn stop_accepting(&self) {
+        let _fence = self.lifecycle.write();
+        self.accepting.store(false, Ordering::Release);
+    }
+
     fn reserve(self: &Arc<Self>, bytes: usize) -> Option<Reservation> {
         let mut budget = self.budget.lock();
         let tokens = self.limits.max_tokens_per_request;
@@ -537,7 +543,7 @@ impl Drop for ExecutorFinished {
         // This guard belongs to the outer thread frame: run_executor and its
         // executor/Python references have already returned or unwound first.
         self.shared.stopping.store(true, Ordering::Release);
-        self.shared.accepting.store(false, Ordering::Release);
+        self.shared.stop_accepting();
         let _ = self.closed.send(true);
     }
 }
@@ -621,6 +627,7 @@ impl RenderBridge {
         let (closed_sender, closed) = watch::channel(false);
         let (ready_sender, ready) = watch::channel(Readiness::Pending);
         let shared = Arc::new(Shared {
+            lifecycle: RwLock::new(()),
             accepting: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             budget: Mutex::new(Budget::default()),
@@ -693,6 +700,17 @@ impl RenderBridge {
             .then(|| self.shared.contract.clone())
     }
 
+    /// The action must be short and synchronous, with no bridge/budget calls.
+    /// This is an observation fence, not a remote Worker admission guarantee.
+    pub(crate) fn with_current_contract<T>(
+        &self,
+        contract: &RenderContract,
+        action: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _fence = self.shared.lifecycle.read();
+        self.is_current(contract).then(action)
+    }
+
     pub fn is_current(&self, contract: &RenderContract) -> bool {
         self.shared.accepting.load(Ordering::Acquire) && contract == &self.shared.contract
     }
@@ -702,7 +720,7 @@ impl RenderBridge {
     pub fn invalidate(&self) {
         let _budget = self.shared.budget.lock();
         self.shared.stopping.store(true, Ordering::Release);
-        self.shared.accepting.store(false, Ordering::Release);
+        self.shared.stop_accepting();
     }
 
     pub fn shutdown(&self) {
@@ -863,14 +881,14 @@ fn run_executor(
                 drop(active);
                 if executor.is_invalidated() {
                     shared.stopping.store(true, Ordering::Release);
-                    shared.accepting.store(false, Ordering::Release);
+                    shared.stop_accepting();
                 }
                 let result = match result {
                     PreparedResult::Invalid { http_status } => PreparedResult::Invalid {
                         http_status: client_error_status(Some(http_status)),
                     },
                     PreparedResult::Exact(tokens) if tokens.contract != shared.contract => {
-                        shared.accepting.store(false, Ordering::Release);
+                        shared.stop_accepting();
                         PreparedResult::Unavailable
                     }
                     PreparedResult::Exact(tokens)
@@ -895,7 +913,7 @@ fn run_executor(
         let _ = job.result.send(result);
         // All reservations are dropped only after the actual call returned.
     }
-    shared.accepting.store(false, Ordering::Release);
+    shared.stop_accepting();
     for job in receiver.try_iter() {
         let _ = job.result.send(PreparedResult::Unavailable);
     }
