@@ -53,6 +53,14 @@ The test-log ANSI correction and original failed attempt are retained.
 [Finite GPU evidence and limitations](rfc295-b1-gpu-results.md). Not a speedup,
 new Chat capability or stock zero-engine-change claim.
 
+Additional [official vLLM four-policy comparison](rfc295-b1-benchmark.md):
+150 Chat requests, 50 prefixes repeated three times, nominal input 1024,
+output 128, C=1; fresh Workers per arm and the same production extension.
+Both KV arms doubled physical token-hit rate versus RR (57.66% vs 28.83%)
+with 75:75 request allocation, but mean TTFT remained higher. Standalone
+cache_aware had lower TTFT but allocated 150:0. No stable speedup, history
+causality or saturated-capacity claim is made from one trial per policy.
+
 Before posting: resolve the integration base/interface assignment, handle
 outstanding CI gates, and complete human correctness, authorship/license and
 release review. Hardware acceptance is limited to the explicitly recorded slice.
