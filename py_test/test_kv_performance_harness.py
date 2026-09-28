@@ -827,7 +827,11 @@ class ExactHistoryHardwareEntryTests(unittest.TestCase):
     def test_finite_history_entry_is_six_requests_and_rejects_fake_reuse(self):
         for fake_reuse, commit_log, expect_pass in (
             (False, "kv_history_commit committed=true", True),
-            (False, "kv_history_commit \x1b[3mcommitted\x1b[0m\x1b[2m=\x1b[0mtrue", True),
+            (
+                False,
+                "kv_history_commit \x1b[3mcommitted\x1b[0m\x1b[2m=\x1b[0mtrue",
+                True,
+            ),
             (False, "kv_history_commit committed=false", False),
             (False, "unrelated log without a commit", False),
             (True, "kv_history_commit committed=true", False),
@@ -857,9 +861,7 @@ class ExactHistoryHardwareEntryTests(unittest.TestCase):
                 model="public-fixture",
                 routed=routed,
             )
-            with patch.object(
-                Path, "read_text", return_value=commit_log
-            ):
+            with patch.object(Path, "read_text", return_value=commit_log):
                 if not expect_pass:
                     with self.assertRaises(Exception):
                         perf.acceptance.Validation.exact_history(fixture)
