@@ -1,5 +1,9 @@
 # RFC295-B1 CPU closeout — 2026-09-28
 
+This CPU snapshot is preserved. A later fresh authorization completed the
+[finite GPU history fixture](rfc295-b1-gpu-results.md), reusing these exact
+wheel/native bytes with a test-only ANSI-log parser correction.
+
 ## Candidate and provenance
 
 - Branch: `cmb_rfc295_b1`; stacked base `fdabd202bfa518df2d684d76e86f1e0d97f9542f`.

@@ -2,7 +2,8 @@
 
 **Draft for human review; not published.** B1 CPU and actual optimized
 production-native validation passed at
-`3238b56d1bb265b8ea0d1f381e3f3f20ffd46099`. Hardware, outstanding CI handling,
+`3238b56d1bb265b8ea0d1f381e3f3f20ffd46099`. Finite GPU history validation also
+passed with harness `807f1bfd13934a0c3ea8623dd2dedaf03605c005`. Outstanding CI,
 maintainer integration agreement and release approval remain open.
 No PR or RFC edit has been made.
 
@@ -41,12 +42,20 @@ production native passed off/on/on+CL/on+CL+CT, 12 synthetic transport cases,
 including JSON/SSE, deadline and disconnect. Native SHA256:
 `f2613d588ffc8a551c7b7166c6dd900837306767643adc6e2a366e42fa13f898`.
 Full Black/Ruff checks retain baseline failures. Codespell flags one inherited
-fixture and one new test-only false positive; GPU and hosted security checks
-are unrun. [Exact results, wheel identity and limitations](rfc295-b1-cpu-results.md).
+fixture and one new test-only false positive; hosted security checks are unrun.
+[CPU results and wheel identity](rfc295-b1-cpu-results.md).
+
+GPU: same production native, Qwen3-0.6B, two independent DP=1 Workers on one
+4080 SUPER. Six short Completion JSON/SSE requests passed: fair cold choices,
+four exact-history repeats, actual Worker token agreement and successful
+commits; physical block scores, reusable tokens and actual hit deltas all zero.
+The test-log ANSI correction and original failed attempt are retained.
+[Finite GPU evidence and limitations](rfc295-b1-gpu-results.md). Not a speedup,
+new Chat capability or stock zero-engine-change claim.
 
 Before posting: resolve the integration base/interface assignment, handle
 outstanding CI gates, and complete human correctness, authorship/license and
-release review. Hardware acceptance is separately authorized and unclaimed.
+release review. Hardware acceptance is limited to the explicitly recorded slice.
 Reference, do not close, #295 or #294.
 
 Suggested issue/comment update (human-approved publication only): record B as
