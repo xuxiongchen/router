@@ -1653,7 +1653,10 @@ impl Router {
 
         // Construct one identity over the already prepared tokens. Retries
         // reuse it; only reservations are attempt-local.
-        let history_request = self.history_request(input.as_ref(), headers, raw_bytes);
+        let history_request = match raw_bytes {
+            Some(raw) => self.history_request(input.as_ref(), headers, Some(raw)),
+            None => self.history_request_from_typed(input.as_ref(), headers, typed_req),
+        };
 
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
@@ -2011,6 +2014,26 @@ impl Router {
         outgoing
     }
 
+    fn history_request_from_typed<T: serde::Serialize>(
+        &self,
+        input: Option<&PreparedKvInput>,
+        headers: Option<&HeaderMap>,
+        typed: &T,
+    ) -> Option<crate::policies::exact_history::HistoricalRoutingRequest> {
+        let policy = self.policy_registry.get_default_policy();
+        let policy = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()?;
+        if !policy.history_enabled() || input.and_then(|i| i.tokens.as_ref()).is_none() {
+            return None;
+        }
+        // Scope only: do not replace the existing typed backend body/transport.
+        // RawGenerationRequest serializes its full raw value here, preserving
+        // unknown fields. A serialization failure must not collapse namespaces.
+        let scope_bytes = serde_json::to_vec(typed).ok()?;
+        self.history_request(input, headers, Some(&scope_bytes))
+    }
+
     fn history_request(
         &self,
         input: Option<&PreparedKvInput>,
@@ -2062,9 +2085,10 @@ impl Router {
             .map(|(name, value)| (name.as_str(), value.as_bytes()))
             .collect();
         namespace_headers.sort_unstable();
-        let value: serde_json::Value = raw
-            .and_then(|r| serde_json::from_slice(r).ok())
-            .unwrap_or(serde_json::Value::Null);
+        let value: serde_json::Value = serde_json::from_slice(raw?).ok()?;
+        if !value.is_object() {
+            return None;
+        }
         let namespace = serde_json::to_vec(&(namespace_headers, value.get("user"))).ok()?;
         let namespace = format!("{:x}", Sha256::digest(namespace));
         let scope = ModelHistoryScope::new(
@@ -4137,7 +4161,9 @@ mod tests {
             contract: bridge.current_contract(),
             backend: None,
         };
-        let request = router.history_request(Some(&input), None, None).unwrap();
+        let request = router
+            .history_request(Some(&input), None, Some(b"{}"))
+            .unwrap();
         let router = Arc::new(router);
         let barrier = Arc::new(std::sync::Barrier::new(16));
         let handles: Vec<_> = (0..16)
@@ -4202,7 +4228,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer public-a".parse().unwrap());
         let initial = router
-            .history_request(Some(&input), Some(&headers), None)
+            .history_request(Some(&input), Some(&headers), Some(b"{}"))
             .unwrap();
         policy
             .history()
@@ -4214,7 +4240,7 @@ mod tests {
             let mut other = headers.clone();
             other.insert(change, "different".parse().unwrap());
             let request = router
-                .history_request(Some(&input), Some(&other), None)
+                .history_request(Some(&input), Some(&other), Some(b"{}"))
                 .unwrap();
             let result = policy
                 .history()
@@ -4228,7 +4254,7 @@ mod tests {
         }
         input.contract.as_mut().unwrap().epoch += 1;
         let request = router
-            .history_request(Some(&input), Some(&headers), None)
+            .history_request(Some(&input), Some(&headers), Some(b"{}"))
             .unwrap();
         let result = policy
             .history()
@@ -4241,7 +4267,79 @@ mod tests {
         );
         input.tokens = None;
         assert!(router
-            .history_request(Some(&input), Some(&headers), None)
+            .history_request(Some(&input), Some(&headers), Some(b"{}"))
+            .is_none());
+        bridge.shutdown();
+        assert!(bridge.wait_closed(Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    async fn history_typed_and_raw_entrypoints_preserve_user_scope_and_fail_closed() {
+        use crate::policies::exact_history::HistoricalSelectionStage;
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://127.0.0.1:1".into(),
+            WorkerType::Regular,
+        ));
+        let (router, bridge) = history_test_router(worker.clone()).await;
+        let input = PreparedKvInput {
+            tokens: Some(Arc::from([1, 2, 3])),
+            contract: bridge.current_contract(),
+            backend: None,
+        };
+        let policy = router.policy_registry.get_default_policy();
+        let history = policy
+            .as_any()
+            .downcast_ref::<crate::policies::KvAwarePolicy>()
+            .unwrap()
+            .history()
+            .unwrap();
+        let raw_a = serde_json::json!({"prompt": "public", "user": "scope-a"});
+        let typed_a: CompletionRequest = serde_json::from_value(raw_a.clone()).unwrap();
+        let typed_b: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"prompt": "public", "user": "scope-b"}))
+                .unwrap();
+        let request = router
+            .history_request_from_typed(Some(&input), None, &typed_a)
+            .unwrap();
+        assert!(history
+            .reserve_selected(&request, &worker)
+            .unwrap()
+            .commit());
+        let equivalent = router
+            .history_request(
+                Some(&input),
+                None,
+                Some(&serde_json::to_vec(&raw_a).unwrap()),
+            )
+            .unwrap();
+        let selected = history
+            .select_and_reserve(&equivalent, std::slice::from_ref(&worker), || Some(0))
+            .unwrap();
+        assert_eq!(selected.stage, HistoricalSelectionStage::ExactHistory);
+        // Commit this observation before comparing another namespace; dropping
+        // a failed history attempt intentionally invalidates its source hint.
+        assert!(selected.reservation.unwrap().commit());
+        let other = router
+            .history_request_from_typed(Some(&input), None, &typed_b)
+            .unwrap();
+        assert_eq!(
+            history
+                .select_and_reserve(&other, std::slice::from_ref(&worker), || Some(0))
+                .unwrap()
+                .stage,
+            HistoricalSelectionStage::LeastLoad
+        );
+        for raw in [None, Some(b"invalid".as_slice()), Some(b"null".as_slice())] {
+            assert!(router.history_request(Some(&input), None, raw).is_none());
+        }
+        struct Unserializable;
+        impl serde::Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("public scope failure fixture"))
+            }
+        }
+        assert!(router
+            .history_request_from_typed(Some(&input), None, &Unserializable)
             .is_none());
         bridge.shutdown();
         assert!(bridge.wait_closed(Duration::from_secs(2)).await);
