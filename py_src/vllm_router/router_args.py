@@ -39,8 +39,6 @@ class RouterArgs:
     kv_events_endpoints: List[str] = dataclasses.field(default_factory=list)
     kv_index_max_entries: int = 100_000
     kv_load_guard: bool = False
-    kv_fallback_policy: str = "least_load"
-    kv_fallback_history_ttl_secs: int = 300
     kv_completion_token_input: bool = False
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
@@ -112,6 +110,9 @@ class RouterArgs:
     cb_timeout_duration_secs: int = 60
     cb_window_duration_secs: int = 120
     disable_circuit_breaker: bool = False
+    # Append optional fields to preserve existing positional construction.
+    kv_fallback_policy: str = "least_load"
+    kv_fallback_history_ttl_secs: int = 300
 
     @staticmethod
     def add_cli_args(

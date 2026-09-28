@@ -78,6 +78,12 @@ def child(config_path):
     spec = importlib.util.spec_from_file_location("vllm_router_rs", config["extension"])
     extension = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(extension)
+    if config.get("kv_exact_history"):
+        signature = extension.Router.__text_signature__ or ""
+        require(0 <= signature.find("kv_completion_token_input")
+                < signature.find("kv_fallback_policy")
+                < signature.find("kv_fallback_history_ttl_secs"),
+                "new native history options changed existing positional argument slots")
     record(event_path, "main", extension_sha256=sha256(config["extension"]))
     stopped = threading.Event()
 

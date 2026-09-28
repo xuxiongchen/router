@@ -65,6 +65,8 @@ def _facade():
 
 class TestKvRenderEntrypoint(unittest.TestCase):
     def test_exact_history_args_and_native_kwargs_are_opt_in(self):
+        self.assertEqual(list(RouterArgs.__dataclass_fields__)[-3:], [
+            "disable_circuit_breaker", "kv_fallback_policy", "kv_fallback_history_ttl_secs"])
         self.assertEqual(RouterArgs().kv_fallback_policy, "least_load")
         args = self.args(kv_fallback_policy="cache_aware", kv_fallback_history_ttl_secs=45,
                          max_tree_size=1024, cache_threshold=0.7, kv_load_guard=True)

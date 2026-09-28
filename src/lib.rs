@@ -425,9 +425,9 @@ impl Router {
         kv_events_endpoints = vec![],
         kv_index_max_entries = 100_000,
         kv_load_guard = false,
+        kv_completion_token_input = false,
         kv_fallback_policy = "least_load".to_string(),
         kv_fallback_history_ttl_secs = 300,
-        kv_completion_token_input = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -505,9 +505,9 @@ impl Router {
         kv_events_endpoints: Vec<String>,
         kv_index_max_entries: usize,
         kv_load_guard: bool,
+        kv_completion_token_input: bool,
         kv_fallback_policy: String,
         kv_fallback_history_ttl_secs: u64,
-        kv_completion_token_input: bool,
     ) -> PyResult<Self> {
         if wasm_middleware_sha256
             .as_deref()
