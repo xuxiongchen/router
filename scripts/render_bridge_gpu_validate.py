@@ -456,7 +456,7 @@ class Validation(prior.Validation):
                         "history must reserve without manufacturing reusable tokens")
                 expected_stage = "least_load" if repetition == 0 else "exact_history"
                 require(decision["stage"] == expected_stage, "unexpected history decision stage")
-                commit_log = (self.out / f"{name}.router.log").read_text()
+                commit_log = prior.ANSI.sub("", (self.out / f"{name}.router.log").read_text())
                 require("kv_history_commit" in commit_log and "committed=true" in commit_log,
                         "Regular history commit observation is absent")
                 if owner is None:
