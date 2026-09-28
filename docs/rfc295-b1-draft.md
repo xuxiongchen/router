@@ -1,7 +1,10 @@
 # Draft: opt-in bounded exact-token history for static Regular KV routing
 
-**Not ready for publication:** B1 CPU/native/CI validation and exact candidate /
-artifact binding remain pending. No PR or RFC edit has been made.
+**Draft for human review; not published.** B1 CPU and actual optimized
+production-native validation passed at
+`3238b56d1bb265b8ea0d1f381e3f3f20ffd46099`. Hardware, outstanding CI handling,
+maintainer integration agreement and release approval remain open.
+No PR or RFC edit has been made.
 
 Refs #295, https://github.com/vllm-project/router/issues/295#issuecomment-5791829565,
 and #294. Implements the proposed B slice, not the parent RFC or PD deliverable.
@@ -31,9 +34,20 @@ automatic path meets #294's zero-engine-change goal. Restricted native/advisory
 alternatives and specific discovery fields are documented for M1/M3/M5/M7/M8
 co-review. Integration base/interfaces remain subject to maintainer agreement.
 
-Before posting: replace this pending status with exact executed PASS/FAIL/SKIP,
-candidate SHA and native/wheel hashes; complete human correctness,
-authorship/license and release review. Reference, do not close, #295 or #294.
+Validation: Rust history/KV/policies/bridge/CLI filters passed (30/76/88/13/1;
+overlapping filters), as did Python entrypoint/boundary/harness (17/40/37),
+strict default-profile Clippy, check, fmt and pip dependency checks. One actual
+production native passed off/on/on+CL/on+CL+CT, 12 synthetic transport cases,
+including JSON/SSE, deadline and disconnect. Native SHA256:
+`f2613d588ffc8a551c7b7166c6dd900837306767643adc6e2a366e42fa13f898`.
+Full Black/Ruff checks retain baseline failures. Codespell flags one inherited
+fixture and one new test-only false positive; GPU and hosted security checks
+are unrun. [Exact results, wheel identity and limitations](rfc295-b1-cpu-results.md).
+
+Before posting: resolve the integration base/interface assignment, handle
+outstanding CI gates, and complete human correctness, authorship/license and
+release review. Hardware acceptance is separately authorized and unclaimed.
+Reference, do not close, #295 or #294.
 
 Suggested issue/comment update (human-approved publication only): record B as
 the current local implementation, keep A/B/C tracking separate, update the old
