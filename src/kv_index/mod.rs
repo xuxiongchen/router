@@ -6,11 +6,13 @@ pub mod subscriber;
 pub mod types;
 pub mod wire;
 
-pub use discovery::{CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo};
+pub use discovery::{
+    CacheKey, KvEventSourceEntry, KvEventSourcesResponse, KvIndexSupervisor, WorkerKvInfo,
+};
 pub use indexer::{KvBlockIndexer, MatchQuery, TierMatch};
 pub use types::{
-    CacheOwnerId, ClearScope, HashMode, Locality,
-    ResidencyOwner, RoutableTarget, SourceId, StorageTier,
+    CacheOwnerId, ClearScope, HashMode, Locality, ResidencyOwner, RoutableTarget, SourceId,
+    StorageTier,
 };
 pub use wire::{AllBlocksCleared, BlockRemoved, BlockStored, KVEvent, KVEventBatch};
 
@@ -24,8 +26,21 @@ pub trait TieredMatchProvider: Send + Sync {
 /// `EXACT`/`DEGRADED`/`FALLBACK` state machine is the trust arbiter's contract.
 #[derive(Debug, Clone)]
 pub enum IngestionSignal {
-    Advance { source: SourceId, last_seq: i64 },
-    Gap { source: SourceId, from_seq: i64, to_seq: i64 },
-    ReplayApplied { source: SourceId, replay_seq: i64 },
-    IncarnationReset { source: SourceId, incarnation: u64 },
+    Advance {
+        source: SourceId,
+        last_seq: i64,
+    },
+    Gap {
+        source: SourceId,
+        from_seq: i64,
+        to_seq: i64,
+    },
+    ReplayApplied {
+        source: SourceId,
+        replay_seq: i64,
+    },
+    IncarnationReset {
+        source: SourceId,
+        incarnation: u64,
+    },
 }

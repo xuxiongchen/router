@@ -18,19 +18,34 @@ pub type CacheOwnerId = Arc<str>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResidencyOwner {
     /// A worker's own device/host cache. Cleared on restart via `incarnation`.
-    Worker { source: SourceId, dp_rank: u32, incarnation: u64 },
+    Worker {
+        source: SourceId,
+        dp_rank: u32,
+        incarnation: u64,
+    },
     /// A shared-pool copy attributed to the worker that pushed it.
-    CacheOwner { pool_id: CacheOwnerId, source: SourceId, dp_rank: u32 },
+    CacheOwner {
+        pool_id: CacheOwnerId,
+        source: SourceId,
+        dp_rank: u32,
+    },
 }
 
 impl ResidencyOwner {
     /// The target a hit on this owner routes to.
     pub fn target(&self) -> RoutableTarget {
         let (source, dp_rank) = match self {
-            ResidencyOwner::Worker { source, dp_rank, .. }
-            | ResidencyOwner::CacheOwner { source, dp_rank, .. } => (source, dp_rank),
+            ResidencyOwner::Worker {
+                source, dp_rank, ..
+            }
+            | ResidencyOwner::CacheOwner {
+                source, dp_rank, ..
+            } => (source, dp_rank),
         };
-        RoutableTarget { instance_id: source.clone(), dp_rank: *dp_rank }
+        RoutableTarget {
+            instance_id: source.clone(),
+            dp_rank: *dp_rank,
+        }
     }
 
     /// Locality derived from the domain: Worker = Local, CacheOwner = Remote.
@@ -124,16 +139,28 @@ mod tests {
     #[test]
     fn medium_uppercase_vllm_values() {
         assert_eq!(StorageTier::from_medium(Some("GPU")), StorageTier::Device);
-        assert_eq!(StorageTier::from_medium(Some("CPU")), StorageTier::HostPinned);
+        assert_eq!(
+            StorageTier::from_medium(Some("CPU")),
+            StorageTier::HostPinned
+        );
         assert_eq!(StorageTier::from_medium(Some("STORAGE")), StorageTier::Disk);
     }
 
     #[test]
     fn medium_case_insensitive_and_aliases() {
         assert_eq!(StorageTier::from_medium(Some("gpu")), StorageTier::Device);
-        assert_eq!(StorageTier::from_medium(Some("device")), StorageTier::Device);
-        assert_eq!(StorageTier::from_medium(Some("cpu")), StorageTier::HostPinned);
-        assert_eq!(StorageTier::from_medium(Some("host")), StorageTier::HostPinned);
+        assert_eq!(
+            StorageTier::from_medium(Some("device")),
+            StorageTier::Device
+        );
+        assert_eq!(
+            StorageTier::from_medium(Some("cpu")),
+            StorageTier::HostPinned
+        );
+        assert_eq!(
+            StorageTier::from_medium(Some("host")),
+            StorageTier::HostPinned
+        );
         assert_eq!(StorageTier::from_medium(Some("disk")), StorageTier::Disk);
     }
 
@@ -141,19 +168,32 @@ mod tests {
     fn medium_never_produces_external() {
         // External derives from the owner domain, not `medium`: pool-backend
         // medium values fall through to Device, never External.
-        assert_eq!(StorageTier::from_medium(Some("external")), StorageTier::Device);
+        assert_eq!(
+            StorageTier::from_medium(Some("external")),
+            StorageTier::Device
+        );
         assert_eq!(StorageTier::from_medium(Some("pool")), StorageTier::Device);
-        assert_eq!(StorageTier::from_medium(Some("shared")), StorageTier::Device);
+        assert_eq!(
+            StorageTier::from_medium(Some("shared")),
+            StorageTier::Device
+        );
     }
 
     #[test]
     fn medium_unknown_defaults_to_device() {
-        assert_eq!(StorageTier::from_medium(Some("nonsense")), StorageTier::Device);
+        assert_eq!(
+            StorageTier::from_medium(Some("nonsense")),
+            StorageTier::Device
+        );
     }
 
     #[test]
     fn locality_and_domain_derived_from_owner() {
-        let w = ResidencyOwner::Worker { source: Arc::from("w"), dp_rank: 0, incarnation: 0 };
+        let w = ResidencyOwner::Worker {
+            source: Arc::from("w"),
+            dp_rank: 0,
+            incarnation: 0,
+        };
         let p = ResidencyOwner::CacheOwner {
             pool_id: Arc::from("p"),
             source: Arc::from("w"),
@@ -167,14 +207,30 @@ mod tests {
 
     #[test]
     fn target_routes_to_pushing_worker() {
-        let w = ResidencyOwner::Worker { source: Arc::from("w0"), dp_rank: 1, incarnation: 3 };
-        assert_eq!(w.target(), RoutableTarget { instance_id: Arc::from("w0"), dp_rank: 1 });
+        let w = ResidencyOwner::Worker {
+            source: Arc::from("w0"),
+            dp_rank: 1,
+            incarnation: 3,
+        };
+        assert_eq!(
+            w.target(),
+            RoutableTarget {
+                instance_id: Arc::from("w0"),
+                dp_rank: 1
+            }
+        );
         let p = ResidencyOwner::CacheOwner {
             pool_id: Arc::from("pool"),
             source: Arc::from("w0"),
             dp_rank: 1,
         };
         // A pool hit is attributed to the worker that pushed it.
-        assert_eq!(p.target(), RoutableTarget { instance_id: Arc::from("w0"), dp_rank: 1 });
+        assert_eq!(
+            p.target(),
+            RoutableTarget {
+                instance_id: Arc::from("w0"),
+                dp_rank: 1
+            }
+        );
     }
 }
