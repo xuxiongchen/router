@@ -188,7 +188,7 @@ impl GroupShard {
             }
         }
         for claims in n.claims.iter_mut() {
-            if !claims.iter().any(|(o, t)| (o, t) == key) {
+            if !claims.iter().any(|claim| claim == key) {
                 claims.push(key.clone());
             }
         }
@@ -286,7 +286,7 @@ impl GroupShard {
         let mut n = node.write();
         if let Some(idx) = n.edge.iter().position(|(s, _)| s == seq) {
             if let Some(claims) = n.claims.get_mut(idx) {
-                claims.retain(|(o, t)| (o, t) != key);
+                claims.retain(|claim| claim != key);
             }
         }
     }

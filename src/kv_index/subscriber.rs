@@ -169,7 +169,7 @@ pub fn spawn(
 
 /// Shut down on an explicit signal OR the handle (sender) being dropped.
 fn is_shutdown(rx: &mut broadcast::Receiver<()>) -> bool {
-    matches!(rx.try_recv(), Ok(()) | Err(broadcast::error::RecvError::Closed))
+    matches!(rx.try_recv(), Ok(()) | Err(broadcast::error::TryRecvError::Closed))
 }
 
 /// Advisory signal send: `try_send` so a slow arbiter never stalls the hot loop.
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn read_seq_big_endian_signed() {
         assert_eq!(read_seq(&(-1i64).to_be_bytes()), -1);
-        assert_eq!(read_seq(&42i64).to_be_bytes()), 42);
+        assert_eq!(read_seq(&42i64.to_be_bytes()), 42);
     }
 
     #[test]
