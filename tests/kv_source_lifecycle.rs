@@ -21,10 +21,15 @@ struct Publisher {
     _context: zmq::Context,
     socket: zmq::Socket,
     endpoint: String,
+    topic: Vec<u8>,
 }
 
 impl Publisher {
     fn new() -> Self {
+        Self::with_topic(TOPIC)
+    }
+
+    fn with_topic(topic: &[u8]) -> Self {
         let context = zmq::Context::new();
         let socket = context.socket(zmq::XPUB).unwrap();
         socket.set_linger(0).unwrap();
@@ -35,6 +40,7 @@ impl Publisher {
             _context: context,
             socket,
             endpoint,
+            topic: topic.to_vec(),
         }
     }
 
@@ -44,7 +50,7 @@ impl Publisher {
             dp_rank: 0,
             pub_endpoint: self.endpoint.clone(),
             replay_endpoint: None,
-            topic: String::from_utf8(TOPIC.to_vec()).unwrap(),
+            topic: String::from_utf8(self.topic.clone()).unwrap(),
             hwm: None,
         }
     }
@@ -53,7 +59,7 @@ impl Publisher {
         tokio::time::timeout(TIMEOUT, async {
             loop {
                 let message = receive(&self.socket).await;
-                if message == vec![[&[1], TOPIC].concat()] {
+                if message == vec![[&[1], self.topic.as_slice()].concat()] {
                     return;
                 }
             }
@@ -64,7 +70,7 @@ impl Publisher {
 
     fn send(&self, seq: i64, payload: &[u8]) {
         self.socket
-            .send_multipart([TOPIC, &seq.to_be_bytes(), payload], 0)
+            .send_multipart([self.topic.as_slice(), &seq.to_be_bytes(), payload], 0)
             .unwrap();
     }
 }
@@ -207,6 +213,7 @@ impl ReplayServer {
     }
 
     fn send(&self, request: &[Vec<u8>], seq: i64, payload: &[u8]) {
+        assert!(seq >= 0, "use the publisher's distinct terminal schema");
         self.reply(
             request,
             vec![
@@ -215,6 +222,13 @@ impl ReplayServer {
                 seq.to_be_bytes().to_vec(),
                 payload.to_vec(),
             ],
+        );
+    }
+
+    fn send_end(&self, request: &[Vec<u8>]) {
+        self.reply(
+            request,
+            vec![vec![], vec![], (-1_i64).to_be_bytes().to_vec(), vec![]],
         );
     }
 }
@@ -286,7 +300,7 @@ async fn shutdown_fences_blocked_replay_and_waits_for_resources() {
     handle.shutdown();
     assert!(index.find_matches(&query()).is_empty());
     replay.send(&request, 1, &stored());
-    replay.send(&request, -1, &[]);
+    replay.send_end(&request);
     tokio::time::timeout(TIMEOUT, handle.shutdown_and_wait())
         .await
         .unwrap()
@@ -304,7 +318,7 @@ async fn drop_fences_blocked_replay_and_releases_the_task() {
     drop(handle);
     assert!(index.find_matches(&query()).is_empty());
     replay.send(&request, 1, &stored());
-    replay.send(&request, -1, &[]);
+    replay.send_end(&request);
     no_late_publication(&mut rx).await;
     assert!(index.find_matches(&query()).is_empty());
 }
@@ -324,7 +338,7 @@ async fn retired_handle_drop_cannot_clear_its_replacement() {
     publisher.send(0, &stored());
     advance(&mut rx, 0).await;
     replay.send(&request, 1, &stored());
-    replay.send(&request, -1, &[]);
+    replay.send_end(&request);
     old.shutdown_and_wait().await.unwrap(); // Includes the old handle's Drop.
     no_late_publication(&mut old_rx).await;
     assert_eq!(index.find_matches(&query()).len(), 1);
@@ -354,6 +368,82 @@ async fn vllm029_empty_topic_terminal_completes_replay_before_deadline() {
 }
 
 #[tokio::test]
+async fn replay_terminal_also_completes_with_empty_configured_topic() {
+    let publisher = Publisher::with_topic(b"");
+    let replay = ReplayServer::new();
+    let index = Arc::new(KvBlockIndexer::new());
+    let (handle, mut rx, request) =
+        replaying(&publisher, &replay, index.clone(), &batch(vec![], 0)).await;
+    replay.reply(
+        &request,
+        vec![vec![], vec![], 1_i64.to_be_bytes().to_vec(), stored()],
+    );
+    replay.send_end(&request);
+    let signals = tokio::time::timeout(Duration::from_secs(2), advance(&mut rx, 2))
+        .await
+        .expect("empty-topic replay must complete before its deadline");
+    assert_eq!(advances(&signals), [1, 2]);
+    assert_eq!(replay_applied(&signals), [1]);
+    assert_eq!(index.find_matches(&query()).len(), 1);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_replay_controls_cannot_complete_a_valid_prefix() {
+    let end = (-1_i64).to_be_bytes().to_vec();
+    let invalid_frames = [
+        (
+            "configured terminal topic",
+            vec![vec![], TOPIC.to_vec(), end.clone(), vec![]],
+        ),
+        (
+            "terminal payload",
+            vec![vec![], vec![], end.clone(), vec![1]],
+        ),
+        ("delimiter", vec![vec![1], vec![], end.clone(), vec![]]),
+        ("missing payload", vec![vec![], vec![], end.clone()]),
+        (
+            "extra frame",
+            vec![vec![], vec![], end.clone(), vec![], vec![]],
+        ),
+        ("short sequence", vec![vec![], vec![], vec![255; 7], vec![]]),
+        ("long sequence", vec![vec![], vec![], vec![255; 9], vec![]]),
+        (
+            "other negative",
+            vec![vec![], vec![], (-2_i64).to_be_bytes().to_vec(), vec![]],
+        ),
+        (
+            "wrong data topic",
+            vec![
+                vec![],
+                b"other".to_vec(),
+                2_i64.to_be_bytes().to_vec(),
+                batch(vec![removed()], 0),
+            ],
+        ),
+    ];
+    for (case, frames) in invalid_frames {
+        let publisher = Publisher::new();
+        let replay = ReplayServer::new();
+        let index = Arc::new(KvBlockIndexer::new());
+        let (handle, mut rx, request) =
+            replaying(&publisher, &replay, index.clone(), &batch(vec![], 0)).await;
+        replay.send(&request, 1, &stored());
+        replay.reply(&request, frames);
+        replay.send(&request, 2, &stored());
+        replay.send_end(&request);
+        publisher.send(3, &batch(vec![], 0));
+        let signals = tokio::time::timeout(Duration::from_secs(2), advance(&mut rx, 3))
+            .await
+            .unwrap_or_else(|_| panic!("malformed frame blocked replay: {case}"));
+        assert_eq!(advances(&signals), [1, 2, 3], "{case}");
+        assert_eq!(replay_applied(&signals), [2], "{case}");
+        assert_eq!(index.find_matches(&query()).len(), 1, "{case}");
+        handle.shutdown_and_wait().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn malformed_replay_does_not_consume_a_valid_same_sequence() {
     let publisher = Publisher::new();
     let replay = ReplayServer::new();
@@ -362,7 +452,7 @@ async fn malformed_replay_does_not_consume_a_valid_same_sequence() {
         replaying(&publisher, &replay, index.clone(), &batch(vec![], 0)).await;
     replay.send(&request, 1, &[0xc1]);
     replay.send(&request, 1, &stored());
-    replay.send(&request, -1, &[]);
+    replay.send_end(&request);
     let signals = advance(&mut rx, 2).await;
     assert_eq!(advances(&signals), [1, 2]);
     assert_eq!(replay_applied(&signals), [1]);
@@ -389,7 +479,7 @@ async fn replay_high_water_deduplicates_queued_live_without_fake_restart() {
     replay.send(&request, 1, &stored());
     replay.send(&request, 2, &batch(vec![], 0));
     replay.send(&request, 3, &stored());
-    replay.send(&request, -1, &[]);
+    replay.send_end(&request);
     publisher.send(4, &batch(vec![], 0));
     let signals = advance(&mut rx, 4).await;
     assert_eq!(advances(&signals), [1, 2, 3, 4]);
@@ -453,7 +543,7 @@ async fn incomplete_replay_gap_keeps_observations_without_recovery_summary() {
     let (handle, mut rx, request) =
         replaying(&publisher, &replay, index.clone(), &batch(vec![], 0)).await;
     replay.send(&request, 2, &stored()); // seq 1 remains missing.
-    replay.send(&request, -1, &[]);
+    replay.send_end(&request);
     publisher.send(3, &batch(vec![], 0));
     let signals = advance(&mut rx, 3).await;
     assert_eq!(advances(&signals), [2, 3]);
@@ -533,7 +623,7 @@ async fn invalid_replay_envelopes_and_missing_gap_produce_no_recovery_summary() 
             frames[2] = 1_i64.to_be_bytes().to_vec();
         }
         replay.reply(&request, frames);
-        replay.send(&request, -1, &[]);
+        replay.send_end(&request);
         let signals = advance(&mut rx, 2).await;
         assert_eq!(advances(&signals), [2]);
         assert!(replay_applied(&signals).is_empty());
@@ -1030,7 +1120,7 @@ async fn replay_rank_conflict_never_advances_or_reports_recovery_even_after_a_va
         // The conflicting duplicate still invalidates recovery evidence when
         // a valid seq1 was already applied; high-water skipping cannot hide it.
         replay.send(&request, 1, &batch(vec![removed()], 1));
-        replay.send(&request, -1, &[]);
+        replay.send_end(&request);
         let observed = advance(&mut signals, 2).await;
         assert_eq!(
             advances(&observed),

@@ -563,19 +563,22 @@ async fn replay(
         }
         match dealer.recv_multipart(zmq::DONTWAIT) {
             Ok(frames) => {
-                // DEALER reply: [empty, exact topic, 8-byte signed seq, payload].
-                if frames.len() != 4 || !frames[0].is_empty() || frames[1] != topic.as_bytes() {
+                // DEALER data and the publisher's terminal have distinct topics.
+                if frames.len() != 4 || !frames[0].is_empty() {
                     continue;
                 }
                 let Some(seq) = read_seq(&frames[2]) else {
                     continue;
                 };
                 if seq == END_SEQ {
+                    if !frames[1].is_empty() || !frames[3].is_empty() {
+                        continue;
+                    }
                     // Applied observations do not imply complete recovery. A
                     // missing sequence or timeout must not report a filled gap.
                     return last_applied.filter(|_| contiguous && high >= gap_to);
                 }
-                if seq < 0 {
+                if seq < 0 || frames[1] != topic.as_bytes() {
                     continue;
                 }
                 let Some(batch) = decode(&frames[3]) else {
