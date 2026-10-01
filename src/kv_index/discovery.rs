@@ -471,6 +471,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancelled_pending_guard_removes_only_its_own_generation() {
+        let (supervisor, _) = KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        let old = Arc::new(());
+        supervisor
+            .workers
+            .lock()
+            .insert("url".into(), WorkerEntry::Pending(old.clone()));
+        let pending = PendingRegistration {
+            supervisor: &supervisor,
+            worker_url: "url",
+            token: old,
+            committed: false,
+        };
+        drop(pending);
+        assert!(!supervisor.workers.lock().contains_key("url"));
+
+        let old = Arc::new(());
+        supervisor
+            .workers
+            .lock()
+            .insert("url".into(), WorkerEntry::Pending(old.clone()));
+        let pending = PendingRegistration {
+            supervisor: &supervisor,
+            worker_url: "url",
+            token: old,
+            committed: false,
+        };
+        let replacement = Arc::new(());
+        supervisor
+            .workers
+            .lock()
+            .insert("url".into(), WorkerEntry::Pending(replacement.clone()));
+        drop(pending);
+        assert!(
+            matches!(supervisor.workers.lock().get("url"), Some(WorkerEntry::Pending(token)) if Arc::ptr_eq(token, &replacement))
+        );
+    }
+
+    #[test]
+    fn last_identity_release_racing_acquire_keeps_the_new_indexer() {
+        let (supervisor, _) = KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        let key = CacheKey {
+            model: Arc::from("m"),
+            hash_mode: HashMode::Sha256,
+            block_size: 2,
+        };
+        for _ in 0..128 {
+            supervisor.acquire_identity(&key);
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let release = scope.spawn(|| {
+                    start.wait();
+                    supervisor.release_identity(&key);
+                });
+                start.wait();
+                let replacement = supervisor.acquire_identity(&key);
+                release.join().unwrap();
+                assert!(Arc::ptr_eq(
+                    &supervisor.indexers.get(&key).unwrap(),
+                    &replacement
+                ));
+                assert_eq!(supervisor.identity_refs.lock().get(&key), Some(&1));
+            });
+            supervisor.release_identity(&key);
+            assert!(supervisor.indexers.is_empty());
+        }
+    }
+
+    #[test]
     fn resolve_endpoint_rewrites_bind_star() {
         assert_eq!(
             resolve_endpoint("tcp://*:5557", "10.0.0.5"),
