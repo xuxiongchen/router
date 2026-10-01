@@ -626,6 +626,14 @@ struct DiscoveryServer {
 
 impl DiscoveryServer {
     async fn new(publisher: &Publisher, model: &str, delay: Option<&'static str>) -> Self {
+        Self::with_sources(model, delay, sources(publisher, &["0"], None)).await
+    }
+
+    async fn with_sources(
+        model: &str,
+        delay: Option<&'static str>,
+        sources: serde_json::Value,
+    ) -> Self {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let requests = Arc::new(AtomicUsize::new(0));
@@ -650,11 +658,10 @@ impl DiscoveryServer {
                 }
             }))
             .route("/kv_event_sources", get({
-                let endpoint = publisher.endpoint.clone();
                 let entered = entered.clone();
                 let release = release.clone();
                 move || {
-                    let endpoint = endpoint.clone();
+                    let sources = sources.clone();
                     let entered = entered.clone();
                     let release = release.clone();
                     let requests = requests.clone();
@@ -663,7 +670,7 @@ impl DiscoveryServer {
                             entered.notify_one();
                             release.notified().await;
                         }
-                        Json(serde_json::json!({"0": {"endpoint": endpoint, "topic": "kv"}}))
+                        Json(sources)
                     }
                 }
             }));
@@ -683,6 +690,27 @@ impl DiscoveryServer {
             .await
             .unwrap();
     }
+}
+
+fn sources(
+    publisher: &Publisher,
+    ranks: &[&str],
+    replay: Option<&ReplayServer>,
+) -> serde_json::Value {
+    serde_json::Value::Object(
+        ranks
+            .iter()
+            .map(|rank| {
+                (
+                    (*rank).to_string(),
+                    serde_json::json!({
+                        "endpoint": publisher.endpoint, "topic": "kv",
+                        "replay_endpoint": replay.map(|replay| &replay.endpoint),
+                    }),
+                )
+            })
+            .collect(),
+    )
 }
 
 impl Drop for DiscoveryServer {
@@ -777,7 +805,7 @@ async fn replacement_invalidates_late_discovery_without_disturbing_new_subscript
 }
 
 #[tokio::test]
-async fn overlapping_url_source_is_rejected_only_within_the_same_cache_identity() {
+async fn overlapping_rank_is_rejected_only_within_the_same_cache_identity() {
     let first_publisher = Publisher::new();
     let second_publisher = Publisher::new();
     let first = DiscoveryServer::new(&first_publisher, "model-A", None).await;
@@ -805,5 +833,248 @@ async fn overlapping_url_source_is_rejected_only_within_the_same_cache_identity(
         supervisor.on_worker_added(&second.url).await.unwrap().ranks,
         [0]
     );
+    supervisor.shutdown();
+}
+
+#[tokio::test]
+async fn disjoint_source_rank_urls_ingest_and_replace_without_resetting_the_peer() {
+    let publisher0 = Publisher::new();
+    let publisher1 = Publisher::new();
+    let server0 = DiscoveryServer::new(&publisher0, "model-A", None).await;
+    let server1 =
+        DiscoveryServer::with_sources("model-A", None, sources(&publisher1, &["1"], None)).await;
+    let (supervisor, mut signals) =
+        KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+    assert_eq!(
+        supervisor
+            .on_worker_added(&server0.url)
+            .await
+            .unwrap()
+            .ranks,
+        [0]
+    );
+    assert_eq!(
+        supervisor
+            .on_worker_added(&server1.url)
+            .await
+            .unwrap()
+            .ranks,
+        [1]
+    );
+    publisher0.subscribed().await;
+    publisher1.subscribed().await;
+    publisher0.send(10, &stored());
+    advance(&mut signals, 10).await;
+    publisher1.send(20, &batch(vec![stored_event("GPU", None)], 1));
+    advance(&mut signals, 20).await;
+    // Actual peer residency isolation is also checked by the lease/index unit
+    // test; the supervisor intentionally does not expose its private index.
+    supervisor.on_worker_removed(&server0.url);
+    publisher1.send(21, &batch(vec![], 1));
+    let observed = advance(&mut signals, 21).await;
+    assert_eq!(advances(&observed), [21]);
+    assert!(!observed
+        .iter()
+        .any(|signal| matches!(signal, IngestionSignal::IncarnationReset { .. })));
+    assert_eq!(
+        supervisor
+            .on_worker_added(&server0.url)
+            .await
+            .unwrap()
+            .ranks,
+        [0]
+    );
+    publisher0.subscribed().await;
+    publisher0.send(0, &stored());
+    advance(&mut signals, 0).await;
+    // Replace an already active registration synchronously as well.
+    assert_eq!(
+        supervisor
+            .on_worker_added(&server0.url)
+            .await
+            .unwrap()
+            .ranks,
+        [0]
+    );
+    publisher0.subscribed().await;
+    publisher1.send(22, &batch(vec![], 1));
+    let observed = advance(&mut signals, 22).await;
+    assert_eq!(advances(&observed), [22]);
+    assert!(!observed
+        .iter()
+        .any(|signal| matches!(signal, IngestionSignal::IncarnationReset { .. })));
+    supervisor.shutdown();
+}
+
+#[tokio::test]
+async fn free_batch_rank_override_is_owned_until_registration_retires() {
+    let publisher0 = Publisher::new();
+    let publisher1 = Publisher::new();
+    let publisher3 = Publisher::new();
+    let server0 = DiscoveryServer::new(&publisher0, "model-A", None).await;
+    let server1 =
+        DiscoveryServer::with_sources("model-A", None, sources(&publisher1, &["1"], None)).await;
+    let server3 =
+        DiscoveryServer::with_sources("model-A", None, sources(&publisher3, &["3"], None)).await;
+    let (supervisor, mut signals) =
+        KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+    supervisor.on_worker_added(&server0.url).await.unwrap();
+    supervisor.on_worker_added(&server1.url).await.unwrap();
+    publisher0.subscribed().await;
+    publisher1.subscribed().await;
+    publisher0.send(0, &batch(vec![stored_event("GPU", None)], 3));
+    assert_eq!(advances(&advance(&mut signals, 0).await), [0]);
+    let error = supervisor.on_worker_added(&server3.url).await.unwrap_err();
+    assert!(error.contains("rank 3 already registered"));
+    supervisor.on_worker_removed(&server0.url);
+    assert_eq!(
+        supervisor
+            .on_worker_added(&server3.url)
+            .await
+            .unwrap()
+            .ranks,
+        [3]
+    );
+    publisher3.subscribed().await;
+    publisher3.send(10, &batch(vec![stored_event("GPU", None)], 3));
+    advance(&mut signals, 10).await;
+    publisher1.send(20, &batch(vec![stored_event("GPU", None)], 1));
+    advance(&mut signals, 20).await;
+    supervisor.shutdown();
+}
+
+#[tokio::test]
+async fn colliding_live_batch_cannot_reset_or_advance_another_rank_writer() {
+    let publisher0 = Publisher::new();
+    let publisher1 = Publisher::new();
+    let server0 = DiscoveryServer::new(&publisher0, "model-A", None).await;
+    let server1 =
+        DiscoveryServer::with_sources("model-A", None, sources(&publisher1, &["1"], None)).await;
+    let (supervisor, mut signals) =
+        KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+    supervisor.on_worker_added(&server0.url).await.unwrap();
+    supervisor.on_worker_added(&server1.url).await.unwrap();
+    publisher0.subscribed().await;
+    publisher1.subscribed().await;
+    publisher0.send(5, &stored());
+    advance(&mut signals, 5).await;
+    publisher1.send(10, &batch(vec![stored_event("GPU", None)], 1));
+    advance(&mut signals, 10).await;
+    publisher0.send(0, &batch(vec![removed()], 1)); // Backwards collision.
+    publisher0.send(99, &batch(vec![stored_event("CPU", None)], 1)); // Gap collision.
+    publisher0.send(6, &batch(vec![], 0)); // Ordered barrier on rank0's stream.
+    let observed = advance(&mut signals, 6).await;
+    assert_eq!(advances(&observed), [6]);
+    assert!(!observed.iter().any(|signal| matches!(
+        signal,
+        IngestionSignal::IncarnationReset { .. } | IngestionSignal::Gap { .. }
+    )));
+    publisher1.send(11, &batch(vec![], 1));
+    assert_eq!(advances(&advance(&mut signals, 11).await), [11]);
+    supervisor.shutdown();
+}
+
+#[tokio::test]
+async fn replay_rank_conflict_never_advances_or_reports_recovery_even_after_a_valid_prefix() {
+    for valid_prefix in [false, true] {
+        let publisher0 = Publisher::new();
+        let publisher1 = Publisher::new();
+        let replay = ReplayServer::new();
+        let server0 = DiscoveryServer::with_sources(
+            "model-A",
+            None,
+            sources(&publisher0, &["0"], Some(&replay)),
+        )
+        .await;
+        let server1 =
+            DiscoveryServer::with_sources("model-A", None, sources(&publisher1, &["1"], None))
+                .await;
+        let (supervisor, mut signals) =
+            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        supervisor.on_worker_added(&server0.url).await.unwrap();
+        supervisor.on_worker_added(&server1.url).await.unwrap();
+        publisher0.subscribed().await;
+        publisher1.subscribed().await;
+        publisher0.send(0, &batch(vec![], 0));
+        advance(&mut signals, 0).await;
+        publisher1.send(10, &batch(vec![stored_event("GPU", None)], 1));
+        advance(&mut signals, 10).await;
+        publisher0.send(2, &batch(vec![], 0));
+        let request = receive(&replay.socket).await;
+        assert_eq!(request[2], 1_u64.to_be_bytes());
+        if valid_prefix {
+            replay.send(&request, 1, &batch(vec![], 0));
+        }
+        // The conflicting duplicate still invalidates recovery evidence when
+        // a valid seq1 was already applied; high-water skipping cannot hide it.
+        replay.send(&request, 1, &batch(vec![removed()], 1));
+        replay.send(&request, -1, &[]);
+        let observed = advance(&mut signals, 2).await;
+        assert_eq!(
+            advances(&observed),
+            if valid_prefix { vec![1, 2] } else { vec![2] }
+        );
+        assert!(replay_applied(&observed).is_empty());
+        publisher1.send(11, &batch(vec![], 1));
+        assert_eq!(advances(&advance(&mut signals, 11).await), [11]);
+        supervisor.shutdown();
+    }
+}
+
+#[tokio::test]
+async fn retiring_a_configured_rank_without_events_releases_its_reservation() {
+    let publisher0 = Publisher::new();
+    let publisher1 = Publisher::new();
+    let replacement = Publisher::new();
+    let server0 = DiscoveryServer::new(&publisher0, "model-A", None).await;
+    let server1 =
+        DiscoveryServer::with_sources("model-A", None, sources(&publisher1, &["1"], None)).await;
+    let next0 = DiscoveryServer::new(&replacement, "model-A", None).await;
+    let (supervisor, _signals) = KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+    supervisor.on_worker_added(&server0.url).await.unwrap();
+    supervisor.on_worker_added(&server1.url).await.unwrap();
+    publisher0.subscribed().await;
+    publisher1.subscribed().await;
+    assert!(supervisor.on_worker_added(&next0.url).await.is_err());
+    // Rank1 keeps the very same shared table alive during rank0's retirement.
+    supervisor.on_worker_removed(&server0.url);
+    assert_eq!(
+        supervisor.on_worker_added(&next0.url).await.unwrap().ranks,
+        [0]
+    );
+    replacement.subscribed().await;
+    supervisor.shutdown();
+}
+
+#[tokio::test]
+async fn multirank_conflict_and_numeric_aliases_leave_no_partial_reservation() {
+    let publisher0 = Publisher::new();
+    let publisher2 = Publisher::new();
+    let peer = DiscoveryServer::new(&publisher0, "model-A", None).await;
+    let (supervisor, _signals) = KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+    supervisor.on_worker_added(&peer.url).await.unwrap();
+    publisher0.subscribed().await;
+    for (ranks, message) in [
+        (vec!["2", "0"], "rank 0 already registered"),
+        (vec!["2", "02"], "duplicate numeric rank 2"),
+    ] {
+        let rejected =
+            DiscoveryServer::with_sources("model-A", None, sources(&publisher2, &ranks, None))
+                .await;
+        assert!(supervisor
+            .on_worker_added(&rejected.url)
+            .await
+            .unwrap_err()
+            .contains(message));
+        let free =
+            DiscoveryServer::with_sources("model-A", None, sources(&publisher2, &["2"], None))
+                .await;
+        assert_eq!(
+            supervisor.on_worker_added(&free.url).await.unwrap().ranks,
+            [2]
+        );
+        publisher2.subscribed().await;
+        supervisor.on_worker_removed(&free.url);
+    }
     supervisor.shutdown();
 }

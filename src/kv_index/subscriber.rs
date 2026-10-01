@@ -1,6 +1,6 @@
 //! ZMQ SUB + DEALER replay subscriber, one task per (worker, rank).
 
-use std::collections::HashSet;
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,17 +98,53 @@ struct LeaseState {
     applied_ranks: HashSet<u32>,
 }
 
+/// Shared only by registrations for one cache identity and publishing source.
+pub(super) type RankClaims = Arc<Mutex<HashMap<u32, Arc<()>>>>;
+
+#[derive(Clone)]
+pub(super) struct RankOwnership {
+    pub(super) claims: RankClaims,
+    pub(super) token: Arc<()>,
+}
+
+impl RankOwnership {
+    fn claim(&self, claims: &mut HashMap<u32, Arc<()>>, rank: u32) -> bool {
+        match claims.entry(rank) {
+            Entry::Occupied(entry) => Arc::ptr_eq(entry.get(), &self.token),
+            Entry::Vacant(entry) => {
+                entry.insert(self.token.clone());
+                true
+            }
+        }
+    }
+}
+
+enum ApplyResult {
+    Applied,
+    Skipped,
+    RankConflict,
+}
+
 #[derive(Clone)]
 struct SubscriberLease {
     state: Arc<Mutex<LeaseState>>,
     indexer: Arc<KvBlockIndexer>,
     source: SourceId,
     dp_rank: u32,
+    ownership: Option<RankOwnership>,
 }
 
 impl SubscriberLease {
-    fn clear_worker(&self, state: &mut LeaseState) {
+    fn clear_worker(&self, state: &mut LeaseState, claims: Option<&HashMap<u32, Arc<()>>>) {
         for rank in state.applied_ranks.drain() {
+            if let Some(ownership) = &self.ownership {
+                if !claims
+                    .and_then(|claims| claims.get(&rank))
+                    .is_some_and(|token| Arc::ptr_eq(token, &ownership.token))
+                {
+                    continue;
+                }
+            }
             self.indexer.clear(
                 &owner_for(&self.source, rank, state.incarnation),
                 ClearScope::Worker,
@@ -119,8 +155,13 @@ impl SubscriberLease {
     fn retire(&self) {
         let mut state = self.state.lock();
         if state.active {
+            let mut claims = self.ownership.as_ref().map(|owner| owner.claims.lock());
             state.active = false;
-            self.clear_worker(&mut state);
+            self.clear_worker(&mut state, claims.as_deref());
+            if let (Some(ownership), Some(claims)) = (&self.ownership, &mut claims) {
+                // Clear before releasing a rank for another current writer.
+                claims.retain(|_, token| !Arc::ptr_eq(token, &ownership.token));
+            }
         }
     }
 
@@ -129,16 +170,28 @@ impl SubscriberLease {
         seq: i64,
         batch: &KVEventBatch,
         signals: &Option<mpsc::Sender<IngestionSignal>>,
-    ) -> bool {
+    ) -> ApplyResult {
         // No await inside this fence: retirement, writes, high-water and the
         // positive observation signal are one publication operation.
         let mut state = self.state.lock();
-        if !state.active || seq <= state.last_seq {
-            return false;
+        if !state.active {
+            return ApplyResult::Skipped;
         }
-        state
-            .applied_ranks
-            .insert(batch.data_parallel_rank.unwrap_or(self.dp_rank));
+        let rank = batch.data_parallel_rank.unwrap_or(self.dp_rank);
+        let mut claims = self.ownership.as_ref().map(|owner| owner.claims.lock());
+        if let (Some(ownership), Some(claims)) = (&self.ownership, &mut claims) {
+            if !ownership.claim(claims, rank) {
+                warn!(
+                    "kv_index {}: batch rank{} belongs to another subscriber",
+                    self.source, rank
+                );
+                return ApplyResult::RankConflict;
+            }
+        }
+        if seq <= state.last_seq {
+            return ApplyResult::Skipped;
+        }
+        state.applied_ranks.insert(rank);
         apply_batch(
             &self.indexer,
             &self.source,
@@ -154,7 +207,7 @@ impl SubscriberLease {
                 last_seq: seq,
             },
         );
-        true
+        ApplyResult::Applied
     }
 }
 
@@ -169,12 +222,23 @@ impl Drop for RetireOnDrop {
 /// Spawn one subscriber task for an event source. Applies events to the shared
 /// indexer in `seq` order; on a gap, opens a DEALER replay to `replay_endpoint`.
 /// `signal_tx` receives ingestion signals for the trust arbiter; None disables.
-/// Callers must retire an old writer before attaching its replacement to the
-/// same indexer/source/rank. Discovery enforces this per worker registration.
+/// Standalone callers must exclusively own every actual source/rank they emit,
+/// including batch-rank overrides, and retire before attaching a replacement.
+/// Discovery coordinates supervised writers; mixing standalone and supervised
+/// writers in the same ownership domain is not protected by this API.
 pub fn spawn(
     source: EventSource,
     indexer: Arc<KvBlockIndexer>,
     signal_tx: Option<mpsc::Sender<IngestionSignal>>,
+) -> SubscriberHandle {
+    spawn_with_ownership(source, indexer, signal_tx, None)
+}
+
+pub(super) fn spawn_with_ownership(
+    source: EventSource,
+    indexer: Arc<KvBlockIndexer>,
+    signal_tx: Option<mpsc::Sender<IngestionSignal>>,
+    ownership: Option<RankOwnership>,
 ) -> SubscriberHandle {
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
     let pub_endpoint = source.pub_endpoint.clone();
@@ -193,6 +257,7 @@ pub fn spawn(
         indexer,
         source: source.source,
         dp_rank: source.dp_rank,
+        ownership,
     };
     let task_lease = lease.clone();
 
@@ -248,10 +313,21 @@ pub fn spawn(
                         if !state.active {
                             break;
                         }
+                        let rank = batch.data_parallel_rank.unwrap_or(lease.dp_rank);
+                        let mut claims = lease.ownership.as_ref().map(|owner| owner.claims.lock());
+                        if let (Some(ownership), Some(claims)) = (&lease.ownership, &mut claims) {
+                            if !ownership.claim(claims, rank) {
+                                warn!(
+                                    "kv_index {}: live batch rank{} belongs to another subscriber",
+                                    lease.source, rank
+                                );
+                                continue;
+                            }
+                        }
                         // A validated backwards sequence preserves the existing
                         // restart heuristic; this is not remote-generation proof.
                         if state.last_live_seq != -1 && seq < state.last_live_seq {
-                            lease.clear_worker(&mut state);
+                            lease.clear_worker(&mut state, claims.as_deref());
                             state.incarnation += 1;
                             state.last_seq = -1;
                             emit(
@@ -499,16 +575,20 @@ async fn replay(
                     // missing sequence or timeout must not report a filled gap.
                     return last_applied.filter(|_| contiguous && high >= gap_to);
                 }
-                if seq < 0 || seq <= high {
+                if seq < 0 {
                     continue;
                 }
                 let Some(batch) = decode(&frames[3]) else {
                     continue;
                 };
-                if lease.apply(seq, &batch, signals) {
-                    contiguous &= seq == high + 1;
-                    high = seq;
-                    last_applied = Some(seq);
+                match lease.apply(seq, &batch, signals) {
+                    ApplyResult::Applied => {
+                        contiguous &= seq == high + 1;
+                        high = seq;
+                        last_applied = Some(seq);
+                    }
+                    ApplyResult::RankConflict => contiguous = false,
+                    ApplyResult::Skipped => {}
                 }
             }
             Err(zmq::Error::EAGAIN) => {
@@ -537,6 +617,147 @@ mod tests {
     use crate::kv_index::indexer::MatchQuery;
     use crate::kv_index::types::Locality;
     use crate::kv_index::wire::BlockStored;
+
+    fn coordinated_lease(
+        indexer: &Arc<KvBlockIndexer>,
+        claims: &RankClaims,
+        rank: u32,
+    ) -> SubscriberLease {
+        let token = Arc::new(());
+        assert!(claims.lock().insert(rank, token.clone()).is_none());
+        SubscriberLease {
+            state: Arc::new(Mutex::new(LeaseState {
+                active: true,
+                incarnation: 0,
+                last_seq: -1,
+                last_live_seq: -1,
+                applied_ranks: HashSet::new(),
+            })),
+            indexer: indexer.clone(),
+            source: Arc::from("shared-source"),
+            dp_rank: rank,
+            ownership: Some(RankOwnership {
+                claims: claims.clone(),
+                token,
+            }),
+        }
+    }
+
+    fn rank_batch(rank: u32) -> KVEventBatch {
+        KVEventBatch {
+            ts: 1.0,
+            events: vec![KVEvent::BlockStored(stored(
+                vec![ExternalBlockHash::Int(42)],
+                vec![1, 2, 3, 4],
+                Some("GPU"),
+                None,
+            ))],
+            data_parallel_rank: Some(rank),
+        }
+    }
+
+    fn rank_query() -> MatchQuery {
+        MatchQuery {
+            group_idx: 0,
+            local_hashes: local_hashes(&[1, 2, 3, 4], 4, None)
+                .iter()
+                .map(|hash| Arc::from(hex(hash)))
+                .collect(),
+            tiers_of_interest: vec![StorageTier::Device],
+        }
+    }
+
+    #[test]
+    fn shared_rank_retirement_and_old_drop_preserve_peer_and_replacement_residency() {
+        let index = Arc::new(KvBlockIndexer::new());
+        let claims = Arc::new(Mutex::new(HashMap::new()));
+        let first = coordinated_lease(&index, &claims, 0);
+        let peer = coordinated_lease(&index, &claims, 1);
+        assert!(matches!(
+            first.apply(0, &rank_batch(0), &None),
+            ApplyResult::Applied
+        ));
+        assert!(matches!(
+            peer.apply(0, &rank_batch(1), &None),
+            ApplyResult::Applied
+        ));
+        assert_eq!(index.find_matches(&rank_query()).len(), 2);
+        first.retire();
+        let hits = index.find_matches(&rank_query());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].target.dp_rank, 1);
+        assert!(!claims.lock().contains_key(&0));
+        assert!(claims.lock().contains_key(&1));
+        let replacement = coordinated_lease(&index, &claims, 0);
+        assert!(matches!(
+            replacement.apply(0, &rank_batch(0), &None),
+            ApplyResult::Applied
+        ));
+        first.retire(); // The same idempotent path used by an old handle's Drop.
+        assert_eq!(index.find_matches(&rank_query()).len(), 2);
+        replacement.retire();
+        peer.retire();
+        assert!(index.find_matches(&rank_query()).is_empty());
+        assert!(claims.lock().is_empty());
+    }
+
+    #[test]
+    fn rank_conflict_and_restart_clear_only_owned_residency_and_retain_reservations() {
+        let index = Arc::new(KvBlockIndexer::new());
+        let claims = Arc::new(Mutex::new(HashMap::new()));
+        let first = coordinated_lease(&index, &claims, 0);
+        let peer = coordinated_lease(&index, &claims, 1);
+        assert!(matches!(
+            first.apply(5, &rank_batch(0), &None),
+            ApplyResult::Applied
+        ));
+        assert!(matches!(
+            peer.apply(5, &rank_batch(1), &None),
+            ApplyResult::Applied
+        ));
+        let conflicting = KVEventBatch {
+            ts: 1.0,
+            events: vec![KVEvent::AllBlocksCleared(Default::default())],
+            data_parallel_rank: Some(1),
+        };
+        assert!(matches!(
+            first.apply(6, &conflicting, &None),
+            ApplyResult::RankConflict
+        ));
+        assert_eq!(first.state.lock().last_seq, 5);
+        assert_eq!(index.find_matches(&rank_query()).len(), 2);
+        assert!(matches!(
+            first.apply(6, &rank_batch(3), &None),
+            ApplyResult::Applied
+        ));
+        assert_eq!(index.find_matches(&rank_query()).len(), 3);
+        {
+            // The production restart's clear operation holds this same lease
+            // -> claims -> index fence, without releasing active reservations.
+            let mut state = first.state.lock();
+            let owned = claims.lock();
+            first.clear_worker(&mut state, Some(&owned));
+            assert!(owned.contains_key(&0));
+            assert!(owned.contains_key(&1));
+            assert!(owned.contains_key(&3));
+        }
+        let hits = index.find_matches(&rank_query());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].target.dp_rank, 1);
+        first.retire();
+        assert!(!claims.lock().contains_key(&0));
+        assert!(!claims.lock().contains_key(&3));
+        assert!(claims.lock().contains_key(&1));
+        let replacement = coordinated_lease(&index, &claims, 3);
+        assert!(matches!(
+            replacement.apply(0, &rank_batch(3), &None),
+            ApplyResult::Applied
+        ));
+        first.retire();
+        assert_eq!(index.find_matches(&rank_query()).len(), 2);
+        replacement.retire();
+        peer.retire();
+    }
 
     fn stored(
         block_hashes: Vec<ExternalBlockHash>,

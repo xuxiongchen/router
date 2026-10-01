@@ -1,7 +1,7 @@
 //! Worker discovery: query /get_server_info + /kv_event_sources, spawn one
 //! subscriber per (worker, rank). One indexer per cache-identity core.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -11,7 +11,10 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::kv_index::indexer::KvBlockIndexer;
-use crate::kv_index::subscriber::{spawn as spawn_subscriber, EventSource, SubscriberHandle};
+use crate::kv_index::subscriber::{
+    spawn_with_ownership as spawn_subscriber, EventSource, RankClaims, RankOwnership,
+    SubscriberHandle,
+};
 use crate::kv_index::{HashMode, IngestionSignal, SourceId};
 use crate::protocols::worker_spec::ServerInfo;
 
@@ -63,6 +66,7 @@ pub struct WorkerKvInfo {
 struct WorkerSubs {
     key: CacheKey,
     source_id: SourceId,
+    rank_claims: RankClaims,
     handles: Vec<SubscriberHandle>,
 }
 
@@ -238,11 +242,9 @@ impl KvIndexSupervisor {
         let source_id: SourceId = Arc::from(instance_id.as_str());
         let mut ranks = Vec::with_capacity(sources.len());
         let mut event_sources = Vec::with_capacity(sources.len());
+        let mut numeric_ranks = HashSet::with_capacity(sources.len());
 
         for (rank_str, entry) in &sources {
-            if !events_enabled(entry) {
-                continue;
-            }
             let rank: u32 = match rank_str.parse() {
                 Ok(r) => r,
                 Err(_) => {
@@ -253,6 +255,14 @@ impl KvIndexSupervisor {
                     continue;
                 }
             };
+            if !numeric_ranks.insert(rank) {
+                return Err(format!(
+                    "kv_index {worker_url}: duplicate numeric rank {rank}"
+                ));
+            }
+            if !events_enabled(entry) {
+                continue;
+            }
             let pub_endpoint = resolve_endpoint(&entry.endpoint, &worker_host);
             let replay_endpoint = entry
                 .replay_endpoint
@@ -270,7 +280,7 @@ impl KvIndexSupervisor {
             ranks.push(rank);
         }
 
-        // Registry -> lease -> index is the lifecycle lock order. The current
+        // Registry -> lease -> claims -> index is the lifecycle lock order. The current
         // token is checked before any identity acquisition or task creation.
         let mut workers = self.workers.lock();
         if !pending.is_current(&workers) {
@@ -287,26 +297,54 @@ impl KvIndexSupervisor {
                 ranks,
             });
         }
-        if workers.values().any(|entry| {
-            matches!(entry, WorkerEntry::Active(subs) if subs.key == key && subs.source_id == source_id)
-        }) {
-            // Candidate ownership boundary: batch rank can override entry rank,
-            // so one publishing source cannot have two URL registrations in an
-            // indexer. Different cache identities remain independent.
-            return Err(format!(
-                "kv_index {worker_url}: source {instance_id} already registered for this cache identity"
-            ));
+        let rank_claims = workers
+            .values()
+            .find_map(|entry| match entry {
+                WorkerEntry::Active(subs) if subs.key == key && subs.source_id == source_id => {
+                    Some(subs.rank_claims.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+        let ownerships: Vec<_> = ranks
+            .iter()
+            .map(|_| RankOwnership {
+                claims: rank_claims.clone(),
+                token: Arc::new(()),
+            })
+            .collect();
+        {
+            let mut claims = rank_claims.lock();
+            // Preflight every rank before inserting any reservation. An actual
+            // batch-rank override can already own a configured rank as well.
+            if let Some(rank) = ranks.iter().find(|rank| claims.contains_key(*rank)) {
+                return Err(format!(
+                    "kv_index {worker_url}: source {instance_id} rank {rank} already registered for this cache identity"
+                ));
+            }
+            for (rank, ownership) in ranks.iter().zip(&ownerships) {
+                claims.insert(*rank, ownership.token.clone());
+            }
         }
         let indexer = self.acquire_identity(&key);
         let handles = event_sources
             .into_iter()
-            .map(|source| spawn_subscriber(source, indexer.clone(), Some(self.signal_tx.clone())))
+            .zip(ownerships)
+            .map(|(source, ownership)| {
+                spawn_subscriber(
+                    source,
+                    indexer.clone(),
+                    Some(self.signal_tx.clone()),
+                    Some(ownership),
+                )
+            })
             .collect();
         workers.insert(
             worker_url.to_string(),
             WorkerEntry::Active(WorkerSubs {
                 key,
                 source_id,
+                rank_claims,
                 handles,
             }),
         );
