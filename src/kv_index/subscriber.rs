@@ -9,9 +9,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::kv_index::indexer::KvBlockIndexer;
-use crate::kv_index::types::{
-    ClearScope, ResidencyOwner, SourceId, StorageTier,
-};
+use crate::kv_index::types::{ClearScope, ResidencyOwner, SourceId, StorageTier};
 use crate::kv_index::wire::{ExternalBlockHash, KVEvent, KVEventBatch};
 use crate::kv_index::IngestionSignal;
 
@@ -102,7 +100,10 @@ pub fn spawn(
         }
         // 1s timeout so the loop can poll shutdown between recvs.
         sub.set_rcvtimeo(1000).ok();
-        info!("kv_index subscriber for {} rank{} on {}", source_id, dp_rank, pub_endpoint);
+        info!(
+            "kv_index subscriber for {} rank{} on {}",
+            source_id, dp_rank, pub_endpoint
+        );
 
         let mut last_seq: i64 = -1;
         let mut incarnation: u64 = 0;
@@ -126,22 +127,57 @@ pub fn spawn(
                     // wipe this rank's worker-domain residency, re-bootstrap.
                     if last_seq != -1 && seq < last_seq {
                         incarnation += 1;
-                        warn!("kv_index {}: restart seq {} < {} → incarnation {}", source_id, seq, last_seq, incarnation);
-                        indexer.clear(&owner_for(&source_id, dp_rank, incarnation), ClearScope::Worker);
+                        warn!(
+                            "kv_index {}: restart seq {} < {} → incarnation {}",
+                            source_id, seq, last_seq, incarnation
+                        );
+                        indexer.clear(
+                            &owner_for(&source_id, dp_rank, incarnation),
+                            ClearScope::Worker,
+                        );
                         last_seq = -1;
-                        emit(&signals, IngestionSignal::IncarnationReset { source: source_id.clone(), incarnation });
+                        emit(
+                            &signals,
+                            IngestionSignal::IncarnationReset {
+                                source: source_id.clone(),
+                                incarnation,
+                            },
+                        );
                     }
                     // Gap → backfill via DEALER replay before applying this batch.
                     if last_seq != -1 && seq > last_seq + 1 {
                         let from = last_seq + 1;
                         let to = seq - 1;
                         debug!("kv_index {}: gap {}..{}", source_id, from, to);
-                        emit(&signals, IngestionSignal::Gap { source: source_id.clone(), from_seq: from, to_seq: to });
+                        emit(
+                            &signals,
+                            IngestionSignal::Gap {
+                                source: source_id.clone(),
+                                from_seq: from,
+                                to_seq: to,
+                            },
+                        );
                         if let Some(ep) = replay_endpoint.as_deref() {
-                            let applied = replay(ep, last_seq, &context, &indexer, &source_id, dp_rank, incarnation, signals.clone()).await;
+                            let applied = replay(
+                                ep,
+                                last_seq,
+                                &context,
+                                &indexer,
+                                &source_id,
+                                dp_rank,
+                                incarnation,
+                                signals.clone(),
+                            )
+                            .await;
                             if let Some(last_replay) = applied {
                                 last_seq = last_replay;
-                                emit(&signals, IngestionSignal::ReplayApplied { source: source_id.clone(), replay_seq: last_replay });
+                                emit(
+                                    &signals,
+                                    IngestionSignal::ReplayApplied {
+                                        source: source_id.clone(),
+                                        replay_seq: last_replay,
+                                    },
+                                );
                             }
                         }
                     }
@@ -150,7 +186,13 @@ pub fn spawn(
                             apply_batch(&indexer, &source_id, dp_rank, incarnation, &batch);
                         }
                         last_seq = seq;
-                        emit(&signals, IngestionSignal::Advance { source: source_id.clone(), last_seq: seq });
+                        emit(
+                            &signals,
+                            IngestionSignal::Advance {
+                                source: source_id.clone(),
+                                last_seq: seq,
+                            },
+                        );
                     }
                 }
                 Err(zmq::Error::EAGAIN) => {
@@ -169,7 +211,10 @@ pub fn spawn(
 
 /// Shut down on an explicit signal OR the handle (sender) being dropped.
 fn is_shutdown(rx: &mut broadcast::Receiver<()>) -> bool {
-    matches!(rx.try_recv(), Ok(()) | Err(broadcast::error::TryRecvError::Closed))
+    matches!(
+        rx.try_recv(),
+        Ok(()) | Err(broadcast::error::TryRecvError::Closed)
+    )
 }
 
 /// Advisory signal send: `try_send` so a slow arbiter never stalls the hot loop.
@@ -317,7 +362,10 @@ async fn replay(
     // Request everything strictly past the live high-water.
     let start_bytes = ((last_seq + 1) as u64).to_be_bytes();
     // DEALER sends [empty delim, start_seq].
-    if dealer.send_multipart([vec![], start_bytes.to_vec()], zmq::DONTWAIT).is_err() {
+    if dealer
+        .send_multipart([vec![], start_bytes.to_vec()], zmq::DONTWAIT)
+        .is_err()
+    {
         warn!("kv_index replay {} send failed", source_id);
         return None;
     }
@@ -349,7 +397,13 @@ async fn replay(
                 }
                 high = seq;
                 last_applied = Some(seq);
-                emit(&signals, IngestionSignal::Advance { source: source_id.clone(), last_seq: seq });
+                emit(
+                    &signals,
+                    IngestionSignal::Advance {
+                        source: source_id.clone(),
+                        last_seq: seq,
+                    },
+                );
             }
             Err(zmq::Error::EAGAIN) => {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -427,8 +481,10 @@ mod tests {
         };
         apply_batch(&idx, &SourceId::from("w0"), 0, 0, &batch);
 
-        let pool_locals: Vec<Arc<str>> =
-            local_hashes(&[1, 2, 3, 4], 4, None).iter().map(|b| Arc::from(hex(b))).collect();
+        let pool_locals: Vec<Arc<str>> = local_hashes(&[1, 2, 3, 4], 4, None)
+            .iter()
+            .map(|b| Arc::from(hex(b)))
+            .collect();
         let pool_res = idx.find_matches(&MatchQuery {
             group_idx: 0,
             local_hashes: pool_locals,
@@ -440,8 +496,10 @@ mod tests {
         assert_eq!(&*pool_res[0].target.instance_id, "w0");
         assert_eq!(pool_res[0].target.dp_rank, 1);
 
-        let wkr_locals: Vec<Arc<str>> =
-            local_hashes(&[5, 6, 7, 8], 4, None).iter().map(|b| Arc::from(hex(b))).collect();
+        let wkr_locals: Vec<Arc<str>> = local_hashes(&[5, 6, 7, 8], 4, None)
+            .iter()
+            .map(|b| Arc::from(hex(b)))
+            .collect();
         let wkr_res = idx.find_matches(&MatchQuery {
             group_idx: 0,
             local_hashes: wkr_locals,
@@ -473,7 +531,10 @@ mod tests {
     #[test]
     fn hash_str_int_and_bytes() {
         assert_eq!(&*hash_str(&ExternalBlockHash::Int(7)), "7");
-        assert_eq!(&*hash_str(&ExternalBlockHash::Bytes(vec![0xab, 0xcd])), "abcd");
+        assert_eq!(
+            &*hash_str(&ExternalBlockHash::Bytes(vec![0xab, 0xcd])),
+            "abcd"
+        );
     }
 
     #[test]
@@ -513,10 +574,22 @@ mod tests {
     #[tokio::test]
     async fn emit_drops_when_no_receiver() {
         let (tx, mut rx) = mpsc::channel::<IngestionSignal>(1);
-        emit(&Some(tx), IngestionSignal::Advance { source: SourceId::from("s"), last_seq: 1 });
+        emit(
+            &Some(tx),
+            IngestionSignal::Advance {
+                source: SourceId::from("s"),
+                last_seq: 1,
+            },
+        );
         // Drain the one buffered, then the next send must drop (channel full/closed).
         assert!(rx.try_recv().is_ok());
         drop(rx);
-        emit(&None, IngestionSignal::Advance { source: SourceId::from("s"), last_seq: 2 });
+        emit(
+            &None,
+            IngestionSignal::Advance {
+                source: SourceId::from("s"),
+                last_seq: 2,
+            },
+        );
     }
 }

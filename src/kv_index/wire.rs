@@ -124,11 +124,18 @@ impl<'de> Deserialize<'de> for KVEventBatch {
                 f.write_str("a 2- or 3-element array [ts, events, (rank)?]")
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let ts: f64 = seq.next_element()?.ok_or_else(|| de::Error::custom("missing ts"))?;
-                let events: Vec<KVEvent> =
-                    seq.next_element()?.ok_or_else(|| de::Error::custom("missing events"))?;
+                let ts: f64 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::custom("missing ts"))?;
+                let events: Vec<KVEvent> = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::custom("missing events"))?;
                 let data_parallel_rank: Option<u32> = seq.next_element()?;
-                Ok(KVEventBatch { ts, events, data_parallel_rank })
+                Ok(KVEventBatch {
+                    ts,
+                    events,
+                    data_parallel_rank,
+                })
             }
         }
         deserializer.deserialize_seq(V)
@@ -227,7 +234,10 @@ mod tests {
     fn all_blocks_cleared_round_trips() {
         let ev = KVEvent::AllBlocksCleared(AllBlocksCleared {});
         let buf = to_vec(&ev).unwrap();
-        assert!(matches!(from_slice::<KVEvent>(&buf).unwrap(), KVEvent::AllBlocksCleared(_)));
+        assert!(matches!(
+            from_slice::<KVEvent>(&buf).unwrap(),
+            KVEvent::AllBlocksCleared(_)
+        ));
     }
 
     #[test]

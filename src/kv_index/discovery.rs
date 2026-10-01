@@ -88,7 +88,10 @@ pub struct KvIndexSupervisor {
 impl KvIndexSupervisor {
     /// Construct the supervisor. The returned receiver streams ingestion signals
     /// to the trust arbiter; drop it to ignore signals.
-    pub fn new(client: reqwest::Client, hash_mode: HashMode) -> (Self, mpsc::Receiver<IngestionSignal>) {
+    pub fn new(
+        client: reqwest::Client,
+        hash_mode: HashMode,
+    ) -> (Self, mpsc::Receiver<IngestionSignal>) {
         let (signal_tx, signal_rx) = mpsc::channel::<IngestionSignal>(256);
         let supervisor = KvIndexSupervisor {
             client,
@@ -110,28 +113,30 @@ impl KvIndexSupervisor {
     /// this worker's identity's indexer. A 404 on /kv_event_sources (engine
     /// without the endpoint or events off) is a soft skip.
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
-        let server_info = query_server_info(&self.client, worker_url).await.unwrap_or_else(|e| {
-            warn!("kv_index {}: {} — falling back to URL as instance/model id", worker_url, e);
-            ServerInfo {
-                model_id: Some(worker_url.to_string()),
-                ..Default::default()
-            }
-        });
+        let server_info = query_server_info(&self.client, worker_url)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(
+                    "kv_index {}: {} — falling back to URL as instance/model id",
+                    worker_url, e
+                );
+                ServerInfo {
+                    model_id: Some(worker_url.to_string()),
+                    ..Default::default()
+                }
+            });
 
         let instance_id = server_info
             .instance_id
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| worker_url.to_string());
-        let model_id = server_info
-            .model_id
-            .clone()
-            .or_else(|| {
-                server_info
-                    .model_path
-                    .as_ref()
-                    .and_then(|p| p.split('/').next_back().map(str::to_string))
-            });
+        let model_id = server_info.model_id.clone().or_else(|| {
+            server_info
+                .model_path
+                .as_ref()
+                .and_then(|p| p.split('/').next_back().map(str::to_string))
+        });
         let model_id = match model_id {
             Some(m) => m,
             None => {
@@ -139,22 +144,42 @@ impl KvIndexSupervisor {
                 worker_url.to_string()
             }
         };
-        let block_size = server_info.kv_block_size.or(server_info.effective_attention_block_size);
+        let block_size = server_info
+            .kv_block_size
+            .or(server_info.effective_attention_block_size);
         self.check_block_size(worker_url, block_size);
 
         let sources = match query_kv_event_sources(&self.client, worker_url).await {
             Ok(s) => s,
             Err(e) => {
-                warn!("kv_index {}: /kv_event_sources: {} — no subscribers", worker_url, e);
-                return Ok(WorkerKvInfo { instance_id, block_size, ranks: vec![] });
+                warn!(
+                    "kv_index {}: /kv_event_sources: {} — no subscribers",
+                    worker_url, e
+                );
+                return Ok(WorkerKvInfo {
+                    instance_id,
+                    block_size,
+                    ranks: vec![],
+                });
             }
         };
 
         let Some(block_size) = block_size else {
-            warn!("kv_index {}: no block_size from /get_server_info — cannot index", worker_url);
-            return Ok(WorkerKvInfo { instance_id, block_size: None, ranks: vec![] });
+            warn!(
+                "kv_index {}: no block_size from /get_server_info — cannot index",
+                worker_url
+            );
+            return Ok(WorkerKvInfo {
+                instance_id,
+                block_size: None,
+                ranks: vec![],
+            });
         };
-        let key = CacheKey { model: Arc::from(model_id.as_str()), hash_mode: self.hash_mode, block_size };
+        let key = CacheKey {
+            model: Arc::from(model_id.as_str()),
+            hash_mode: self.hash_mode,
+            block_size,
+        };
         let indexer = self.acquire_identity(&key);
 
         let worker_host = worker_host(worker_url).unwrap_or_else(|| worker_url.to_string());
@@ -169,7 +194,10 @@ impl KvIndexSupervisor {
             let rank: u32 = match rank_str.parse() {
                 Ok(r) => r,
                 Err(_) => {
-                    warn!("kv_index {}: bad rank key '{}', skipping", worker_url, rank_str);
+                    warn!(
+                        "kv_index {}: bad rank key '{}', skipping",
+                        worker_url, rank_str
+                    );
                     continue;
                 }
             };
@@ -187,16 +215,29 @@ impl KvIndexSupervisor {
                 hwm: entry.hwm,
             };
             let handle = spawn_subscriber(ev, indexer.clone(), Some(self.signal_tx.clone()));
-            info!("kv_index {}: spawned subscriber rank{} (instance {})", worker_url, rank, instance_id);
+            info!(
+                "kv_index {}: spawned subscriber rank{} (instance {})",
+                worker_url, rank, instance_id
+            );
             handles.push(handle);
             ranks.push(rank);
         }
 
         self.workers.lock().insert(
             worker_url.to_string(),
-            WorkerSubs { key, source_id, ranks: ranks.clone(), indexer, handles },
+            WorkerSubs {
+                key,
+                source_id,
+                ranks: ranks.clone(),
+                indexer,
+                handles,
+            },
         );
-        Ok(WorkerKvInfo { instance_id, block_size: Some(block_size), ranks })
+        Ok(WorkerKvInfo {
+            instance_id,
+            block_size: Some(block_size),
+            ranks,
+        })
     }
 
     /// Shut down this worker's subscribers, clear its residency, release its
@@ -241,7 +282,8 @@ impl KvIndexSupervisor {
         let mut refs = self.identity_refs.lock();
         let count = refs.entry(key.clone()).or_insert(0);
         if *count == 0 {
-            self.indexers.insert(key.clone(), Arc::new(KvBlockIndexer::new()));
+            self.indexers
+                .insert(key.clone(), Arc::new(KvBlockIndexer::new()));
         }
         *count += 1;
         drop(refs);
@@ -279,7 +321,10 @@ impl KvIndexSupervisor {
     }
 }
 
-async fn query_server_info(client: &reqwest::Client, worker_url: &str) -> Result<ServerInfo, String> {
+async fn query_server_info(
+    client: &reqwest::Client,
+    worker_url: &str,
+) -> Result<ServerInfo, String> {
     let url = format!("{}/get_server_info", worker_url.trim_end_matches('/'));
     let resp = client
         .get(&url)
@@ -344,7 +389,10 @@ fn worker_host(worker_url: &str) -> Option<String> {
     } else {
         format!("http://{}", worker_url)
     };
-    url::Url::parse(&with_scheme).ok()?.host_str().map(|h| h.to_string())
+    url::Url::parse(&with_scheme)
+        .ok()?
+        .host_str()
+        .map(|h| h.to_string())
 }
 
 #[cfg(test)]
@@ -353,13 +401,22 @@ mod tests {
 
     #[test]
     fn resolve_endpoint_rewrites_bind_star() {
-        assert_eq!(resolve_endpoint("tcp://*:5557", "10.0.0.5"), "tcp://10.0.0.5:5557");
-        assert_eq!(resolve_endpoint("tcp://0.0.0.0:5558", "10.0.0.5"), "tcp://10.0.0.5:5558");
+        assert_eq!(
+            resolve_endpoint("tcp://*:5557", "10.0.0.5"),
+            "tcp://10.0.0.5:5557"
+        );
+        assert_eq!(
+            resolve_endpoint("tcp://0.0.0.0:5558", "10.0.0.5"),
+            "tcp://10.0.0.5:5558"
+        );
     }
 
     #[test]
     fn resolve_endpoint_keeps_resolved_host() {
-        assert_eq!(resolve_endpoint("tcp://10.0.0.5:5557", "ignored"), "tcp://10.0.0.5:5557");
+        assert_eq!(
+            resolve_endpoint("tcp://10.0.0.5:5557", "ignored"),
+            "tcp://10.0.0.5:5557"
+        );
     }
 
     #[test]
@@ -369,9 +426,15 @@ mod tests {
 
     #[test]
     fn worker_host_extracts_from_url() {
-        assert_eq!(worker_host("http://10.0.0.5:8000").as_deref(), Some("10.0.0.5"));
+        assert_eq!(
+            worker_host("http://10.0.0.5:8000").as_deref(),
+            Some("10.0.0.5")
+        );
         assert_eq!(worker_host("10.0.0.5:8000").as_deref(), Some("10.0.0.5"));
-        assert_eq!(worker_host("http://host.example:80").as_deref(), Some("host.example"));
+        assert_eq!(
+            worker_host("http://host.example:80").as_deref(),
+            Some("host.example")
+        );
     }
 
     #[test]
