@@ -332,6 +332,28 @@ async fn retired_handle_drop_cannot_clear_its_replacement() {
 }
 
 #[tokio::test]
+async fn vllm029_empty_topic_terminal_completes_replay_before_deadline() {
+    let publisher = Publisher::new();
+    let replay = ReplayServer::new();
+    let index = Arc::new(KvBlockIndexer::new());
+    let (handle, mut rx, request) =
+        replaying(&publisher, &replay, index.clone(), &batch(vec![], 0)).await;
+    replay.send(&request, 1, &stored());
+    // vLLM v0.29.0 ROUTER sends client-id followed by these DEALER frames.
+    replay.reply(
+        &request,
+        vec![vec![], vec![], (-1_i64).to_be_bytes().to_vec(), vec![]],
+    );
+    let signals = tokio::time::timeout(Duration::from_secs(2), advance(&mut rx, 2))
+        .await
+        .expect("official replay terminal must finish before the five-second deadline");
+    assert_eq!(advances(&signals), [1, 2]);
+    assert_eq!(replay_applied(&signals), [1]);
+    assert_eq!(index.find_matches(&query()).len(), 1);
+    handle.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
 async fn malformed_replay_does_not_consume_a_valid_same_sequence() {
     let publisher = Publisher::new();
     let replay = ReplayServer::new();
