@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::subscriber::{spawn as spawn_subscriber, EventSource, SubscriberHandle};
-use crate::kv_index::{ClearScope, HashMode, IngestionSignal, ResidencyOwner, SourceId};
+use crate::kv_index::{HashMode, IngestionSignal, SourceId};
 use crate::protocols::worker_spec::ServerInfo;
 
 /// The worker-stable core of a cache identity. One indexer per key.
@@ -63,9 +63,48 @@ pub struct WorkerKvInfo {
 struct WorkerSubs {
     key: CacheKey,
     source_id: SourceId,
-    ranks: Vec<u32>,
-    indexer: Arc<KvBlockIndexer>,
     handles: Vec<SubscriberHandle>,
+}
+
+enum WorkerEntry {
+    Pending(Arc<()>),
+    Active(WorkerSubs),
+}
+
+/// Cancellation only removes this request's pending slot, never a replacement.
+struct PendingRegistration<'a> {
+    supervisor: &'a KvIndexSupervisor,
+    worker_url: &'a str,
+    token: Arc<()>,
+    committed: bool,
+}
+
+impl PendingRegistration<'_> {
+    fn is_current(&self, workers: &HashMap<String, WorkerEntry>) -> bool {
+        matches!(workers.get(self.worker_url), Some(WorkerEntry::Pending(token)) if Arc::ptr_eq(token, &self.token))
+    }
+
+    fn ensure_current(&self) -> Result<(), String> {
+        if self.is_current(&self.supervisor.workers.lock()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "kv_index {}: discovery registration retired",
+                self.worker_url
+            ))
+        }
+    }
+}
+
+impl Drop for PendingRegistration<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut workers = self.supervisor.workers.lock();
+            if self.is_current(&workers) {
+                workers.remove(self.worker_url);
+            }
+        }
+    }
 }
 
 /// Orchestrates discovery + subscriber lifecycle for the router's workers.
@@ -80,7 +119,7 @@ pub struct KvIndexSupervisor {
     identity_refs: Mutex<HashMap<CacheKey, usize>>,
     signal_tx: mpsc::Sender<IngestionSignal>,
     /// Per-worker subscriber state.
-    workers: Mutex<HashMap<String, WorkerSubs>>,
+    workers: Mutex<HashMap<String, WorkerEntry>>,
     /// First-seen block_size, for cross-worker mismatch warning.
     first_block_size: Mutex<Option<u32>>,
 }
@@ -113,6 +152,20 @@ impl KvIndexSupervisor {
     /// this worker's identity's indexer. A 404 on /kv_event_sources (engine
     /// without the endpoint or events off) is a soft skip.
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
+        let token = Arc::new(());
+        {
+            let mut workers = self.workers.lock();
+            if let Some(WorkerEntry::Active(subs)) = workers.remove(worker_url) {
+                self.retire_worker(subs);
+            }
+            workers.insert(worker_url.to_string(), WorkerEntry::Pending(token.clone()));
+        }
+        let mut pending = PendingRegistration {
+            supervisor: self,
+            worker_url,
+            token,
+            committed: false,
+        };
         let server_info = query_server_info(&self.client, worker_url)
             .await
             .unwrap_or_else(|e| {
@@ -125,6 +178,7 @@ impl KvIndexSupervisor {
                     ..Default::default()
                 }
             });
+        pending.ensure_current()?;
 
         let instance_id = server_info
             .instance_id
@@ -147,11 +201,10 @@ impl KvIndexSupervisor {
         let block_size = server_info
             .kv_block_size
             .or(server_info.effective_attention_block_size);
-        self.check_block_size(worker_url, block_size);
-
         let sources = match query_kv_event_sources(&self.client, worker_url).await {
             Ok(s) => s,
             Err(e) => {
+                pending.ensure_current()?;
                 warn!(
                     "kv_index {}: /kv_event_sources: {} — no subscribers",
                     worker_url, e
@@ -165,6 +218,7 @@ impl KvIndexSupervisor {
         };
 
         let Some(block_size) = block_size else {
+            pending.ensure_current()?;
             warn!(
                 "kv_index {}: no block_size from /get_server_info — cannot index",
                 worker_url
@@ -180,12 +234,10 @@ impl KvIndexSupervisor {
             hash_mode: self.hash_mode,
             block_size,
         };
-        let indexer = self.acquire_identity(&key);
-
         let worker_host = worker_host(worker_url).unwrap_or_else(|| worker_url.to_string());
         let source_id: SourceId = Arc::from(instance_id.as_str());
         let mut ranks = Vec::with_capacity(sources.len());
-        let mut handles = Vec::with_capacity(sources.len());
+        let mut event_sources = Vec::with_capacity(sources.len());
 
         for (rank_str, entry) in &sources {
             if !events_enabled(entry) {
@@ -214,25 +266,51 @@ impl KvIndexSupervisor {
                 topic: entry.topic.clone(),
                 hwm: entry.hwm,
             };
-            let handle = spawn_subscriber(ev, indexer.clone(), Some(self.signal_tx.clone()));
-            info!(
-                "kv_index {}: spawned subscriber rank{} (instance {})",
-                worker_url, rank, instance_id
-            );
-            handles.push(handle);
+            event_sources.push(ev);
             ranks.push(rank);
         }
 
-        self.workers.lock().insert(
+        // Registry -> lease -> index is the lifecycle lock order. The current
+        // token is checked before any identity acquisition or task creation.
+        let mut workers = self.workers.lock();
+        if !pending.is_current(&workers) {
+            return Err(format!(
+                "kv_index {worker_url}: discovery registration retired"
+            ));
+        }
+        self.check_block_size(worker_url, Some(block_size));
+        if event_sources.is_empty() {
+            drop(workers);
+            return Ok(WorkerKvInfo {
+                instance_id,
+                block_size: Some(block_size),
+                ranks,
+            });
+        }
+        if workers.values().any(|entry| {
+            matches!(entry, WorkerEntry::Active(subs) if subs.key == key && subs.source_id == source_id)
+        }) {
+            // Candidate ownership boundary: batch rank can override entry rank,
+            // so one publishing source cannot have two URL registrations in an
+            // indexer. Different cache identities remain independent.
+            return Err(format!(
+                "kv_index {worker_url}: source {instance_id} already registered for this cache identity"
+            ));
+        }
+        let indexer = self.acquire_identity(&key);
+        let handles = event_sources
+            .into_iter()
+            .map(|source| spawn_subscriber(source, indexer.clone(), Some(self.signal_tx.clone())))
+            .collect();
+        workers.insert(
             worker_url.to_string(),
-            WorkerSubs {
+            WorkerEntry::Active(WorkerSubs {
                 key,
                 source_id,
-                ranks: ranks.clone(),
-                indexer,
                 handles,
-            },
+            }),
         );
+        pending.committed = true;
         Ok(WorkerKvInfo {
             instance_id,
             block_size: Some(block_size),
@@ -243,20 +321,9 @@ impl KvIndexSupervisor {
     /// Shut down this worker's subscribers, clear its residency, release its
     /// identity ref.
     pub fn on_worker_removed(&self, worker_url: &str) {
-        let entry = self.workers.lock().remove(worker_url);
-        if let Some(subs) = entry {
-            for h in subs.handles {
-                h.shutdown();
-            }
-            for rank in &subs.ranks {
-                let owner = ResidencyOwner::Worker {
-                    source: subs.source_id.clone(),
-                    dp_rank: *rank,
-                    incarnation: 0,
-                };
-                subs.indexer.clear(&owner, ClearScope::Worker);
-            }
-            self.release_identity(&subs.key);
+        let mut workers = self.workers.lock();
+        if let Some(WorkerEntry::Active(subs)) = workers.remove(worker_url) {
+            self.retire_worker(subs);
             info!("kv_index {}: removed subscribers", worker_url);
         }
     }
@@ -264,17 +331,19 @@ impl KvIndexSupervisor {
     /// Shut down every subscriber and drop all indexers.
     pub fn shutdown(&self) {
         let mut workers = self.workers.lock();
-        let keys: Vec<CacheKey> = workers.values().map(|s| s.key.clone()).collect();
-        for (_url, subs) in workers.drain() {
-            for h in subs.handles {
-                h.shutdown();
+        for (_url, entry) in workers.drain() {
+            if let WorkerEntry::Active(subs) = entry {
+                self.retire_worker(subs);
             }
         }
-        drop(workers);
-        for key in keys {
-            self.release_identity(&key);
-        }
         info!("kv_index supervisor shut down");
+    }
+
+    fn retire_worker(&self, subs: WorkerSubs) {
+        for handle in subs.handles {
+            handle.shutdown();
+        }
+        self.release_identity(&subs.key);
     }
 
     /// Ref-count an identity; on first acquisition create its indexer.
@@ -286,7 +355,6 @@ impl KvIndexSupervisor {
                 .insert(key.clone(), Arc::new(KvBlockIndexer::new()));
         }
         *count += 1;
-        drop(refs);
         self.indexers.get(key).expect("just inserted").clone()
     }
 
@@ -297,12 +365,9 @@ impl KvIndexSupervisor {
             *c = c.saturating_sub(1);
             if *c == 0 {
                 refs.remove(key);
-                drop(refs);
                 self.indexers.remove(key);
-                return;
             }
         }
-        drop(refs);
     }
 
     fn check_block_size(&self, worker_url: &str, block_size: Option<u32>) {
@@ -318,6 +383,12 @@ impl KvIndexSupervisor {
             }
             _ => {}
         }
+    }
+}
+
+impl Drop for KvIndexSupervisor {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

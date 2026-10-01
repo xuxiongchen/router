@@ -1,13 +1,16 @@
 //! ZMQ SUB + DEALER replay subscriber, one task per (worker, rank).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rmp_serde::from_slice;
+use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::{JoinError, JoinHandle};
 use tracing::{debug, info, warn};
 
+use crate::kv_events::decode_batch;
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::types::{ClearScope, ResidencyOwner, SourceId, StorageTier};
 use crate::kv_index::wire::{ExternalBlockHash, KVEvent, KVEventBatch};
@@ -56,17 +59,118 @@ pub struct EventSource {
 /// A handle to a running subscriber task; drop it (or call `shutdown`) to stop.
 pub struct SubscriberHandle {
     shutdown_tx: broadcast::Sender<()>,
+    lease: SubscriberLease,
+    task: Option<JoinHandle<()>>,
 }
 
 impl SubscriberHandle {
+    /// Synchronously fence publication and clear this attachment's Worker claims.
     pub fn shutdown(&self) {
+        self.lease.retire();
         let _ = self.shutdown_tx.send(());
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+
+    /// Retire and wait for task/socket destruction. Cancellation is expected;
+    /// a task panic remains visible to the caller.
+    pub async fn shutdown_and_wait(mut self) -> Result<(), JoinError> {
+        self.shutdown();
+        match self.task.take().expect("subscriber owns its task").await {
+            Err(error) if error.is_cancelled() => Ok(()),
+            result => result,
+        }
+    }
+}
+
+impl Drop for SubscriberHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+struct LeaseState {
+    active: bool,
+    incarnation: u64,
+    last_seq: i64,
+    last_live_seq: i64,
+    applied_ranks: HashSet<u32>,
+}
+
+#[derive(Clone)]
+struct SubscriberLease {
+    state: Arc<Mutex<LeaseState>>,
+    indexer: Arc<KvBlockIndexer>,
+    source: SourceId,
+    dp_rank: u32,
+}
+
+impl SubscriberLease {
+    fn clear_worker(&self, state: &mut LeaseState) {
+        for rank in state.applied_ranks.drain() {
+            self.indexer.clear(
+                &owner_for(&self.source, rank, state.incarnation),
+                ClearScope::Worker,
+            );
+        }
+    }
+
+    fn retire(&self) {
+        let mut state = self.state.lock();
+        if state.active {
+            state.active = false;
+            self.clear_worker(&mut state);
+        }
+    }
+
+    fn apply(
+        &self,
+        seq: i64,
+        batch: &KVEventBatch,
+        signals: &Option<mpsc::Sender<IngestionSignal>>,
+    ) -> bool {
+        // No await inside this fence: retirement, writes, high-water and the
+        // positive observation signal are one publication operation.
+        let mut state = self.state.lock();
+        if !state.active || seq <= state.last_seq {
+            return false;
+        }
+        state
+            .applied_ranks
+            .insert(batch.data_parallel_rank.unwrap_or(self.dp_rank));
+        apply_batch(
+            &self.indexer,
+            &self.source,
+            self.dp_rank,
+            state.incarnation,
+            batch,
+        );
+        state.last_seq = seq;
+        emit(
+            signals,
+            IngestionSignal::Advance {
+                source: self.source.clone(),
+                last_seq: seq,
+            },
+        );
+        true
+    }
+}
+
+struct RetireOnDrop(SubscriberLease);
+
+impl Drop for RetireOnDrop {
+    fn drop(&mut self) {
+        self.0.retire();
     }
 }
 
 /// Spawn one subscriber task for an event source. Applies events to the shared
 /// indexer in `seq` order; on a gap, opens a DEALER replay to `replay_endpoint`.
 /// `signal_tx` receives ingestion signals for the trust arbiter; None disables.
+/// Callers must retire an old writer before attaching its replacement to the
+/// same indexer/source/rank. Discovery enforces this per worker registration.
 pub fn spawn(
     source: EventSource,
     indexer: Arc<KvBlockIndexer>,
@@ -76,137 +180,145 @@ pub fn spawn(
     let pub_endpoint = source.pub_endpoint.clone();
     let replay_endpoint = source.replay_endpoint.clone();
     let topic = source.topic.clone();
-    let source_id = source.source.clone();
-    let dp_rank = source.dp_rank;
     let hwm = source.hwm;
     let signals = signal_tx;
+    let lease = SubscriberLease {
+        state: Arc::new(Mutex::new(LeaseState {
+            active: true,
+            incarnation: 0,
+            last_seq: -1,
+            last_live_seq: -1,
+            applied_ranks: HashSet::new(),
+        })),
+        indexer,
+        source: source.source,
+        dp_rank: source.dp_rank,
+    };
+    let task_lease = lease.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
+        let lease = task_lease;
+        let _retire = RetireOnDrop(lease.clone());
         let context = zmq::Context::new();
         let sub = match context.socket(zmq::SUB) {
             Ok(s) => s,
             Err(e) => {
-                warn!("kv_index sub socket for {}: {}", source_id, e);
+                warn!("kv_index sub socket for {}: {}", lease.source, e);
                 return;
             }
         };
-        if let Err(e) = sub.connect(&pub_endpoint) {
-            warn!("kv_index connect {} to {}: {}", source_id, pub_endpoint, e);
+        if let Err(e) = (|| {
+            sub.set_linger(0)?;
+            sub.set_subscribe(topic.as_bytes())?;
+            if let Some(h) = hwm {
+                sub.set_rcvhwm(h)?;
+            }
+            sub.connect(&pub_endpoint)
+        })() {
+            warn!(
+                "kv_index configure/connect {} to {}: {}",
+                lease.source, pub_endpoint, e
+            );
             return;
         }
-        sub.set_subscribe(topic.as_bytes()).ok();
-        if let Some(h) = hwm {
-            sub.set_rcvhwm(h).ok();
-        }
-        // 1s timeout so the loop can poll shutdown between recvs.
-        sub.set_rcvtimeo(1000).ok();
         info!(
             "kv_index subscriber for {} rank{} on {}",
-            source_id, dp_rank, pub_endpoint
+            lease.source, lease.dp_rank, pub_endpoint
         );
-
-        let mut last_seq: i64 = -1;
-        let mut incarnation: u64 = 0;
 
         loop {
             if is_shutdown(&mut shutdown_rx) {
-                info!("kv_index subscriber {} shutting down", source_id);
+                info!("kv_index subscriber {} shutting down", lease.source);
                 break;
             }
             match sub.recv_multipart(zmq::DONTWAIT) {
                 Ok(frames) => {
                     // PUB frame: [topic, seq, msgpack_payload].
-                    if frames.len() < 3 {
+                    if frames.len() != 3 || frames[0] != topic.as_bytes() {
                         continue;
                     }
-                    let seq = read_seq(&frames[1]);
-                    if seq == END_SEQ {
+                    let Some(seq) = read_seq(&frames[1]).filter(|seq| *seq >= 0) else {
                         continue;
-                    }
-                    // Publisher restart: seq went backwards → advance incarnation,
-                    // wipe this rank's worker-domain residency, re-bootstrap.
-                    if last_seq != -1 && seq < last_seq {
-                        incarnation += 1;
-                        warn!(
-                            "kv_index {}: restart seq {} < {} → incarnation {}",
-                            source_id, seq, last_seq, incarnation
-                        );
-                        indexer.clear(
-                            &owner_for(&source_id, dp_rank, incarnation),
-                            ClearScope::Worker,
-                        );
-                        last_seq = -1;
-                        emit(
-                            &signals,
-                            IngestionSignal::IncarnationReset {
-                                source: source_id.clone(),
-                                incarnation,
-                            },
-                        );
-                    }
-                    // Gap → backfill via DEALER replay before applying this batch.
-                    if last_seq != -1 && seq > last_seq + 1 {
+                    };
+                    let Some(batch) = decode(&frames[2]) else {
+                        continue;
+                    };
+                    let gap = {
+                        let mut state = lease.state.lock();
+                        if !state.active {
+                            break;
+                        }
+                        // A validated backwards sequence preserves the existing
+                        // restart heuristic; this is not remote-generation proof.
+                        if state.last_live_seq != -1 && seq < state.last_live_seq {
+                            lease.clear_worker(&mut state);
+                            state.incarnation += 1;
+                            state.last_seq = -1;
+                            emit(
+                                &signals,
+                                IngestionSignal::IncarnationReset {
+                                    source: lease.source.clone(),
+                                    incarnation: state.incarnation,
+                                },
+                            );
+                        }
+                        state.last_live_seq = seq;
+                        if seq <= state.last_seq {
+                            continue;
+                        }
+                        if state.last_seq != -1 && seq > state.last_seq + 1 {
+                            emit(
+                                &signals,
+                                IngestionSignal::Gap {
+                                    source: lease.source.clone(),
+                                    from_seq: state.last_seq + 1,
+                                    to_seq: seq - 1,
+                                },
+                            );
+                            Some(state.last_seq)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(last_seq) = gap {
                         let from = last_seq + 1;
                         let to = seq - 1;
-                        debug!("kv_index {}: gap {}..{}", source_id, from, to);
-                        emit(
-                            &signals,
-                            IngestionSignal::Gap {
-                                source: source_id.clone(),
-                                from_seq: from,
-                                to_seq: to,
-                            },
-                        );
+                        debug!("kv_index {}: gap {}..{}", lease.source, from, to);
                         if let Some(ep) = replay_endpoint.as_deref() {
-                            let applied = replay(
-                                ep,
-                                last_seq,
-                                &context,
-                                &indexer,
-                                &source_id,
-                                dp_rank,
-                                incarnation,
-                                signals.clone(),
-                            )
-                            .await;
+                            let applied =
+                                replay(ep, &topic, last_seq, to, &context, &lease, &signals).await;
                             if let Some(last_replay) = applied {
-                                last_seq = last_replay;
-                                emit(
-                                    &signals,
-                                    IngestionSignal::ReplayApplied {
-                                        source: source_id.clone(),
-                                        replay_seq: last_replay,
-                                    },
-                                );
+                                let state = lease.state.lock();
+                                if state.active {
+                                    emit(
+                                        &signals,
+                                        IngestionSignal::ReplayApplied {
+                                            source: lease.source.clone(),
+                                            replay_seq: last_replay,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
-                    if seq > last_seq {
-                        if let Some(batch) = decode(&frames[2]) {
-                            apply_batch(&indexer, &source_id, dp_rank, incarnation, &batch);
-                        }
-                        last_seq = seq;
-                        emit(
-                            &signals,
-                            IngestionSignal::Advance {
-                                source: source_id.clone(),
-                                last_seq: seq,
-                            },
-                        );
-                    }
+                    lease.apply(seq, &batch, &signals);
                 }
                 Err(zmq::Error::EAGAIN) => {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 Err(e) => {
-                    warn!("kv_index sub {} recv: {}", source_id, e);
+                    warn!("kv_index sub {} recv: {}", lease.source, e);
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         }
     });
 
-    SubscriberHandle { shutdown_tx }
+    SubscriberHandle {
+        shutdown_tx,
+        lease,
+        task: Some(task),
+    }
 }
 
 /// Shut down on an explicit signal OR the handle (sender) being dropped.
@@ -227,16 +339,12 @@ fn emit(tx: &Option<mpsc::Sender<IngestionSignal>>, signal: IngestionSignal) {
     }
 }
 
-fn read_seq(bytes: &[u8]) -> i64 {
-    if bytes.len() >= 8 {
-        i64::from_be_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]))
-    } else {
-        -1
-    }
+fn read_seq(bytes: &[u8]) -> Option<i64> {
+    bytes.try_into().ok().map(i64::from_be_bytes)
 }
 
 fn decode(payload: &[u8]) -> Option<KVEventBatch> {
-    match from_slice::<KVEventBatch>(payload) {
+    match decode_batch(payload) {
         Ok(b) => Some(b),
         Err(e) => {
             warn!("kv_index decode batch: {}", e);
@@ -335,30 +443,28 @@ fn apply_batch(
 /// Backfill `(last_seq, ∞)` from the replay ROUTER via a DEALER socket.
 /// Frames with `seq <= last_seq` are skipped — deduped so an out-of-order
 /// re-send can't re-apply a stale `remove` over a freshly re-`store`d block.
-/// Returns the highest seq applied, for the `ReplayApplied` signal.
-#[allow(clippy::too_many_arguments)]
+/// Returns the highest applied sequence only when a valid end marker completes
+/// a contiguous gap; this is an advisory observation, never global EXACT.
 async fn replay(
     endpoint: &str,
+    topic: &str,
     last_seq: i64,
+    gap_to: i64,
     ctx: &zmq::Context,
-    indexer: &Arc<KvBlockIndexer>,
-    source_id: &SourceId,
-    dp_rank: u32,
-    incarnation: u64,
-    signals: Option<mpsc::Sender<IngestionSignal>>,
+    lease: &SubscriberLease,
+    signals: &Option<mpsc::Sender<IngestionSignal>>,
 ) -> Option<i64> {
     let dealer = match ctx.socket(zmq::DEALER) {
         Ok(s) => s,
         Err(e) => {
-            warn!("kv_index replay socket for {}: {}", source_id, e);
+            warn!("kv_index replay socket for {}: {}", lease.source, e);
             return None;
         }
     };
-    if let Err(e) = dealer.connect(endpoint) {
+    if let Err(e) = dealer.set_linger(0).and_then(|()| dealer.connect(endpoint)) {
         warn!("kv_index replay connect {}: {}", endpoint, e);
         return None;
     }
-    dealer.set_rcvtimeo(1000).ok();
     // Request everything strictly past the live high-water.
     let start_bytes = ((last_seq + 1) as u64).to_be_bytes();
     // DEALER sends [empty delim, start_seq].
@@ -366,7 +472,7 @@ async fn replay(
         .send_multipart([vec![], start_bytes.to_vec()], zmq::DONTWAIT)
         .is_err()
     {
-        warn!("kv_index replay {} send failed", source_id);
+        warn!("kv_index replay {} send failed", lease.source);
         return None;
     }
     // ponytail: bounded poll loop. Replay is brief and rare; a hard deadline
@@ -374,47 +480,46 @@ async fn replay(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut high = last_seq;
     let mut last_applied: Option<i64> = None;
+    let mut contiguous = true;
     loop {
-        if tokio::time::Instant::now() >= deadline {
-            warn!("kv_index replay {} timed out", source_id);
-            break;
+        if !lease.state.lock().active || tokio::time::Instant::now() >= deadline {
+            return None;
         }
         match dealer.recv_multipart(zmq::DONTWAIT) {
             Ok(frames) => {
-                // DEALER reply: [empty, topic, seq, payload]; seq is 2nd-from-last.
-                if frames.len() < 4 {
-                    break;
-                }
-                let seq = read_seq(&frames[frames.len() - 2]);
-                if seq == END_SEQ {
-                    break;
-                }
-                if seq <= high {
+                // DEALER reply: [empty, exact topic, 8-byte signed seq, payload].
+                if frames.len() != 4 || !frames[0].is_empty() || frames[1] != topic.as_bytes() {
                     continue;
                 }
-                if let Some(batch) = decode(&frames[frames.len() - 1]) {
-                    apply_batch(indexer, source_id, dp_rank, incarnation, &batch);
+                let Some(seq) = read_seq(&frames[2]) else {
+                    continue;
+                };
+                if seq == END_SEQ {
+                    // Applied observations do not imply complete recovery. A
+                    // missing sequence or timeout must not report a filled gap.
+                    return last_applied.filter(|_| contiguous && high >= gap_to);
                 }
-                high = seq;
-                last_applied = Some(seq);
-                emit(
-                    &signals,
-                    IngestionSignal::Advance {
-                        source: source_id.clone(),
-                        last_seq: seq,
-                    },
-                );
+                if seq < 0 || seq <= high {
+                    continue;
+                }
+                let Some(batch) = decode(&frames[3]) else {
+                    continue;
+                };
+                if lease.apply(seq, &batch, signals) {
+                    contiguous &= seq == high + 1;
+                    high = seq;
+                    last_applied = Some(seq);
+                }
             }
             Err(zmq::Error::EAGAIN) => {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             Err(e) => {
-                warn!("kv_index replay {} recv: {}", source_id, e);
-                break;
+                warn!("kv_index replay {} recv: {}", lease.source, e);
+                return None;
             }
         }
     }
-    last_applied
 }
 
 fn hex(b: &[u8]) -> String {
@@ -515,13 +620,14 @@ mod tests {
 
     #[test]
     fn read_seq_big_endian_signed() {
-        assert_eq!(read_seq(&(-1i64).to_be_bytes()), -1);
-        assert_eq!(read_seq(&42i64.to_be_bytes()), 42);
+        assert_eq!(read_seq(&(-1i64).to_be_bytes()), Some(-1));
+        assert_eq!(read_seq(&42i64.to_be_bytes()), Some(42));
     }
 
     #[test]
-    fn read_seq_short_input_is_sentinel() {
-        assert_eq!(read_seq(&[0u8, 1]), -1);
+    fn read_seq_requires_exactly_eight_bytes() {
+        assert_eq!(read_seq(&[0u8, 1]), None);
+        assert_eq!(read_seq(&[0u8; 9]), None);
     }
 
     #[test]
