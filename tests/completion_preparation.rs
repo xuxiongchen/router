@@ -4,7 +4,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{json, Value};
-use vllm_router_rs::backend::{prepare_completion, validate_completion_tokenizer_definition};
+use vllm_router_rs::backend::{
+    prepare_completion, prepare_completion_classified, validate_completion_tokenizer_definition,
+    CompletionPreparationError,
+};
 use vllm_router_rs::protocols::spec::{CompletionRequest, PromptInput};
 use vllm_tokenizer::{HuggingFaceTokenizer, Tokenizer};
 
@@ -238,4 +241,142 @@ fn request_output_options_stay_immutable_and_retries_borrow_same_owned_tokens() 
     assert!(std::ptr::eq(first_attempt.as_ptr(), retry.as_ptr()));
     assert_eq!(serde_json::to_value(&request).unwrap(), before);
     assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn classified_preparation_preserves_the_string_result_api() {
+    let tokenizer = tokenizer();
+    for value in [
+        json!({"prompt": "hello world"}),
+        json!({"prompt": [0, 2, 15]}),
+    ] {
+        let request = request(value);
+        assert_eq!(
+            prepare_completion(&request, &tokenizer, MODEL_VOCAB_SIZE)
+                .unwrap()
+                .token_ids(),
+            prepare_completion_classified(&request, &tokenizer, MODEL_VOCAB_SIZE)
+                .unwrap()
+                .token_ids(),
+        );
+    }
+    for value in [
+        json!({"prompt": "hello", "suffix": "world"}),
+        json!({"prompt": [-1]}),
+    ] {
+        let request = request(value);
+        let classified =
+            prepare_completion_classified(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap_err();
+        assert_eq!(
+            prepare_completion(&request, &tokenizer, MODEL_VOCAB_SIZE).unwrap_err(),
+            classified.to_string()
+        );
+    }
+}
+
+#[test]
+fn classified_invalid_input_takes_precedence_over_unsupported_modifiers() {
+    let tokenizer = CountingTokenizer {
+        inner: tokenizer(),
+        encodes: AtomicUsize::new(0),
+    };
+    for value in [
+        json!({"prompt": [-1], "suffix": "world"}),
+        json!({"prompt": [16], "lora_path": "adapter"}),
+        json!({"prompt": [-1], "session_params": {}}),
+        json!({"prompt": [16], "unknown_extension": null}),
+        json!({"prompt": [[3], [-1]], "suffix": "world"}),
+        json!({"prompt": [[16]], "unknown_extension": null}),
+        json!({"prompt": ["hello"], "suffix": "world", "add_special_tokens": null}),
+        json!({"prompt": "hello", "lora_path": "adapter", "add_special_tokens": 1}),
+    ] {
+        let error = prepare_completion_classified(&request(value), &tokenizer, MODEL_VOCAB_SIZE)
+            .unwrap_err();
+        assert!(
+            matches!(error, CompletionPreparationError::InvalidRequest(_)),
+            "{error:?}"
+        );
+    }
+    let mut empty = request(json!({"prompt": [0], "suffix": "world"}));
+    empty.prompt = PromptInput::IntArray(Vec::new());
+    assert!(matches!(
+        prepare_completion_classified(&empty, &tokenizer, MODEL_VOCAB_SIZE),
+        Err(CompletionPreparationError::InvalidRequest(_))
+    ));
+    assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn classified_unsupported_inputs_never_encode() {
+    let tokenizer = CountingTokenizer {
+        inner: tokenizer(),
+        encodes: AtomicUsize::new(0),
+    };
+    for value in [
+        json!({"prompt": "hello", "suffix": "world"}),
+        json!({"prompt": [3], "suffix": "world"}),
+        json!({"prompt": ["hello", "world"]}),
+        json!({"prompt": [[3], [4, 15]]}),
+        json!({"prompt": "hello", "unknown_extension": null}),
+    ] {
+        let error = prepare_completion_classified(&request(value), &tokenizer, MODEL_VOCAB_SIZE)
+            .unwrap_err();
+        assert!(
+            matches!(error, CompletionPreparationError::Unsupported(_)),
+            "{error:?}"
+        );
+    }
+    assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn classified_service_failure_is_not_invalid_or_unsupported() {
+    let tokenizer = CountingTokenizer {
+        inner: tokenizer(),
+        encodes: AtomicUsize::new(0),
+    };
+    let error = prepare_completion_classified(
+        &request(json!({"prompt": [-1], "suffix": "world"})),
+        &tokenizer,
+        0,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, CompletionPreparationError::ServiceFailure(_)),
+        "{error:?}"
+    );
+    assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 0);
+    let error =
+        prepare_completion_classified(&request(json!({"prompt": "hello world"})), &tokenizer, 3)
+            .unwrap_err();
+    assert!(
+        matches!(error, CompletionPreparationError::ServiceFailure(_)),
+        "{error:?}"
+    );
+    assert_eq!(tokenizer.encodes.load(Ordering::Relaxed), 1);
+    let failing = HuggingFaceTokenizer::new_hf(
+        &Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tokenizer/completion_missing_unk.json"),
+    )
+    .unwrap();
+    let error = prepare_completion_classified(
+        &request(json!({"prompt": "unknown token"})),
+        &failing,
+        MODEL_VOCAB_SIZE,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, CompletionPreparationError::ServiceFailure(_)),
+        "{error:?}"
+    );
+    let error = prepare_completion_classified(
+        &request(json!({"prompt": "", "add_special_tokens": false})),
+        &tokenizer,
+        MODEL_VOCAB_SIZE,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, CompletionPreparationError::InvalidRequest(_)),
+        "{error:?}"
+    );
 }

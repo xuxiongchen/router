@@ -85,6 +85,14 @@ mod completion_http {
         attempts: Arc<AtomicUsize>,
         received: Arc<Mutex<Vec<(bytes::Bytes, HeaderMap)>>>,
         body_error_gate: Arc<tokio::sync::Notify>,
+        health_requests: Arc<AtomicUsize>,
+        health_request_gate: Arc<tokio::sync::Notify>,
+    }
+
+    async fn health(State(state): State<Backend>) -> StatusCode {
+        state.health_requests.fetch_add(1, Ordering::SeqCst);
+        state.health_request_gate.notify_one();
+        StatusCode::OK
     }
 
     async fn backend(State(state): State<Backend>, request: Request) -> Response {
@@ -153,11 +161,14 @@ mod completion_http {
             attempts: Arc::new(AtomicUsize::new(0)),
             received: Arc::new(Mutex::new(Vec::new())),
             body_error_gate: Arc::new(tokio::sync::Notify::new()),
+            health_requests: Arc::new(AtomicUsize::new(0)),
+            health_request_gate: Arc::new(tokio::sync::Notify::new()),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let worker_url = format!("http://{}", listener.local_addr().unwrap());
         let app = axum::Router::new()
             .route("/v1/completions", axum::routing::post(backend))
+            .route("/health", axum::routing::get(health))
             .with_state(backend_state.clone());
         let backend_task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -194,7 +205,11 @@ mod completion_http {
         };
         router.completion_frontend = prepare.then(|| CompletionFrontend {
             tokenizer: tokenizer.clone(),
-            model_vocab_size: 16,
+            model_vocab_size: match mode {
+                "zero_vocab" => 0,
+                "encoded_vocab_error" => 3,
+                _ => 16,
+            },
         });
         let router = Arc::new(router);
         let context = Arc::new(
@@ -291,7 +306,7 @@ mod completion_http {
     }
 
     #[tokio::test]
-    async fn ingress_ids_do_not_encode_and_invalid_or_unsupported_inputs_do_not_dispatch() {
+    async fn ingress_ids_do_not_encode_and_invalid_inputs_do_not_dispatch() {
         let h = harness("ok", true).await;
         let client = Client::new();
         for (raw, status) in [
@@ -299,14 +314,31 @@ mod completion_http {
             ("{\"prompt\":[-1]}", reqwest::StatusCode::BAD_REQUEST),
             ("{\"prompt\":[16]}", reqwest::StatusCode::BAD_REQUEST),
             (
-                "{\"prompt\":[\"hello\",\"world\"]}",
+                "{\"prompt\":[-1],\"suffix\":\"world\"}",
                 reqwest::StatusCode::BAD_REQUEST,
             ),
             (
-                "{\"prompt\":\"hello\",\"suffix\":\"world\"}",
+                "{\"prompt\":[16],\"lora_path\":\"adapter\"}",
                 reqwest::StatusCode::BAD_REQUEST,
             ),
-            ("{\"prompt\":[]}", reqwest::StatusCode::BAD_REQUEST),
+            (
+                "{\"prompt\":[-1],\"unknown_extension\":null}",
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+            (
+                "{\"prompt\":[[3],[-1]],\"suffix\":\"world\"}",
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+            (
+                "{\"prompt\":[[16]],\"unknown_extension\":null}",
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+            (
+                "{\"prompt\":[\"hello\"],\"suffix\":\"world\",\"add_special_tokens\":null}",
+                reqwest::StatusCode::BAD_REQUEST,
+            ),
+            ("{\"prompt\":", reqwest::StatusCode::BAD_REQUEST),
+            ("{\"prompt\":{}}", reqwest::StatusCode::UNPROCESSABLE_ENTITY),
         ] {
             let response = client
                 .post(&h.ingress_url)
@@ -322,6 +354,122 @@ mod completion_http {
         assert_eq!(h.backend.attempts.load(Ordering::SeqCst), 1);
         assert_eq!(h.policy.seen.lock()[0].tokens, Some(vec![0, 2, 15]));
         assert_eq!(h.worker.load(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingress_unsupported_inputs_retry_original_bytes_without_tokens_or_encoding() {
+        for raw in [
+            "{ \"prompt\":\"hello\", \"suffix\":\"world\" }\n",
+            "{ \"prompt\":[0,2,15], \"suffix\":\"world\" }\n",
+            "{ \"prompt\":[\"hello\",\"world\"] }\n",
+            "{ \"prompt\":[[3],[4,15]] }\n",
+            "{ \"prompt\":\"hello\", \"unknown_extension\":null }\n",
+        ] {
+            let h = harness("retry", true).await;
+            let response = Client::new()
+                .post(&h.ingress_url)
+                .header("content-type", "application/json")
+                .header("x-session-id", "fallback-session")
+                .body(raw)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "{raw}");
+            assert_eq!(
+                response.text().await.unwrap(),
+                "{\"choices\":[{\"text\":\"ok\"}]}"
+            );
+            assert_eq!(h.tokenizer.encodes.load(Ordering::SeqCst), 0);
+            assert_eq!(h.backend.attempts.load(Ordering::SeqCst), 2);
+            for (body, headers) in h.backend.received.lock().iter() {
+                assert_eq!(body.as_ref(), raw.as_bytes());
+                assert_eq!(headers["x-session-id"], "fallback-session");
+            }
+            let seen = h.policy.seen.lock();
+            assert_eq!(seen.len(), 2);
+            assert!(seen
+                .iter()
+                .all(|context| context.tokens.is_none() && context.pointer.is_none()));
+            assert!(seen
+                .iter()
+                .all(|context| context.session == "fallback-session"));
+            assert_eq!(h.worker.load(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn ingress_configuration_failures_never_fall_back() {
+        for (mode, raw, encodes) in [
+            ("encoded_vocab_error", "{\"prompt\":\"hello world\"}", 1),
+            (
+                "zero_vocab",
+                "{\"prompt\":\"hello\",\"suffix\":\"world\"}",
+                0,
+            ),
+        ] {
+            let h = harness(mode, true).await;
+            let response = Client::new()
+                .post(&h.ingress_url)
+                .header("content-type", "application/json")
+                .body(raw)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            let error = response.text().await.unwrap();
+            assert!(
+                error.contains(if mode == "zero_vocab" {
+                    "nonzero"
+                } else {
+                    "outside"
+                }),
+                "{error}"
+            );
+            assert_eq!(h.tokenizer.encodes.load(Ordering::SeqCst), encodes);
+            assert_eq!(h.backend.attempts.load(Ordering::SeqCst), 0);
+            assert!(h.policy.seen.lock().is_empty());
+            assert_eq!(h.worker.load(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_completion_cannot_bypass_mixed_or_grpc_pool_failure() {
+        for mixed in [true, false] {
+            let h = harness("ok", true).await;
+            if !mixed {
+                h.router
+                    .worker_registry
+                    .remove_by_url(h.worker.url())
+                    .unwrap();
+            }
+            h.router.worker_registry.register(Arc::new(BasicWorker::new(
+                "grpc://127.0.0.1:1".into(),
+                WorkerType::Regular,
+            )));
+            let response = tokio::time::timeout(
+                Duration::from_secs(3),
+                Client::new()
+                    .post(&h.ingress_url)
+                    .json(&serde_json::json!({"prompt": "hello", "suffix": "world"}))
+                    .send(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                response.status(),
+                if mixed {
+                    reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    reqwest::StatusCode::BAD_REQUEST
+                }
+            );
+            let _ = response.bytes().await.unwrap();
+            assert_eq!(h.tokenizer.encodes.load(Ordering::SeqCst), 0);
+            assert_eq!(h.backend.attempts.load(Ordering::SeqCst), 0);
+            assert!(h.policy.seen.lock().is_empty());
+            assert_eq!(h.worker.load(), 1);
+        }
     }
 
     #[tokio::test]
@@ -376,10 +524,37 @@ mod completion_http {
         assert_eq!(h.backend.attempts.load(Ordering::SeqCst), 1);
         assert_eq!(other_backend.backend.attempts.load(Ordering::SeqCst), 0);
         assert_eq!(h.tokenizer.encodes.load(Ordering::SeqCst), 1);
+        {
+            let seen = h.policy.seen.lock();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].urls, [wanted.url()]);
+            assert_eq!(seen[0].tokens, Some(vec![1, 3, 4]));
+        }
+        assert_eq!(wanted.load(), 1);
+        assert_eq!(other.load(), 1);
+
+        let raw = "{ \"model\":\"wanted\", \"prompt\":\"hello\", \"suffix\":\"world\" }\n";
+        let response = Client::new()
+            .post(&h.ingress_url)
+            .header("content-type", "application/json")
+            .header("x-session-id", "model-fallback")
+            .body(raw)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let _ = response.bytes().await.unwrap();
+        assert_eq!(h.backend.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(other_backend.backend.attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(h.tokenizer.encodes.load(Ordering::SeqCst), 1);
+        let received = h.backend.received.lock();
+        assert_eq!(received[1].0.as_ref(), raw.as_bytes());
+        assert_eq!(received[1].1["x-session-id"], "model-fallback");
         let seen = h.policy.seen.lock();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].urls, [wanted.url()]);
-        assert_eq!(seen[0].tokens, Some(vec![1, 3, 4]));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].urls, [wanted.url()]);
+        assert!(seen[1].tokens.is_none());
+        assert_eq!(seen[1].session, "model-fallback");
         assert_eq!(wanted.load(), 1);
         assert_eq!(other.load(), 1);
     }
@@ -432,6 +607,51 @@ mod completion_http {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         wait_load(&h.worker, 1).await;
+    }
+
+    #[tokio::test]
+    async fn health_monitor_preserves_two_live_completion_loads() {
+        let h = harness("stream_pending", true).await;
+        h.worker.decrement_load();
+        assert_eq!(h.worker.load(), 0);
+        let client = Client::new();
+        let mut first = client
+            .post(&h.ingress_url)
+            .json(&serde_json::json!({"prompt": "hello world", "stream": true}))
+            .send()
+            .await
+            .unwrap();
+        let mut second = client
+            .post(&h.ingress_url)
+            .json(&serde_json::json!({"prompt": "hello world", "stream": true}))
+            .send()
+            .await
+            .unwrap();
+        for response in [&mut first, &mut second] {
+            let chunk = response.chunk().await.unwrap().unwrap();
+            assert!(chunk.windows(11).any(|window| window == b"data: token"));
+        }
+        assert_eq!(h.worker.load(), 2);
+        let checker = h.router.worker_registry.start_health_checker(1);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let notified = h.backend.health_request_gate.notified();
+                // The eleventh request proves the tenth completed, including
+                // its periodic load-reset block in the old implementation.
+                if h.backend.health_requests.load(Ordering::SeqCst) >= 11 {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(h.worker.load(), 2);
+        drop(first);
+        wait_load(&h.worker, 1).await;
+        drop(second);
+        wait_load(&h.worker, 0).await;
+        checker.shutdown().await;
     }
 
     #[tokio::test]

@@ -1066,7 +1066,7 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request_with_completion(headers, typed_req, route, model_id, None)
+        self.route_typed_request_with_completion(headers, typed_req, route, model_id, None, None)
             .await
     }
 
@@ -1087,21 +1087,18 @@ impl Router {
             )
                 .into_response();
         };
-        let prepared = match crate::backend::prepare_completion(
+        let prepared = match crate::backend::prepare_completion_classified(
             body,
             frontend.tokenizer.as_ref(),
             frontend.model_vocab_size,
         ) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let status = if error.starts_with("completion tokenization failed:")
-                    || error == "completion model vocabulary must be nonzero"
-                {
-                    StatusCode::SERVICE_UNAVAILABLE
-                } else {
-                    StatusCode::BAD_REQUEST
-                };
-                return (status, error).into_response();
+            Ok(prepared) => Some(prepared),
+            Err(crate::backend::CompletionPreparationError::Unsupported(_)) => None,
+            Err(crate::backend::CompletionPreparationError::InvalidRequest(error)) => {
+                return (StatusCode::BAD_REQUEST, error).into_response();
+            }
+            Err(crate::backend::CompletionPreparationError::ServiceFailure(error)) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
             }
         };
         self.route_typed_request_with_completion(
@@ -1109,7 +1106,8 @@ impl Router {
             body,
             "/v1/completions",
             body.model.as_deref(),
-            Some((raw_body, &prepared)),
+            Some(raw_body),
+            prepared.as_ref().map(|prepared| prepared.token_ids()),
         )
         .await
     }
@@ -1122,7 +1120,8 @@ impl Router {
         typed_req: &T,
         route: &str,
         model_id: Option<&str>,
-        completion_input: Option<(&bytes::Bytes, &crate::backend::PreparedCompletion)>,
+        raw_body: Option<&bytes::Bytes>,
+        completion_token_ids: Option<&[u32]>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -1135,6 +1134,14 @@ impl Router {
                 return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
             }
         };
+
+        if raw_body.is_some() && matches!(pool, Some(crate::backend::WorkerPoolKind::Grpc)) {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("gRPC backend currently supports /v1/chat/completions, not {route}"),
+            )
+                .into_response();
+        }
 
         // All-grpc chat: tokenize once, outside policy and retry.
         // Policy still uses extract_text_for_routing (session / empty).
@@ -1203,7 +1210,7 @@ impl Router {
                         model_id,
                         Some(&text),
                         headers,
-                        completion_input.map(|(_, prepared)| prepared.token_ids()),
+                        completion_token_ids,
                     )
                 };
                 let worker = match selected_worker {
@@ -1243,7 +1250,7 @@ impl Router {
                             is_stream,
                             load_guard,
                             worker: &worker,
-                            raw_body: completion_input.map(|(raw, _)| raw),
+                            raw_body,
                             prepared: prepared.clone(),
                         },
                         program_completion.clone(),
