@@ -825,6 +825,7 @@ pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
 /// RAII guard for worker load management
 pub struct WorkerLoadGuard<'a> {
     workers: Vec<&'a dyn Worker>,
+    owned_worker: Option<Arc<dyn Worker>>,
 }
 
 impl<'a> WorkerLoadGuard<'a> {
@@ -833,6 +834,7 @@ impl<'a> WorkerLoadGuard<'a> {
         worker.increment_load();
         Self {
             workers: vec![worker],
+            owned_worker: None,
         }
     }
 
@@ -842,7 +844,21 @@ impl<'a> WorkerLoadGuard<'a> {
         for worker in &workers {
             worker.increment_load();
         }
-        Self { workers }
+        Self {
+            workers,
+            owned_worker: None,
+        }
+    }
+}
+
+impl WorkerLoadGuard<'static> {
+    /// Create an owned guard that can follow a worker into a response body.
+    pub fn new_owned(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_load();
+        Self {
+            workers: Vec::new(),
+            owned_worker: Some(worker),
+        }
     }
 }
 
@@ -851,6 +867,10 @@ impl<'a> Drop for WorkerLoadGuard<'a> {
         // Decrement load counters for all workers
         for worker in &self.workers {
             worker.decrement_load();
+        }
+        if let Some(worker) = &self.owned_worker {
+            worker.decrement_load();
+            crate::metrics::RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
     }
 }

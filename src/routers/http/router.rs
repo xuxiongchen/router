@@ -2,11 +2,11 @@ use super::program_adapter::ProgramCompletion;
 use crate::config::types::RetryConfig;
 use crate::core::{
     is_retryable_status, BasicWorker, CircuitBreakerConfig, DPAwareWorker, HealthConfig,
-    RetryExecutor, Worker, WorkerRegistry, WorkerType,
+    RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
 };
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry, PolicyRequestContext};
 use crate::program_scheduling::{
     BackendObservationProvider, ProgramIdentity, ProgramScheduler, ProgramSchedulerConfig,
     ProgramTarget, ScheduleError, VllmMetricsObservationProvider,
@@ -73,13 +73,14 @@ struct LoadTrackedBody {
         Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Send + 'static>,
     >,
     worker: Option<Arc<dyn Worker>>,
+    load_guard: Option<WorkerLoadGuard<'static>>,
     producer_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl LoadTrackedBody {
     fn release(&mut self) {
         if let Some(worker) = self.worker.take() {
-            worker.decrement_load();
+            drop(self.load_guard.take());
             RouterMetrics::set_running_requests(worker.url(), worker.load());
         }
     }
@@ -107,26 +108,31 @@ impl Drop for LoadTrackedBody {
     }
 }
 
-fn hold_load_until_body_done(mut response: Response, worker: Arc<dyn Worker>) -> Response {
+fn hold_load_until_body_done(
+    mut response: Response,
+    worker: Arc<dyn Worker>,
+    load_guard: WorkerLoadGuard<'static>,
+) -> Response {
     let producer = response
         .extensions_mut()
         .remove::<crate::backend::grpc::GrpcStreamTask>()
         .and_then(|task| task.take());
     let producer_abort = producer.as_ref().map(tokio::task::JoinHandle::abort_handle);
-    let fallback_worker = if let Some(producer) = producer {
+    let (fallback_worker, fallback_guard) = if let Some(producer) = producer {
         tokio::spawn(async move {
             let _ = producer.await;
-            worker.decrement_load();
+            drop(load_guard);
             RouterMetrics::set_running_requests(worker.url(), worker.load());
         });
-        None
+        (None, None)
     } else {
-        Some(worker)
+        (Some(worker), Some(load_guard))
     };
     let (parts, body) = response.into_parts();
     let stream = LoadTrackedBody {
         inner: Box::pin(body.into_data_stream()),
         worker: fallback_worker,
+        load_guard: fallback_guard,
         producer_abort,
     };
     Response::from_parts(parts, Body::from_stream(stream))
@@ -137,8 +143,25 @@ struct TypedDispatch<'a> {
     route: &'a str,
     worker_url: &'a str,
     is_stream: bool,
-    load_incremented: bool,
+    load_guard: Option<WorkerLoadGuard<'static>>,
+    worker: &'a Arc<dyn Worker>,
+    raw_body: Option<&'a bytes::Bytes>,
     prepared: Option<crate::backend::PreparedChat>,
+}
+
+/// Local preparation inputs, not proof of remote Worker conformance.
+/// Callers must validate the exact HF definition loaded into this tokenizer.
+struct CompletionFrontend {
+    tokenizer: Arc<dyn vllm_tokenizer::Tokenizer>,
+    model_vocab_size: u32,
+}
+
+impl std::fmt::Debug for CompletionFrontend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletionFrontend")
+            .field("model_vocab_size", &self.model_vocab_size)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Regular router that uses injected load balancing policies
@@ -155,6 +178,7 @@ pub struct Router {
     circuit_breaker_config: CircuitBreakerConfig,
     health_config: HealthConfig,
     frontend: crate::backend::EngineFrontend,
+    completion_frontend: Option<CompletionFrontend>,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_scheduler: Option<Arc<ProgramScheduler>>,
@@ -358,6 +382,7 @@ impl Router {
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
             health_config,
+            completion_frontend: None,
             frontend: crate::backend::EngineFrontend::with_request_timeout(Duration::from_secs(
                 ctx.router_config.request_timeout_secs,
             )),
@@ -999,6 +1024,7 @@ impl Router {
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
+        token_ids: Option<&[u32]>,
     ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
@@ -1024,7 +1050,12 @@ impl Router {
         // Convert headers for policies that need them (e.g., consistent_hash)
         let request_headers = Self::headers_to_request_headers(headers);
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
+        let context = PolicyRequestContext {
+            request_text: text,
+            headers: request_headers.as_ref(),
+            token_ids,
+        };
+        let idx = policy.select_worker_with_context(&available, &context)?;
         Some(available[idx].clone())
     }
 
@@ -1034,6 +1065,64 @@ impl Router {
         typed_req: &T,
         route: &str,
         model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request_with_completion(headers, typed_req, route, model_id, None)
+            .await
+    }
+
+    pub(crate) fn has_completion_frontend(&self) -> bool {
+        self.completion_frontend.is_some()
+    }
+
+    pub(crate) async fn route_prepared_completion(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &CompletionRequest,
+        raw_body: &bytes::Bytes,
+    ) -> Response {
+        let Some(frontend) = self.completion_frontend.as_ref() else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Completion preparation capability is unavailable",
+            )
+                .into_response();
+        };
+        let prepared = match crate::backend::prepare_completion(
+            body,
+            frontend.tokenizer.as_ref(),
+            frontend.model_vocab_size,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let status = if error.starts_with("completion tokenization failed:")
+                    || error == "completion model vocabulary must be nonzero"
+                {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return (status, error).into_response();
+            }
+        };
+        self.route_typed_request_with_completion(
+            headers,
+            body,
+            "/v1/completions",
+            body.model.as_deref(),
+            Some((raw_body, &prepared)),
+        )
+        .await
+    }
+
+    async fn route_typed_request_with_completion<
+        T: GenerationRequest + serde::Serialize + Clone,
+    >(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &str,
+        model_id: Option<&str>,
+        completion_input: Option<(&bytes::Bytes, &crate::backend::PreparedCompletion)>,
     ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
@@ -1110,7 +1199,12 @@ impl Router {
                     };
                     Some(worker)
                 } else {
-                    self.select_worker_for_model(model_id, Some(&text), headers)
+                    self.select_worker_for_model(
+                        model_id,
+                        Some(&text),
+                        headers,
+                        completion_input.map(|(_, prepared)| prepared.token_ids()),
+                    )
                 };
                 let worker = match selected_worker {
                     Some(w) => w,
@@ -1131,18 +1225,10 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_incremented =
-                    if policy.name() == "cache_aware" || program_completion.is_some() {
-                        worker.increment_load();
-                        RouterMetrics::set_running_requests(worker.url(), worker.load());
-                        true
-                    } else {
-                        false
-                    };
-
-                // Keep a clone for potential cleanup on retry
-                let worker_for_cleanup = if load_incremented {
-                    Some(worker.clone())
+                let load_guard = if policy.name() == "cache_aware" || program_completion.is_some() {
+                    let guard = WorkerLoadGuard::new_owned(worker.clone());
+                    RouterMetrics::set_running_requests(worker.url(), worker.load());
+                    Some(guard)
                 } else {
                     None
                 };
@@ -1155,7 +1241,9 @@ impl Router {
                             route,
                             worker_url: worker.url(),
                             is_stream,
-                            load_incremented,
+                            load_guard,
+                            worker: &worker,
+                            raw_body: completion_input.map(|(raw, _)| raw),
                             prepared: prepared.clone(),
                         },
                         program_completion.clone(),
@@ -1169,18 +1257,6 @@ impl Router {
                 worker.record_outcome(status.is_success() || status.is_client_error());
                 if was_available != worker.is_available() {
                     self.worker_registry.notify_worker_state_change();
-                }
-
-                // For retryable failures, we need to decrement load since send_typed_request
-                // won't have done it (it only decrements on success or non-retryable failures)
-                if is_retryable_status(response.status()) && load_incremented {
-                    if let Some(cleanup_worker) = worker_for_cleanup {
-                        cleanup_worker.decrement_load();
-                        RouterMetrics::set_running_requests(
-                            cleanup_worker.url(),
-                            cleanup_worker.load(),
-                        );
-                    }
                 }
 
                 response
@@ -1345,7 +1421,9 @@ impl Router {
             route,
             worker_url,
             is_stream,
-            load_incremented,
+            mut load_guard,
+            worker,
+            raw_body,
             prepared,
         } = dispatch;
         if crate::backend::is_grpc_url(worker_url) {
@@ -1367,18 +1445,13 @@ impl Router {
                     .into_response();
             };
             let mut response = self.frontend.dispatch(worker_url, prepared).await;
-            if load_incremented
-                && (response.status().is_success() || !is_retryable_status(response.status()))
-            {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    if is_stream && response.status().is_success() {
-                        response = hold_load_until_body_done(response, worker);
-                    } else {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
+            if is_stream && response.status().is_success() {
+                if let Some(guard) = load_guard.take() {
+                    response = hold_load_until_body_done(response, worker.clone(), guard);
                 }
             }
+            drop(load_guard);
+            RouterMetrics::set_running_requests(worker.url(), worker.load());
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
             }
@@ -1428,6 +1501,14 @@ impl Router {
                 )
             };
 
+        if let Some(raw_body) = raw_body {
+            request_builder = self
+                .client
+                .post(&request_url)
+                .header(CONTENT_TYPE, "application/json")
+                .body(raw_body.clone());
+        }
+
         // Copy all headers from original request if provided, skipping
         // Content-Type/Content-Length (.json() sets them) and trace headers
         // (propagate_trace_headers below injects fresh context).
@@ -1473,14 +1554,6 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // Decrement load on error if it was incremented
-                if load_incremented {
-                    if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(worker_url, worker.load());
-                    }
-                }
-
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Request failed: {}", e),
@@ -1514,118 +1587,22 @@ impl Router {
                     response
                 }
                 Err(e) => {
-                    // IMPORTANT: Decrement load on error before returning
-                    if load_incremented {
-                        if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                            worker.decrement_load();
-                            RouterMetrics::set_running_requests(worker_url, worker.load());
-                        }
-                    }
-
                     let error_msg = format!("Failed to get response body: {}", e);
                     (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
                 }
             };
-
-            // Decrement load counter for non-streaming requests if it was incremented
-            if load_incremented {
-                if let Some(worker) = self.worker_registry.get_by_url(worker_url) {
-                    worker.decrement_load();
-                    RouterMetrics::set_running_requests(worker_url, worker.load());
-                }
-            }
 
             if let Some(completion) = &program_completion {
                 completion.finish(response.status().is_success());
             }
 
             response
-        } else if load_incremented {
-            // For streaming with load tracking, we need to manually decrement when done
-            let registry = Arc::clone(&self.worker_registry);
-            let worker_url = worker_url.to_string();
-            let completion = if status.is_success() {
-                program_completion
-            } else {
-                None
-            };
-
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-            if stages_on {
-                let header_stages = http_stages_json(http_ttfb_ms, http_ttfb_ms);
-                insert_router_stages(&mut response_headers, &header_stages);
-            }
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream and detect completion
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let mut decremented = false;
-                let mut first_sse = true;
-                let mut stream_succeeded = true;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if first_sse {
-                                first_sse = false;
-                                let first_ms = t_send.elapsed().as_secs_f64() * 1000.0;
-                                if stages_on {
-                                    let stages = http_stages_json(http_ttfb_ms, first_ms);
-                                    emit_http_first_sse(&tx, &stages);
-                                }
-                            }
-                            if let Some(completion) = &completion {
-                                completion.observe_sse_chunk(&bytes);
-                            }
-                            // Check for stream end marker
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                if let Some(worker) = registry.get_by_url(&worker_url) {
-                                    worker.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url, worker.load());
-                                    decremented = true;
-                                }
-                            }
-                            if tx.send(Ok(bytes)).is_err() {
-                                stream_succeeded = false;
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            stream_succeeded = false;
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-                if !decremented {
-                    if let Some(worker) = registry.get_by_url(&worker_url) {
-                        worker.decrement_load();
-                        RouterMetrics::set_running_requests(&worker_url, worker.load());
-                    }
-                }
-                if let Some(completion) = &completion {
-                    completion.finish(stream_succeeded);
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
         } else {
-            // For requests without load tracking, just stream
+            // Retryable responses release their attempt load before retry.
+            if !status.is_success() {
+                drop(load_guard.take());
+                RouterMetrics::set_running_requests(worker.url(), worker.load());
+            }
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             // Ensure we set the correct content-type for SSE
@@ -1644,7 +1621,7 @@ impl Router {
             };
 
             // Spawn task to forward stream
-            tokio::spawn(async move {
+            let producer = tokio::spawn(async move {
                 let mut stream = stream;
                 let mut first_sse = true;
                 let mut stream_succeeded = true;
@@ -1685,6 +1662,12 @@ impl Router {
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
+            if let Some(guard) = load_guard {
+                response
+                    .extensions_mut()
+                    .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
+                response = hold_load_until_body_done(response, worker.clone(), guard);
+            }
             response
         }
     }
@@ -2653,6 +2636,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    include!("completion_http_tests.rs");
+
     fn create_test_regular_router() -> Router {
         // Create registries
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -2679,6 +2664,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            completion_frontend: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,
@@ -2710,6 +2696,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            completion_frontend: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,
@@ -2865,16 +2852,20 @@ mod tests {
             WorkerType::Regular,
         ));
 
-        worker.increment_load();
-        let response =
-            hold_load_until_body_done(Response::new(Body::from("complete")), worker.clone());
+        let response = hold_load_until_body_done(
+            Response::new(Body::from("complete")),
+            worker.clone(),
+            WorkerLoadGuard::new_owned(worker.clone()),
+        );
         assert_eq!(worker.load(), 1);
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(worker.load(), 0);
 
-        worker.increment_load();
-        let response =
-            hold_load_until_body_done(Response::new(Body::from("cancelled")), worker.clone());
+        let response = hold_load_until_body_done(
+            Response::new(Body::from("cancelled")),
+            worker.clone(),
+            WorkerLoadGuard::new_owned(worker.clone()),
+        );
         assert_eq!(worker.load(), 1);
         drop(response);
         assert_eq!(worker.load(), 0);
@@ -2887,7 +2878,6 @@ mod tests {
             WorkerType::Regular,
         ));
 
-        worker.increment_load();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let producer = tokio::spawn(async move {
             let _ = finish_rx.await;
@@ -2896,7 +2886,11 @@ mod tests {
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
-        let response = hold_load_until_body_done(response, worker.clone());
+        let response = hold_load_until_body_done(
+            response,
+            worker.clone(),
+            WorkerLoadGuard::new_owned(worker.clone()),
+        );
         finish_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while worker.load() != 0 {
@@ -2909,13 +2903,16 @@ mod tests {
         assert_eq!(worker.load(), 0);
         drop(response);
 
-        worker.increment_load();
         let producer = tokio::spawn(std::future::pending::<()>());
         let mut response = Response::new(Body::from("buffered"));
         response
             .extensions_mut()
             .insert(crate::backend::grpc::GrpcStreamTask::new(producer));
-        let response = hold_load_until_body_done(response, worker.clone());
+        let response = hold_load_until_body_done(
+            response,
+            worker.clone(),
+            WorkerLoadGuard::new_owned(worker.clone()),
+        );
         drop(response);
         tokio::time::timeout(Duration::from_secs(1), async {
             while worker.load() != 0 {
@@ -2974,6 +2971,7 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
+            completion_frontend: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,
@@ -3038,7 +3036,12 @@ mod tests {
         let mut selected_urls: Vec<String> = Vec::new();
         for _ in 0..10 {
             let worker = router
-                .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), Some(&header_map))
+                .select_worker_for_model(
+                    None,
+                    Some(r#"{"prompt": "test"}"#),
+                    Some(&header_map),
+                    None,
+                )
                 .expect("Should select a worker");
             selected_urls.push(worker.url().to_string());
         }
@@ -3068,7 +3071,7 @@ mod tests {
         }
 
         let worker = router
-            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None)
+            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None, None)
             .expect("Should select the remaining healthy worker");
 
         assert_eq!(
@@ -3089,7 +3092,8 @@ mod tests {
             w.set_healthy(false);
         }
 
-        let result = router.select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None);
+        let result =
+            router.select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None, None);
         assert!(
             result.is_none(),
             "Should return None when all workers are unavailable"
@@ -3111,6 +3115,7 @@ mod tests {
                 None,
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
+                None,
             ) {
                 worker_urls_seen.insert(worker.url().to_string());
             }

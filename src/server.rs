@@ -20,7 +20,7 @@ use crate::{
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -254,11 +254,54 @@ async fn v1_chat_completions(
     state.router.route_chat(Some(&headers), &body, None).await
 }
 
-async fn v1_completions(
+pub(crate) async fn v1_completions(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
-    Json(body): Json<CompletionRequest>,
+    request: Request,
 ) -> Response {
+    let headers = request.headers().clone();
+    if let Some(router) = state
+        .router
+        .as_any()
+        .downcast_ref::<crate::routers::http::router::Router>()
+        .filter(|router| router.has_completion_frontend())
+    {
+        let (parts, body) = request.into_parts();
+        let raw_body = match bytes::Bytes::from_request(
+            Request::from_parts(parts.clone(), body),
+            &state,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return error.into_response(),
+        };
+        let Json(value) = match Json::<serde_json::Value>::from_request(
+            Request::from_parts(parts, axum::body::Body::from(raw_body.clone())),
+            &state,
+        )
+        .await
+        {
+            Ok(json) => json,
+            Err(error) => return error.into_response(),
+        };
+        let body = match serde_json::from_value::<CompletionRequest>(value) {
+            Ok(body) => body,
+            Err(error) => {
+                return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+            }
+        };
+        if let Err(response) = authorize_request(&state, &headers).await {
+            return response;
+        }
+        return router
+            .route_prepared_completion(Some(&headers), &body, &raw_body)
+            .await;
+    }
+    // Unprepared routes keep Axum's typed JSON validation, including duplicate fields.
+    let Json(body) = match Json::<CompletionRequest>::from_request(request, &state).await {
+        Ok(json) => json,
+        Err(error) => return error.into_response(),
+    };
     if let Err(response) = authorize_request(&state, &headers).await {
         return response;
     }
