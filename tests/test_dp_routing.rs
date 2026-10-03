@@ -280,6 +280,7 @@ mod dp_e2e_tests {
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
+            completion_input_contract: None,
         }
     }
 
@@ -329,6 +330,7 @@ mod dp_e2e_tests {
             profile_timeout_secs: 30,
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
+            completion_input_contract: None,
         }
     }
 

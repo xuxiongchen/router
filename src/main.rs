@@ -116,6 +116,10 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
+    /// Opt into a supervised static Regular Completion input contract.
+    #[arg(long)]
+    completion_input_contract: Option<std::path::PathBuf>,
+
     /// Load balancing policy to use
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
@@ -596,6 +600,7 @@ impl CliArgs {
             profile_timeout_secs: 10, // Default profiling timeout
             kv_connector: self.kv_connector,
             program_scheduling,
+            completion_input_contract: self.completion_input_contract.clone(),
         })
     }
 

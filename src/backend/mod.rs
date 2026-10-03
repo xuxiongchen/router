@@ -16,6 +16,7 @@
 //! remains a transparent proxy and reports worker header/first-byte timings.
 
 pub mod completion;
+pub mod completion_activation;
 pub mod control;
 pub mod convert;
 pub mod detect;

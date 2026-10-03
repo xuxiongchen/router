@@ -251,6 +251,7 @@ impl Router {
                 self.enable_program_scheduling,
                 self.program_scheduling_config_json.as_deref(),
             )?,
+            completion_input_contract: None,
         })
     }
 }

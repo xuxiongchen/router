@@ -20,6 +20,9 @@ impl ConfigValidator {
         Self::validate_mode(&config.mode, has_service_discovery)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
+        if config.completion_input_contract.is_some() {
+            Self::validate_completion_input_contract(config)?;
+        }
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;
         }
@@ -40,6 +43,39 @@ impl ConfigValidator {
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
+        Ok(())
+    }
+
+    fn validate_completion_input_contract(config: &RouterConfig) -> ConfigResult<()> {
+        let valid_workers = match &config.mode {
+            RoutingMode::Regular { worker_urls } => {
+                let mut unique = std::collections::HashSet::new();
+                !worker_urls.is_empty()
+                    && worker_urls.iter().all(|url| {
+                        reqwest::Url::parse(url).is_ok_and(|parsed| {
+                            matches!(parsed.scheme(), "http" | "https")
+                                && parsed.host_str().is_some()
+                                && parsed.username().is_empty()
+                                && parsed.password().is_none()
+                                && parsed.query().is_none()
+                                && parsed.fragment().is_none()
+                                && unique.insert(parsed.as_str().trim_end_matches('/').to_string())
+                        })
+                    })
+            }
+            _ => false,
+        };
+        if !valid_workers
+            || config.connection_mode != ConnectionMode::Http
+            || config.intra_node_data_parallel_size != 1
+            || config.discovery.as_ref().is_some_and(|d| d.enabled)
+            || config.enable_igw
+            || config.program_scheduling.is_some()
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "completion_input_contract requires unique static Regular HTTP workers, DP=1, discovery/IGW/Program scheduling disabled".into(),
+            });
+        }
         Ok(())
     }
 
@@ -696,6 +732,75 @@ impl ConfigValidator {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completion_input_contract_defaults_off_and_rejects_nonstatic_modes() {
+        use super::*;
+        let default = RouterConfig::default();
+        assert!(default.completion_input_contract.is_none());
+        assert!(serde_json::to_value(&default)
+            .unwrap()
+            .get("completion_input_contract")
+            .is_none());
+        let config = RouterConfig {
+            completion_input_contract: Some("contract.json".into()),
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".into()],
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        for invalid in [
+            RouterConfig {
+                intra_node_data_parallel_size: 2,
+                ..config.clone()
+            },
+            RouterConfig {
+                enable_igw: true,
+                ..config.clone()
+            },
+            RouterConfig {
+                connection_mode: ConnectionMode::Grpc,
+                ..config.clone()
+            },
+            RouterConfig {
+                discovery: Some(DiscoveryConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                ..config.clone()
+            },
+            RouterConfig {
+                program_scheduling: Some(ProgramSchedulingConfig::default()),
+                ..config.clone()
+            },
+            RouterConfig {
+                mode: RoutingMode::Regular {
+                    worker_urls: vec![],
+                },
+                ..config.clone()
+            },
+            RouterConfig {
+                mode: RoutingMode::Regular {
+                    worker_urls: vec!["grpc://worker:8000".into()],
+                },
+                ..config.clone()
+            },
+            RouterConfig {
+                mode: RoutingMode::Regular {
+                    worker_urls: vec!["http://worker:8000".into(), "http://worker:8000/".into()],
+                },
+                ..config.clone()
+            },
+            RouterConfig {
+                mode: RoutingMode::OpenAI {
+                    worker_urls: vec!["http://worker:8000".into()],
+                },
+                ..config.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "accepted {invalid:?}");
+        }
+    }
     use super::*;
 
     #[test]

@@ -210,6 +210,7 @@ mod completion_http {
                 "encoded_vocab_error" => 3,
                 _ => 16,
             },
+            activation: None,
         });
         let router = Arc::new(router);
         let context = Arc::new(

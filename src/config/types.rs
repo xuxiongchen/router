@@ -88,6 +88,9 @@ pub struct RouterConfig {
     /// Optional Program-level admission and continuity scheduling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_scheduling: Option<ProgramSchedulingConfig>,
+    /// Default-off, controlled static Completion input contract file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_input_contract: Option<std::path::PathBuf>,
 }
 
 fn default_profile_timeout_secs() -> u64 {
@@ -909,6 +912,7 @@ impl Default for RouterConfig {
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            completion_input_contract: None,
         }
     }
 }
@@ -1626,6 +1630,7 @@ mod tests {
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            completion_input_contract: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1693,6 +1698,7 @@ mod tests {
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            completion_input_contract: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1756,6 +1762,7 @@ mod tests {
             profile_timeout_secs: default_profile_timeout_secs(),
             kv_connector: KvConnector::default(),
             program_scheduling: None,
+            completion_input_contract: None,
         };
 
         assert!(config.has_service_discovery());

@@ -40,6 +40,32 @@ use std::time::{Duration, Instant};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, warn};
 
+fn completion_diagnostic(event: &str, headers: Option<&HeaderMap>, tokens: Option<&[u32]>) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    use sha2::{Digest, Sha256};
+    let request_id = headers
+        .and_then(|headers| headers.get("x-request-id"))
+        .and_then(|id| id.to_str().ok())
+        .unwrap_or("");
+    let fingerprint = tokens.map(|tokens| {
+        let mut hash = Sha256::new();
+        for token in tokens {
+            hash.update(token.to_le_bytes());
+        }
+        format!("{:x}", hash.finalize())
+    });
+    debug!(
+        event,
+        request_id,
+        token_count = tokens.map(<[u32]>::len),
+        token_allocation = tokens.map(|tokens| tokens.as_ptr() as usize),
+        token_fingerprint = fingerprint.as_deref(),
+        "completion_input_context"
+    );
+}
+
 fn insert_router_stages(headers: &mut HeaderMap, stages: &serde_json::Value) {
     if let Ok(value) = HeaderValue::from_str(&stages.to_string()) {
         headers.insert("x-router-stages", value);
@@ -154,6 +180,10 @@ struct TypedDispatch<'a> {
 struct CompletionFrontend {
     tokenizer: Arc<dyn vllm_tokenizer::Tokenizer>,
     model_vocab_size: u32,
+    activation: Option<(
+        crate::backend::completion_activation::CompletionInputAssets,
+        crate::backend::completion_activation::CompletionWorkerBinding,
+    )>,
 }
 
 impl std::fmt::Debug for CompletionFrontend {
@@ -216,6 +246,27 @@ impl Router {
 
         // All-http or all-grpc. Mixed schemes fail here (not a silent fallback).
         crate::backend::classify_worker_urls(&worker_urls)?;
+        let completion_assets = if let Some(path) =
+            ctx.router_config.completion_input_contract.as_deref()
+        {
+            ctx.router_config
+                .validate()
+                .map_err(|error| error.to_string())?;
+            if !ctx.worker_registry.get_all().is_empty() {
+                return Err("Completion contract requires a fresh static worker registry".into());
+            }
+            let assets = crate::backend::completion_activation::load_completion_input_assets(path)?;
+            assets
+                .validate_workers(
+                    &worker_urls,
+                    &ctx.client,
+                    ctx.router_config.api_key.as_deref(),
+                )
+                .await?;
+            Some(assets)
+        } else {
+            None
+        };
 
         // Wait for workers to be healthy (skip if empty - for service discovery mode)
         if !worker_urls.is_empty() {
@@ -279,7 +330,15 @@ impl Router {
                 Arc::new(
                     BasicWorker::new(url.clone(), WorkerType::Regular)
                         .with_circuit_breaker_config(core_cb_config.clone())
-                        .with_health_config(health_config.clone()),
+                        .with_health_config(health_config.clone())
+                        .with_labels(
+                            completion_assets
+                                .as_ref()
+                                .map(|assets| {
+                                    HashMap::from([("model_id".into(), assets.model.clone())])
+                                })
+                                .unwrap_or_default(),
+                        ),
                 )
             };
             ctx.worker_registry.register(worker_arc.clone());
@@ -382,7 +441,16 @@ impl Router {
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
             health_config,
-            completion_frontend: None,
+            completion_frontend: completion_assets.map(|assets| CompletionFrontend {
+                tokenizer: assets.tokenizer.clone(),
+                model_vocab_size: assets.model_vocab_size,
+                activation: Some((
+                    assets,
+                    crate::backend::completion_activation::CompletionWorkerBinding::capture(
+                        &ctx.worker_registry,
+                    ),
+                )),
+            }),
             frontend: crate::backend::EngineFrontend::with_request_timeout(Duration::from_secs(
                 ctx.router_config.request_timeout_secs,
             )),
@@ -1074,6 +1142,24 @@ impl Router {
         self.completion_frontend.is_some()
     }
 
+    fn completion_contract_valid(&self, selected: Option<&Arc<dyn Worker>>) -> bool {
+        self.completion_frontend
+            .as_ref()
+            .and_then(|frontend| frontend.activation.as_ref())
+            .is_none_or(|(_, binding)| {
+                binding.valid(&self.worker_registry)
+                    && selected.is_none_or(|worker| binding.contains(worker))
+            })
+    }
+
+    fn completion_contract_closed() -> Response {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Completion worker contract changed; drain and restart the router",
+        )
+            .into_response()
+    }
+
     pub(crate) async fn route_prepared_completion(
         &self,
         headers: Option<&HeaderMap>,
@@ -1087,11 +1173,24 @@ impl Router {
             )
                 .into_response();
         };
-        let prepared = match crate::backend::prepare_completion_classified(
-            body,
-            frontend.tokenizer.as_ref(),
-            frontend.model_vocab_size,
-        ) {
+        if !self.completion_contract_valid(None) {
+            return Self::completion_contract_closed();
+        }
+        let model_id = frontend
+            .activation
+            .as_ref()
+            .filter(|(assets, _)| assets.accepts_model(body.model.as_deref()))
+            .map(|(assets, _)| assets.model.as_str())
+            .or(body.model.as_deref());
+        let preparation = match &frontend.activation {
+            Some((assets, _)) => assets.prepare(body),
+            None => crate::backend::prepare_completion_classified(
+                body,
+                frontend.tokenizer.as_ref(),
+                frontend.model_vocab_size,
+            ),
+        };
+        let prepared = match preparation {
             Ok(prepared) => Some(prepared),
             Err(crate::backend::CompletionPreparationError::Unsupported(_)) => None,
             Err(crate::backend::CompletionPreparationError::InvalidRequest(error)) => {
@@ -1101,11 +1200,16 @@ impl Router {
                 return (StatusCode::SERVICE_UNAVAILABLE, error).into_response();
             }
         };
+        completion_diagnostic(
+            "completion_prepared",
+            headers,
+            prepared.as_ref().map(|prepared| prepared.token_ids()),
+        );
         self.route_typed_request_with_completion(
             headers,
             body,
             "/v1/completions",
-            body.model.as_deref(),
+            model_id,
             Some(raw_body),
             prepared.as_ref().map(|prepared| prepared.token_ids()),
         )
@@ -1183,6 +1287,9 @@ impl Router {
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
+                if raw_body.is_some() && !self.completion_contract_valid(None) {
+                    return Self::completion_contract_closed();
+                }
                 // Each backend attempt is a fresh scheduling arrival. The
                 // previous ProgramCompletion finishes exactly once before a
                 // retry invokes this closure again.
@@ -1224,6 +1331,12 @@ impl Router {
                             .into_response();
                     }
                 };
+                if raw_body.is_some() && !self.completion_contract_valid(Some(&worker)) {
+                    return Self::completion_contract_closed();
+                }
+                if raw_body.is_some() {
+                    completion_diagnostic("completion_attempt", headers, completion_token_ids);
+                }
 
                 // Optional load tracking for cache-aware policy
                 // Get the policy for this model to check if it's cache-aware
@@ -2644,6 +2757,7 @@ mod tests {
     use std::collections::HashMap;
 
     include!("completion_http_tests.rs");
+    include!("completion_activation_tests.rs");
 
     fn create_test_regular_router() -> Router {
         // Create registries
