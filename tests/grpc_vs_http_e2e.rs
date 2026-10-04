@@ -68,6 +68,7 @@ fn test_config(worker_urls: Vec<String>) -> RouterConfig {
         kv_connector: vllm_router_rs::config::KvConnector::Nixl,
         program_scheduling: None,
         completion_input_contract: None,
+        completion_kv_observations: None,
     }
 }
 

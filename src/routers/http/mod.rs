@@ -1,5 +1,6 @@
 //! HTTP router implementations
 
+mod completion_observations;
 pub mod dp_utils;
 pub mod logprobs_merge;
 pub mod openai_router;

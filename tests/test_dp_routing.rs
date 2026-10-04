@@ -281,6 +281,7 @@ mod dp_e2e_tests {
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
             completion_input_contract: None,
+            completion_kv_observations: None,
         }
     }
 
@@ -331,6 +332,7 @@ mod dp_e2e_tests {
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
             completion_input_contract: None,
+            completion_kv_observations: None,
         }
     }
 

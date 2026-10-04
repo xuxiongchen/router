@@ -64,6 +64,7 @@ impl TestContext {
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
             completion_input_contract: None,
+            completion_kv_observations: None,
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1609,6 +1610,7 @@ mod error_tests {
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
             completion_input_contract: None,
+            completion_kv_observations: None,
         };
 
         let ctx = TestContext::new_with_config(
@@ -1973,6 +1975,7 @@ mod pd_mode_tests {
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
             completion_input_contract: None,
+            completion_kv_observations: None,
         };
 
         // Create app context
@@ -2140,6 +2143,7 @@ mod request_id_tests {
             kv_connector: vllm_router_rs::config::KvConnector::Nixl,
             program_scheduling: None,
             completion_input_contract: None,
+            completion_kv_observations: None,
         };
 
         let ctx = TestContext::new_with_config(

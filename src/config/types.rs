@@ -91,6 +91,9 @@ pub struct RouterConfig {
     /// Default-off, controlled static Completion input contract file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_input_contract: Option<std::path::PathBuf>,
+    /// Default-off static event observations, not verified reusable KV credit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_kv_observations: Option<std::path::PathBuf>,
 }
 
 fn default_profile_timeout_secs() -> u64 {
@@ -913,6 +916,7 @@ impl Default for RouterConfig {
             kv_connector: KvConnector::default(),
             program_scheduling: None,
             completion_input_contract: None,
+            completion_kv_observations: None,
         }
     }
 }
@@ -1631,6 +1635,7 @@ mod tests {
             kv_connector: KvConnector::default(),
             program_scheduling: None,
             completion_input_contract: None,
+            completion_kv_observations: None,
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1699,6 +1704,7 @@ mod tests {
             kv_connector: KvConnector::default(),
             program_scheduling: None,
             completion_input_contract: None,
+            completion_kv_observations: None,
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1763,6 +1769,7 @@ mod tests {
             kv_connector: KvConnector::default(),
             program_scheduling: None,
             completion_input_contract: None,
+            completion_kv_observations: None,
         };
 
         assert!(config.has_service_discovery());

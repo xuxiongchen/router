@@ -120,6 +120,10 @@ struct CliArgs {
     #[arg(long)]
     completion_input_contract: Option<std::path::PathBuf>,
 
+    /// Static DP=1 event observation affinity (not verified reusable KV tokens).
+    #[arg(long)]
+    completion_kv_observations: Option<std::path::PathBuf>,
+
     /// Load balancing policy to use
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
@@ -601,6 +605,7 @@ impl CliArgs {
             kv_connector: self.kv_connector,
             program_scheduling,
             completion_input_contract: self.completion_input_contract.clone(),
+            completion_kv_observations: self.completion_kv_observations.clone(),
         })
     }
 

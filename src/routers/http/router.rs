@@ -209,6 +209,7 @@ pub struct Router {
     health_config: HealthConfig,
     frontend: crate::backend::EngineFrontend,
     completion_frontend: Option<CompletionFrontend>,
+    completion_observations: Option<super::completion_observations::CompletionObservations>,
     _worker_loads: Arc<tokio::sync::watch::Receiver<HashMap<String, isize>>>,
     _load_monitor_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     program_scheduler: Option<Arc<ProgramScheduler>>,
@@ -360,6 +361,23 @@ impl Router {
             }
         }
 
+        let completion_observations = match (
+            ctx.router_config.completion_kv_observations.as_deref(),
+            completion_assets.as_ref(),
+        ) {
+            (Some(path), Some(assets)) => Some(
+                super::completion_observations::CompletionObservations::load(
+                    path,
+                    &assets.model,
+                    &worker_urls,
+                    &ctx.worker_registry,
+                    ctx.client.clone(),
+                )?,
+            ),
+            (Some(_), None) => return Err("KV observations require Completion input assets".into()),
+            (None, _) => None,
+        };
+
         // Setup load monitoring for PowerOfTwo policy
         let (tx, rx) = tokio::sync::watch::channel(HashMap::new());
         let worker_loads = Arc::new(rx);
@@ -441,6 +459,7 @@ impl Router {
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
             health_config,
+            completion_observations,
             completion_frontend: completion_assets.map(|assets| CompletionFrontend {
                 tokenizer: assets.tokenizer.clone(),
                 model_vocab_size: assets.model_vocab_size,
@@ -1138,6 +1157,38 @@ impl Router {
             .await
     }
 
+    fn select_completion_observation(
+        &self,
+        observations: &super::completion_observations::CompletionObservations,
+        model_id: Option<&str>,
+        text: &str,
+        headers: Option<&HeaderMap>,
+        token_ids: Option<&[u32]>,
+    ) -> Option<(Arc<dyn Worker>, WorkerLoadGuard<'static>)> {
+        let workers = match model_id {
+            Some(model) => self.worker_registry.get_by_model_fast(model),
+            None => self.worker_registry.get_all(),
+        };
+        let available: Vec<_> = workers
+            .into_iter()
+            .filter(|worker| worker.is_available())
+            .collect();
+        let request_headers = Self::headers_to_request_headers(headers);
+        let context = PolicyRequestContext {
+            request_text: Some(text),
+            headers: request_headers.as_ref(),
+            token_ids,
+        };
+        let policy = match model_id {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        observations.select(&self.worker_registry, &available, &context, || {
+            let index = policy.select_worker_with_context(&available, &context)?;
+            available.get(index).cloned()
+        })
+    }
+
     pub(crate) fn has_completion_frontend(&self) -> bool {
         self.completion_frontend.is_some()
     }
@@ -1303,7 +1354,24 @@ impl Router {
                 let forced_worker_url = program_completion
                     .as_ref()
                     .map(|completion| completion.dispatch().target_id.as_str());
-                let selected_worker = if let Some(target) = forced_worker_url {
+                let mut observation_guard = None;
+                let selected_worker = if let Some(observations) = self
+                    .completion_observations
+                    .as_ref()
+                    .filter(|_| raw_body.is_some() && route == "/v1/completions")
+                {
+                    self.select_completion_observation(
+                        observations,
+                        model_id,
+                        &text,
+                        headers,
+                        completion_token_ids,
+                    )
+                    .map(|(worker, guard)| {
+                        observation_guard = Some(guard);
+                        worker
+                    })
+                } else if let Some(target) = forced_worker_url {
                     let worker = self
                         .worker_registry
                         .get_by_url(target)
@@ -1345,7 +1413,10 @@ impl Router {
                     None => self.policy_registry.get_default_policy(),
                 };
 
-                let load_guard = if policy.name() == "cache_aware" || program_completion.is_some() {
+                let load_guard = if observation_guard.is_some() {
+                    RouterMetrics::set_running_requests(worker.url(), worker.load());
+                    observation_guard
+                } else if policy.name() == "cache_aware" || program_completion.is_some() {
                     let guard = WorkerLoadGuard::new_owned(worker.clone());
                     RouterMetrics::set_running_requests(worker.url(), worker.load());
                     Some(guard)
@@ -1994,6 +2065,9 @@ impl Router {
             };
 
             if self.worker_registry.remove_by_url(worker_url).is_some() {
+                if let Some(observations) = &self.completion_observations {
+                    observations.retire_worker(worker_url);
+                }
                 self.frontend.remove_worker(worker_url);
                 info!("Removed worker: {}", worker_url);
 
@@ -2786,6 +2860,7 @@ mod tests {
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
             completion_frontend: None,
+            completion_observations: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,
@@ -2818,6 +2893,7 @@ mod tests {
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
             completion_frontend: None,
+            completion_observations: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,
@@ -3093,6 +3169,7 @@ mod tests {
             health_config: HealthConfig::default(),
             frontend: crate::backend::EngineFrontend::new(),
             completion_frontend: None,
+            completion_observations: None,
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
             program_scheduler: None,

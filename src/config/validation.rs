@@ -23,6 +23,12 @@ impl ConfigValidator {
         if config.completion_input_contract.is_some() {
             Self::validate_completion_input_contract(config)?;
         }
+        if config.completion_kv_observations.is_some() && config.completion_input_contract.is_none()
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "completion_kv_observations requires completion_input_contract".into(),
+            });
+        }
         if let Some(program_scheduling) = &config.program_scheduling {
             Self::validate_program_scheduling(program_scheduling)?;
         }
@@ -732,6 +738,29 @@ impl ConfigValidator {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completion_kv_observations_require_static_completion_contract() {
+        use super::*;
+        let default = RouterConfig::default();
+        assert!(default.completion_kv_observations.is_none());
+        assert!(serde_json::to_value(&default)
+            .unwrap()
+            .get("completion_kv_observations")
+            .is_none());
+        let mut config = RouterConfig {
+            completion_kv_observations: Some("sources.json".into()),
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".into()],
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        config.completion_input_contract = Some("contract.json".into());
+        assert!(config.validate().is_ok());
+        config.intra_node_data_parallel_size = 2;
+        assert!(config.validate().is_err());
+    }
+
     #[test]
     fn completion_input_contract_defaults_off_and_rejects_nonstatic_modes() {
         use super::*;

@@ -125,6 +125,7 @@ mod test_pd_routing {
                 health_check: vllm_router_rs::config::HealthCheckConfig::default(),
                 program_scheduling: None,
                 completion_input_contract: None,
+                completion_kv_observations: None,
                 enable_igw: false,
                 rate_limit_tokens_per_second: None,
                 connection_mode: ConnectionMode::Http,
