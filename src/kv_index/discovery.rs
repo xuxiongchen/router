@@ -1,0 +1,770 @@
+//! Worker discovery: query /get_server_info + /kv_event_sources, spawn one
+//! subscriber per (worker, rank). One indexer per cache-identity core.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use parking_lot::Mutex;
+use serde::Deserialize;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use crate::kv_index::indexer::KvBlockIndexer;
+use crate::kv_index::subscriber::{
+    spawn_with_ownership as spawn_subscriber, spawn_with_qualification, EventSource,
+    QualifiedSourceCursor, RankClaims, RankOwnership, SubscriberHandle,
+};
+use crate::kv_index::{HashMode, IngestionSignal, SourceId, TieredMatchProvider};
+use crate::protocols::worker_spec::ServerInfo;
+
+/// The worker-stable core of a cache identity. One indexer per key.
+///
+/// ponytail: full per-block identity isolation needs `lora_name`/`extra_keys`
+/// on every remove, but vLLM's `BlockRemoved` carries neither. Keying on the
+/// worker-stable triple isolates the common multi-model axis (different models
+/// never collide in one tree) and defers lora-level isolation to an upstream
+/// change that adds identity to remove events.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CacheKey {
+    pub model: Arc<str>,
+    pub hash_mode: HashMode,
+    pub block_size: u32,
+}
+
+/// One per-DP-rank entry from /kv_event_sources. Mirrors vLLM's KVEventsConfig.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct KvEventSourceEntry {
+    #[serde(default)]
+    pub endpoint: String, // PUB, may be a bind addr (tcp://*:port)
+    #[serde(default)]
+    pub replay_endpoint: Option<String>, // ROUTER
+    #[serde(default)]
+    pub topic: String,
+    #[serde(default)]
+    pub hwm: Option<i32>,
+    #[serde(default)]
+    pub buffer_steps: Option<u64>,
+    #[serde(default)]
+    pub publisher: Option<String>, // "zmq" | "null"
+    #[serde(default)]
+    pub enable_kv_cache_events: Option<bool>,
+}
+
+/// /kv_event_sources body: a JSON object keyed by DP rank (as string).
+pub type KvEventSourcesResponse = HashMap<String, KvEventSourceEntry>;
+
+/// What on_worker_added learned and spawned.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerKvInfo {
+    pub instance_id: String,
+    pub block_size: Option<u32>,
+    pub ranks: Vec<u32>,
+}
+
+/// Per-worker subscriber state retained for removal-time cleanup.
+struct WorkerSubs {
+    key: CacheKey,
+    source_id: SourceId,
+    rank_claims: RankClaims,
+    handles: Vec<SubscriberHandle>,
+}
+
+enum WorkerEntry {
+    Pending(Arc<()>),
+    Active(WorkerSubs),
+}
+
+/// Cancellation only removes this request's pending slot, never a replacement.
+struct PendingRegistration<'a> {
+    supervisor: &'a KvIndexSupervisor,
+    worker_url: &'a str,
+    token: Arc<()>,
+    committed: bool,
+}
+
+impl PendingRegistration<'_> {
+    fn is_current(&self, workers: &HashMap<String, WorkerEntry>) -> bool {
+        matches!(workers.get(self.worker_url), Some(WorkerEntry::Pending(token)) if Arc::ptr_eq(token, &self.token))
+    }
+
+    fn ensure_current(&self) -> Result<(), String> {
+        if self.is_current(&self.supervisor.workers.lock()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "kv_index {}: discovery registration retired",
+                self.worker_url
+            ))
+        }
+    }
+}
+
+impl Drop for PendingRegistration<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut workers = self.supervisor.workers.lock();
+            if self.is_current(&workers) {
+                workers.remove(self.worker_url);
+            }
+        }
+    }
+}
+
+/// Orchestrates discovery + subscriber lifecycle for the router's workers.
+/// One indexer per `CacheKey`, shared by every `(worker, rank)` of that
+/// identity.
+pub struct KvIndexSupervisor {
+    client: reqwest::Client,
+    hash_mode: HashMode,
+    /// One indexer per cache-identity core.
+    indexers: DashMap<CacheKey, Arc<KvBlockIndexer>>,
+    /// Live-worker ref-count per identity; drop the indexer on last departure.
+    identity_refs: Mutex<HashMap<CacheKey, usize>>,
+    signal_tx: mpsc::Sender<IngestionSignal>,
+    /// Per-worker subscriber state.
+    workers: Mutex<HashMap<String, WorkerEntry>>,
+    /// First-seen block_size, for cross-worker mismatch warning.
+    first_block_size: Mutex<Option<u32>>,
+}
+
+impl KvIndexSupervisor {
+    /// Construct the supervisor. The returned receiver streams ingestion signals
+    /// to the trust arbiter; drop it to ignore signals.
+    pub fn new(
+        client: reqwest::Client,
+        hash_mode: HashMode,
+    ) -> (Self, mpsc::Receiver<IngestionSignal>) {
+        let (signal_tx, signal_rx) = mpsc::channel::<IngestionSignal>(256);
+        let supervisor = KvIndexSupervisor {
+            client,
+            hash_mode,
+            indexers: DashMap::new(),
+            identity_refs: Mutex::new(HashMap::new()),
+            signal_tx,
+            workers: Mutex::new(HashMap::new()),
+            first_block_size: Mutex::new(None),
+        };
+        (supervisor, signal_rx)
+    }
+
+    pub fn hash_mode(&self) -> HashMode {
+        self.hash_mode
+    }
+
+    /// Clone the actual current partition; absence does not create an index.
+    pub fn provider(&self, key: &CacheKey) -> Option<Arc<dyn TieredMatchProvider>> {
+        self.indexers
+            .get(key)
+            .map(|index| index.value().clone() as Arc<dyn TieredMatchProvider>)
+    }
+
+    /// Register one explicitly mapped, independently addressed DP=1 publisher.
+    /// The caller must independently validate the normal-input/layout/worker
+    /// contract and cache identity. Event shape is not remote capability proof.
+    /// Qualification requires an observed sequence-zero baseline; this is not
+    /// proof of the engine's complete cache. Gaps/restarts/clear require reattach.
+    pub fn register_static_worker(
+        &self,
+        worker_url: &str,
+        key: CacheKey,
+        source: EventSource,
+    ) -> Result<WorkerKvInfo, String> {
+        if worker_url.is_empty()
+            || key.model.is_empty()
+            || key.block_size == 0
+            || key.hash_mode != HashMode::Sha256
+            || self.hash_mode != HashMode::Sha256
+            || source.source.is_empty()
+            || source.dp_rank != 0
+            || !source.pub_endpoint.starts_with("tcp://")
+        {
+            return Err(
+                "static KV registration requires an explicit SHA256 DP=1 identity and endpoint"
+                    .into(),
+            );
+        }
+        let mut workers = self.workers.lock();
+        // Preflight peer ownership before retiring this URL's current attachment.
+        let rank_claims = workers
+            .values()
+            .find_map(|entry| match entry {
+                WorkerEntry::Active(subs) if subs.key == key && subs.source_id == source.source => {
+                    Some(subs.rank_claims.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+        let claims = rank_claims.lock();
+        let owned_current = match workers.get(worker_url) {
+            Some(WorkerEntry::Active(subs))
+                if subs.key == key && subs.source_id == source.source =>
+            {
+                subs.handles
+                    .iter()
+                    .any(|handle| handle.owns_rank(0, &claims))
+            }
+            _ => false,
+        };
+        if claims.contains_key(&0) && !owned_current {
+            return Err(format!("kv_index {worker_url}: source {} rank 0 already registered for this cache identity", source.source));
+        }
+        drop(claims);
+        if let Some(WorkerEntry::Active(subs)) = workers.remove(worker_url) {
+            self.retire_worker(subs);
+        }
+        let ownership = RankOwnership {
+            claims: rank_claims.clone(),
+            token: Arc::new(()),
+        };
+        rank_claims.lock().insert(0, ownership.token.clone());
+        let indexer = self.acquire_identity(&key);
+        let instance_id = source.source.to_string();
+        let source_id = source.source.clone();
+        let block_size = key.block_size;
+        let handle = spawn_with_qualification(
+            source,
+            indexer,
+            Some(self.signal_tx.clone()),
+            Some(ownership),
+            Some(block_size),
+        );
+        workers.insert(
+            worker_url.to_string(),
+            WorkerEntry::Active(WorkerSubs {
+                key,
+                source_id,
+                rank_claims,
+                handles: vec![handle],
+            }),
+        );
+        Ok(WorkerKvInfo {
+            instance_id,
+            block_size: Some(block_size),
+            ranks: vec![0],
+        })
+    }
+
+    /// Capture this exact attachment; a retired cursor never follows replacements.
+    pub fn qualified_source(
+        &self,
+        worker_url: &str,
+        key: &CacheKey,
+    ) -> Option<QualifiedSourceCursor> {
+        match self.workers.lock().get(worker_url) {
+            Some(WorkerEntry::Active(subs)) if &subs.key == key => subs
+                .handles
+                .first()
+                .and_then(SubscriberHandle::qualified_source),
+            _ => None,
+        }
+    }
+
+    /// Query both endpoints for `worker_url`, spawn one subscriber per rank into
+    /// this worker's identity's indexer. A 404 on /kv_event_sources (engine
+    /// without the endpoint or events off) is a soft skip.
+    pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
+        let token = Arc::new(());
+        {
+            let mut workers = self.workers.lock();
+            if let Some(WorkerEntry::Active(subs)) = workers.remove(worker_url) {
+                self.retire_worker(subs);
+            }
+            workers.insert(worker_url.to_string(), WorkerEntry::Pending(token.clone()));
+        }
+        let mut pending = PendingRegistration {
+            supervisor: self,
+            worker_url,
+            token,
+            committed: false,
+        };
+        let server_info = query_server_info(&self.client, worker_url)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(
+                    "kv_index {}: {} — falling back to URL as instance/model id",
+                    worker_url, e
+                );
+                ServerInfo {
+                    model_id: Some(worker_url.to_string()),
+                    ..Default::default()
+                }
+            });
+        pending.ensure_current()?;
+
+        let instance_id = server_info
+            .instance_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| worker_url.to_string());
+        let model_id = server_info.model_id.clone().or_else(|| {
+            server_info
+                .model_path
+                .as_ref()
+                .and_then(|p| p.split('/').next_back().map(str::to_string))
+        });
+        let model_id = match model_id {
+            Some(m) => m,
+            None => {
+                warn!("kv_index {}: no model_id/model_path — using URL; cross-worker KV sharing disabled", worker_url);
+                worker_url.to_string()
+            }
+        };
+        let block_size = server_info
+            .kv_block_size
+            .or(server_info.effective_attention_block_size);
+        let sources = match query_kv_event_sources(&self.client, worker_url).await {
+            Ok(s) => s,
+            Err(e) => {
+                pending.ensure_current()?;
+                warn!(
+                    "kv_index {}: /kv_event_sources: {} — no subscribers",
+                    worker_url, e
+                );
+                return Ok(WorkerKvInfo {
+                    instance_id,
+                    block_size,
+                    ranks: vec![],
+                });
+            }
+        };
+
+        let Some(block_size) = block_size else {
+            pending.ensure_current()?;
+            warn!(
+                "kv_index {}: no block_size from /get_server_info — cannot index",
+                worker_url
+            );
+            return Ok(WorkerKvInfo {
+                instance_id,
+                block_size: None,
+                ranks: vec![],
+            });
+        };
+        let key = CacheKey {
+            model: Arc::from(model_id.as_str()),
+            hash_mode: self.hash_mode,
+            block_size,
+        };
+        let worker_host = worker_host(worker_url).unwrap_or_else(|| worker_url.to_string());
+        let source_id: SourceId = Arc::from(instance_id.as_str());
+        let mut ranks = Vec::with_capacity(sources.len());
+        let mut event_sources = Vec::with_capacity(sources.len());
+        let mut numeric_ranks = HashSet::with_capacity(sources.len());
+
+        for (rank_str, entry) in &sources {
+            let rank: u32 = match rank_str.parse() {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!(
+                        "kv_index {}: bad rank key '{}', skipping",
+                        worker_url, rank_str
+                    );
+                    continue;
+                }
+            };
+            if !numeric_ranks.insert(rank) {
+                return Err(format!(
+                    "kv_index {worker_url}: duplicate numeric rank {rank}"
+                ));
+            }
+            if !events_enabled(entry) {
+                continue;
+            }
+            let pub_endpoint = resolve_endpoint(&entry.endpoint, &worker_host);
+            let replay_endpoint = entry
+                .replay_endpoint
+                .as_deref()
+                .map(|e| resolve_endpoint(e, &worker_host));
+            let ev = EventSource {
+                source: source_id.clone(),
+                dp_rank: rank,
+                pub_endpoint,
+                replay_endpoint,
+                topic: entry.topic.clone(),
+                hwm: entry.hwm,
+            };
+            event_sources.push(ev);
+            ranks.push(rank);
+        }
+
+        // Registry -> lease -> claims -> index is the lifecycle lock order. The current
+        // token is checked before any identity acquisition or task creation.
+        let mut workers = self.workers.lock();
+        if !pending.is_current(&workers) {
+            return Err(format!(
+                "kv_index {worker_url}: discovery registration retired"
+            ));
+        }
+        self.check_block_size(worker_url, Some(block_size));
+        if event_sources.is_empty() {
+            drop(workers);
+            return Ok(WorkerKvInfo {
+                instance_id,
+                block_size: Some(block_size),
+                ranks,
+            });
+        }
+        let rank_claims = workers
+            .values()
+            .find_map(|entry| match entry {
+                WorkerEntry::Active(subs) if subs.key == key && subs.source_id == source_id => {
+                    Some(subs.rank_claims.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+        let ownerships: Vec<_> = ranks
+            .iter()
+            .map(|_| RankOwnership {
+                claims: rank_claims.clone(),
+                token: Arc::new(()),
+            })
+            .collect();
+        {
+            let mut claims = rank_claims.lock();
+            // Preflight every rank before inserting any reservation. An actual
+            // batch-rank override can already own a configured rank as well.
+            if let Some(rank) = ranks.iter().find(|rank| claims.contains_key(*rank)) {
+                return Err(format!(
+                    "kv_index {worker_url}: source {instance_id} rank {rank} already registered for this cache identity"
+                ));
+            }
+            for (rank, ownership) in ranks.iter().zip(&ownerships) {
+                claims.insert(*rank, ownership.token.clone());
+            }
+        }
+        let indexer = self.acquire_identity(&key);
+        let handles = event_sources
+            .into_iter()
+            .zip(ownerships)
+            .map(|(source, ownership)| {
+                spawn_subscriber(
+                    source,
+                    indexer.clone(),
+                    Some(self.signal_tx.clone()),
+                    Some(ownership),
+                )
+            })
+            .collect();
+        workers.insert(
+            worker_url.to_string(),
+            WorkerEntry::Active(WorkerSubs {
+                key,
+                source_id,
+                rank_claims,
+                handles,
+            }),
+        );
+        pending.committed = true;
+        Ok(WorkerKvInfo {
+            instance_id,
+            block_size: Some(block_size),
+            ranks,
+        })
+    }
+
+    /// Shut down this worker's subscribers, clear its residency, release its
+    /// identity ref.
+    pub fn on_worker_removed(&self, worker_url: &str) {
+        let mut workers = self.workers.lock();
+        if let Some(WorkerEntry::Active(subs)) = workers.remove(worker_url) {
+            self.retire_worker(subs);
+            info!("kv_index {}: removed subscribers", worker_url);
+        }
+    }
+
+    /// Shut down every subscriber and drop all indexers.
+    pub fn shutdown(&self) {
+        let mut workers = self.workers.lock();
+        for (_url, entry) in workers.drain() {
+            if let WorkerEntry::Active(subs) = entry {
+                self.retire_worker(subs);
+            }
+        }
+        info!("kv_index supervisor shut down");
+    }
+
+    fn retire_worker(&self, subs: WorkerSubs) {
+        for handle in subs.handles {
+            handle.shutdown();
+        }
+        self.release_identity(&subs.key);
+    }
+
+    /// Ref-count an identity; on first acquisition create its indexer.
+    fn acquire_identity(&self, key: &CacheKey) -> Arc<KvBlockIndexer> {
+        let mut refs = self.identity_refs.lock();
+        let count = refs.entry(key.clone()).or_insert(0);
+        if *count == 0 {
+            self.indexers
+                .insert(key.clone(), Arc::new(KvBlockIndexer::new()));
+        }
+        *count += 1;
+        self.indexers.get(key).expect("just inserted").clone()
+    }
+
+    /// Decrement an identity's ref-count; on last release drop its indexer.
+    fn release_identity(&self, key: &CacheKey) {
+        let mut refs = self.identity_refs.lock();
+        if let Some(c) = refs.get_mut(key) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                refs.remove(key);
+                self.indexers.remove(key);
+            }
+        }
+    }
+
+    fn check_block_size(&self, worker_url: &str, block_size: Option<u32>) {
+        let Some(bs) = block_size else { return };
+        let mut first = self.first_block_size.lock();
+        match *first {
+            None => *first = Some(bs),
+            Some(prev) if prev != bs => {
+                warn!(
+                    "kv_index {}: block_size {} differs from first-seen {} — DEGRADED risk",
+                    worker_url, bs, prev
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for KvIndexSupervisor {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+async fn query_server_info(
+    client: &reqwest::Client,
+    worker_url: &str,
+) -> Result<ServerInfo, String> {
+    let url = format!("{}/get_server_info", worker_url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("get_server_info {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("get_server_info {url}: status {}", resp.status()));
+    }
+    resp.json::<ServerInfo>()
+        .await
+        .map_err(|e| format!("get_server_info parse: {e}"))
+}
+
+async fn query_kv_event_sources(
+    client: &reqwest::Client,
+    worker_url: &str,
+) -> Result<KvEventSourcesResponse, String> {
+    let url = format!("{}/kv_event_sources", worker_url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("kv_event_sources {url}: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("kv_event_sources {url}: status {status}"));
+    }
+    resp.json::<KvEventSourcesResponse>()
+        .await
+        .map_err(|e| format!("kv_event_sources parse: {e}"))
+}
+
+/// A rank emits events iff publisher != "null" and events are enabled.
+fn events_enabled(entry: &KvEventSourceEntry) -> bool {
+    if matches!(entry.publisher.as_deref(), Some("null")) {
+        return false;
+    }
+    if matches!(entry.enable_kv_cache_events, Some(false)) {
+        return false;
+    }
+    !entry.endpoint.is_empty()
+}
+
+/// Rewrite a ZMQ bind address's host (`*` / `0.0.0.0`) to `worker_host`.
+/// `tcp://*:5557` → `tcp://10.0.0.5:5557`.
+fn resolve_endpoint(endpoint: &str, worker_host: &str) -> String {
+    if let Some(rest) = endpoint.strip_prefix("tcp://") {
+        if let Some((host, port)) = rest.split_once(':') {
+            if host == "*" || host == "0.0.0.0" {
+                return format!("tcp://{}:{}", worker_host, port);
+            }
+        }
+    }
+    endpoint.to_string()
+}
+
+/// Extract the host from a worker URL (`http://10.0.0.5:8000` → `10.0.0.5`).
+fn worker_host(worker_url: &str) -> Option<String> {
+    let with_scheme = if worker_url.contains("://") {
+        worker_url.to_string()
+    } else {
+        format!("http://{}", worker_url)
+    };
+    url::Url::parse(&with_scheme)
+        .ok()?
+        .host_str()
+        .map(|h| h.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_pending_guard_removes_only_its_own_generation() {
+        let (supervisor, _) = KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        let old = Arc::new(());
+        supervisor
+            .workers
+            .lock()
+            .insert("url".into(), WorkerEntry::Pending(old.clone()));
+        let pending = PendingRegistration {
+            supervisor: &supervisor,
+            worker_url: "url",
+            token: old,
+            committed: false,
+        };
+        drop(pending);
+        assert!(!supervisor.workers.lock().contains_key("url"));
+
+        let old = Arc::new(());
+        supervisor
+            .workers
+            .lock()
+            .insert("url".into(), WorkerEntry::Pending(old.clone()));
+        let pending = PendingRegistration {
+            supervisor: &supervisor,
+            worker_url: "url",
+            token: old,
+            committed: false,
+        };
+        let replacement = Arc::new(());
+        supervisor
+            .workers
+            .lock()
+            .insert("url".into(), WorkerEntry::Pending(replacement.clone()));
+        drop(pending);
+        assert!(
+            matches!(supervisor.workers.lock().get("url"), Some(WorkerEntry::Pending(token)) if Arc::ptr_eq(token, &replacement))
+        );
+    }
+
+    #[test]
+    fn last_identity_release_racing_acquire_keeps_the_new_indexer() {
+        let (supervisor, _) = KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+        let key = CacheKey {
+            model: Arc::from("m"),
+            hash_mode: HashMode::Sha256,
+            block_size: 2,
+        };
+        for _ in 0..128 {
+            supervisor.acquire_identity(&key);
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let release = scope.spawn(|| {
+                    start.wait();
+                    supervisor.release_identity(&key);
+                });
+                start.wait();
+                let replacement = supervisor.acquire_identity(&key);
+                release.join().unwrap();
+                assert!(Arc::ptr_eq(
+                    &supervisor.indexers.get(&key).unwrap(),
+                    &replacement
+                ));
+                assert_eq!(supervisor.identity_refs.lock().get(&key), Some(&1));
+            });
+            supervisor.release_identity(&key);
+            assert!(supervisor.indexers.is_empty());
+        }
+    }
+
+    #[test]
+    fn resolve_endpoint_rewrites_bind_star() {
+        assert_eq!(
+            resolve_endpoint("tcp://*:5557", "10.0.0.5"),
+            "tcp://10.0.0.5:5557"
+        );
+        assert_eq!(
+            resolve_endpoint("tcp://0.0.0.0:5558", "10.0.0.5"),
+            "tcp://10.0.0.5:5558"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_keeps_resolved_host() {
+        assert_eq!(
+            resolve_endpoint("tcp://10.0.0.5:5557", "ignored"),
+            "tcp://10.0.0.5:5557"
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_passthrough_non_tcp() {
+        assert_eq!(resolve_endpoint("ipc:///tmp/x", "h"), "ipc:///tmp/x");
+    }
+
+    #[test]
+    fn worker_host_extracts_from_url() {
+        assert_eq!(
+            worker_host("http://10.0.0.5:8000").as_deref(),
+            Some("10.0.0.5")
+        );
+        assert_eq!(worker_host("10.0.0.5:8000").as_deref(), Some("10.0.0.5"));
+        assert_eq!(
+            worker_host("http://host.example:80").as_deref(),
+            Some("host.example")
+        );
+    }
+
+    #[test]
+    fn events_enabled_gates_on_publisher_and_endpoint() {
+        let mut e = KvEventSourceEntry::default();
+        assert!(!events_enabled(&e)); // empty endpoint
+        e.endpoint = "tcp://*:5557".into();
+        assert!(events_enabled(&e));
+        e.publisher = Some("null".into());
+        assert!(!events_enabled(&e));
+        e.publisher = Some("zmq".into());
+        e.enable_kv_cache_events = Some(false);
+        assert!(!events_enabled(&e));
+        e.enable_kv_cache_events = Some(true);
+        assert!(events_enabled(&e));
+    }
+
+    #[test]
+    fn server_info_parses_kv_fields_and_aliases() {
+        let s: ServerInfo = serde_json::from_str(
+            r#"{"model_id":"m","kv_block_size":16,"instance_id":"x","data_parallel_size":2}"#,
+        )
+        .unwrap();
+        assert_eq!(s.model_id.as_deref(), Some("m"));
+        assert_eq!(s.kv_block_size, Some(16));
+        assert_eq!(s.instance_id.as_deref(), Some("x"));
+        // `data_parallel_size` is tolerated but unused; rank comes from /kv_event_sources.
+        // block_size alias.
+        let s: ServerInfo = serde_json::from_str(r#"{"block_size":32}"#).unwrap();
+        assert_eq!(s.kv_block_size, Some(32));
+        // empty body → defaults, no error.
+        let s: ServerInfo = serde_json::from_str("{}").unwrap();
+        assert!(s.kv_block_size.is_none());
+    }
+
+    #[test]
+    fn kv_event_sources_decodes_rank_map() {
+        let body = r#"{
+            "0": {"endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","topic":"","hwm":100000,"publisher":"zmq","enable_kv_cache_events":true},
+            "1": {"endpoint":"tcp://*:5559","replay_endpoint":null,"topic":"","publisher":"zmq"}
+        }"#;
+        let m: KvEventSourcesResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m["0"].hwm, Some(100_000));
+        assert!(m["1"].replay_endpoint.is_none());
+    }
+}
