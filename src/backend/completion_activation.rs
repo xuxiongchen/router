@@ -208,13 +208,16 @@ impl CompletionInputAssets {
         } else {
             format!("{configured_class}Fast")
         };
-        // Stock 0.29 wraps HF backends in TokenizerPool; /tokenizer_info does
-        // not expose is_fast. This is a limited controlled-launch check plus
-        // full-array probes, not proof of the underlying tokenizer's identity.
+        // Stock 0.29 pools only HF fast backends. Its cached concrete class may
+        // omit "Fast" under Transformers 5. /tokenizer_info does not expose
+        // is_fast: these names plus full-array probes are only a controlled-
+        // launch compatibility check, not proof of tokenizer identity.
         if class != "TokenizersBackend"
             && class != "TokenizerPool"
             && class != fast_class
             && class != format!("Cached{fast_class}")
+            && class != format!("TokenizerPoolCached{configured_class}")
+            && class != format!("TokenizerPoolCached{fast_class}")
         {
             return Err(format!(
                 "Completion contract requires an HF fast tokenizer, got {class}"
@@ -607,6 +610,45 @@ pub(crate) mod tests {
         let contract = directory.path().join("contract.json");
         std::fs::write(&contract, json!({"assets_path": directory.path(), "model": "base", "aliases": ["alias"], "supervised_immutable_workers": true}).to_string()).unwrap();
         (directory, contract)
+    }
+
+    #[test]
+    fn completion_tokenizer_info_accepts_stock_fast_pool_names() {
+        let (_directory, contract) = assets_fixture();
+        let mut assets = load_completion_input_assets(&contract).unwrap();
+        for configured in ["Qwen2Tokenizer", "ExampleTokenizer"] {
+            assets.tokenizer_config["tokenizer_class"] = json!(configured);
+            for class in [
+                format!("TokenizerPoolCached{configured}"),
+                format!("TokenizerPoolCached{configured}Fast"),
+            ] {
+                assert!(assets
+                    .validate_tokenizer_info(&json!({"tokenizer_class": class}))
+                    .is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn completion_tokenizer_info_rejects_nonmatching_pool_names_and_settings() {
+        let (_directory, contract) = assets_fixture();
+        let mut assets = load_completion_input_assets(&contract).unwrap();
+        assets.tokenizer_config["tokenizer_class"] = json!("ExampleTokenizer");
+        for class in [
+            "ExampleTokenizer",
+            "CachedExampleTokenizer",
+            "TokenizerPoolCachedOtherTokenizer",
+            "TokenizerPoolCachedExampleTokenizerExtra",
+            "OtherTokenizerPoolCachedExampleTokenizer",
+        ] {
+            assert!(assets
+                .validate_tokenizer_info(&json!({"tokenizer_class": class}))
+                .is_err());
+        }
+        assets.tokenizer_config["bos_token"] = json!("<bos>");
+        assert!(assets
+            .validate_tokenizer_info(&json!({"tokenizer_class": "TokenizerPoolCachedExampleTokenizer", "bos_token": "<other>"}))
+            .is_err());
     }
 
     #[test]

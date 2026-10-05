@@ -25,7 +25,9 @@ mod completion_activation {
             "/v1/models" => {
                 serde_json::json!({"data": [{"id":"base","root":"/mock/base","parent":null},{"id":"alias","root":"/mock/base","parent":null}]})
             }
-            "/tokenizer_info" => serde_json::json!({"tokenizer_class":"TokenizersBackend"}),
+            "/tokenizer_info" => {
+                serde_json::json!({"tokenizer_class":"TokenizerPoolCachedPreTrainedTokenizerFast"})
+            }
             "/server_info" => serde_json::json!({"vllm_config": {
                 "model_config": {"model":"/mock/base","tokenizer_mode":"hf","skip_tokenizer_init":false,"trust_remote_code":false,"io_processor_plugin":null,"hf_overrides":{}},
                 "parallel_config":{"data_parallel_size":1},"lora_config":null,"speculative_config":null}}),
