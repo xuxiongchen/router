@@ -10,6 +10,7 @@ use std::time::Duration;
 use reqwest::{Client, Method};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use vllm_tokenizer::{HuggingFaceTokenizer, Tokenizer};
 
 use crate::core::{Worker, WorkerRegistry};
@@ -22,6 +23,29 @@ struct ContractFile {
     #[serde(default)]
     aliases: Vec<String>,
     supervised_immutable_workers: bool,
+    #[serde(default)]
+    local_effective_encoding: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalEffectiveEncoding {
+    schema: String,
+    asset_sha256: HashMap<String, String>,
+    versions: EffectiveEncodingVersions,
+    vllm_source_commit: String,
+    backend_tokenizer: Value,
+    split_special_tokens: bool,
+    backend_encode_special_tokens: bool,
+    route: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EffectiveEncodingVersions {
+    vllm: String,
+    transformers: String,
+    tokenizers: String,
 }
 
 /// The exact owned asset snapshot used by the production Completion loader.
@@ -32,6 +56,9 @@ pub struct CompletionInputAssets {
     pub model: String,
     aliases: Vec<String>,
     tokenizer_config: Value,
+    // A local official-loader proof under supervised immutability, never a
+    // remote tokenizer object or a full-input-domain conformance certificate.
+    has_local_effective_encoding: bool,
 }
 
 impl CompletionInputAssets {
@@ -93,6 +120,8 @@ impl CompletionInputAssets {
                 None,
             )
             .await?;
+            self.validate_effective_environment(&server)
+                .map_err(|error| format!("{error} at {worker}"))?;
             let config = server["vllm_config"].as_object().ok_or_else(|| {
                 format!("Completion contract requires JSON /server_info at {worker}; isolated Worker must enable VLLM_SERVER_DEV_MODE")
             })?;
@@ -234,12 +263,30 @@ impl CompletionInputAssets {
         ] {
             if let Some(local) = self.tokenizer_config.get(field) {
                 let local = local.get("content").unwrap_or(local);
-                if info.get(field) != Some(local) {
+                if info.get(field).is_some_and(|remote| remote != local)
+                    || (!self.has_local_effective_encoding && info.get(field).is_none())
+                {
                     return Err(format!(
                         "Completion contract tokenizer setting {field} differs"
                     ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_effective_environment(&self, server: &Value) -> Result<(), String> {
+        if self.has_local_effective_encoding
+            && (server["vllm_env"]["VLLM_USE_FASTOKENS"] != json!(false)
+                || !server["system_env"]["pip_packages"]
+                    .as_str()
+                    .is_some_and(|packages| {
+                        packages
+                            .lines()
+                            .any(|line| line.trim() == "transformers==5.17.0")
+                    }))
+        {
+            return Err("Completion local effective encoding requires Worker Transformers 5.17.0 without fastokens provenance".into());
         }
         Ok(())
     }
@@ -269,6 +316,7 @@ pub fn load_completion_input_assets(contract_path: &Path) -> Result<CompletionIn
     };
     let snapshot = tempfile::tempdir().map_err(|error| error.to_string())?;
     let mut assets = HashMap::new();
+    let mut asset_sha256 = HashMap::new();
     for name in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
         let bytes = std::fs::read(assets_path.join(name))
             .map_err(|error| format!("Completion asset {name}: {error}"))?;
@@ -277,6 +325,7 @@ pub fn load_completion_input_assets(contract_path: &Path) -> Result<CompletionIn
         if !value.is_object() {
             return Err(format!("Completion asset {name} must be a JSON object"));
         }
+        asset_sha256.insert(name.to_string(), format!("{:x}", Sha256::digest(&bytes)));
         std::fs::write(snapshot.path().join(name), bytes).map_err(|error| error.to_string())?;
         assets.insert(name, value);
     }
@@ -319,6 +368,17 @@ pub fn load_completion_input_assets(contract_path: &Path) -> Result<CompletionIn
         model_vocab_size,
     )?;
     validate_special_tokens(tokenizer_config, &assets["tokenizer.json"])?;
+    if let Some(path) = &file.local_effective_encoding {
+        let path = if path.is_absolute() {
+            path.clone()
+        } else {
+            contract_path.parent().unwrap_or(Path::new(".")).join(path)
+        };
+        let evidence: LocalEffectiveEncoding =
+            serde_json::from_slice(&std::fs::read(path).map_err(|error| error.to_string())?)
+                .map_err(|error| format!("invalid local effective encoding: {error}"))?;
+        validate_local_effective_encoding(evidence, &asset_sha256, tokenizer_config, &definition)?;
+    }
     let tokenizer = HuggingFaceTokenizer::new_hf(&snapshot.path().join("tokenizer.json"))
         .map_err(|error| error.to_string())?;
     if let Some(decoder) = tokenizer_config
@@ -351,7 +411,86 @@ pub fn load_completion_input_assets(contract_path: &Path) -> Result<CompletionIn
         model: file.model,
         aliases: file.aliases,
         tokenizer_config: tokenizer_config.clone(),
+        has_local_effective_encoding: file.local_effective_encoding.is_some(),
     })
+}
+
+fn validate_local_effective_encoding(
+    evidence: LocalEffectiveEncoding,
+    asset_sha256: &HashMap<String, String>,
+    config: &Value,
+    definition: &tokenizers::Tokenizer,
+) -> Result<(), String> {
+    if evidence.schema != "vllm029-hf517-local-effective-v1"
+        || evidence.asset_sha256 != *asset_sha256
+        || !matches!(evidence.versions.vllm.as_str(), "0.29.0" | "0.29.0+cpu")
+        || evidence.versions.transformers != "5.17.0"
+        || evidence.versions.tokenizers != "0.23.2"
+        || evidence.vllm_source_commit != "g98dff2a81"
+        || evidence.route != "stock_hf_tokenizers_completion_v1"
+        || evidence.split_special_tokens
+        || evidence.backend_encode_special_tokens
+    {
+        return Err("Completion local effective encoding provenance/assets/flags differ".into());
+    }
+    let local = serde_json::to_value(definition).map_err(|error| error.to_string())?;
+    // new_hf merges absent decoder entries. Do not compare the pre-merge
+    // definition unless every configured token is already materialized.
+    if config
+        .get("added_tokens_decoder")
+        .and_then(Value::as_object)
+        .is_some_and(|decoder| {
+            decoder.keys().any(|id| {
+                !local["added_tokens"].as_array().is_some_and(|tokens| {
+                    tokens
+                        .iter()
+                        .any(|token| id.parse::<u64>().ok() == token["id"].as_u64())
+                })
+            })
+        })
+    {
+        return Err(
+            "Completion local effective encoding requires materialized added tokens".into(),
+        );
+    }
+    if input_encoding_projection(local) != input_encoding_projection(evidence.backend_tokenizer) {
+        return Err("Completion effective backend input encoding differs from Rust".into());
+    }
+    Ok(())
+}
+
+fn input_encoding_projection(mut definition: Value) -> Value {
+    // Responses are still forwarded unchanged: decoder behavior is not used.
+    if let Some(fields) = definition.as_object_mut() {
+        fields.remove("decoder");
+        for stage in ["pre_tokenizer", "post_processor"] {
+            if let Some(value) = fields.get_mut(stage) {
+                remove_byte_level_offsets(value);
+            }
+        }
+    }
+    definition
+}
+
+fn remove_byte_level_offsets(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            // trim_offsets changes offsets, not Completion input token IDs.
+            // Preserve add_prefix_space/use_regex and every other input field.
+            if fields.get("type").and_then(Value::as_str) == Some("ByteLevel") {
+                fields.remove("trim_offsets");
+            }
+            for value in fields.values_mut() {
+                remove_byte_level_offsets(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                remove_byte_level_offsets(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn validate_added_tokens(
@@ -610,6 +749,210 @@ pub(crate) mod tests {
         let contract = directory.path().join("contract.json");
         std::fs::write(&contract, json!({"assets_path": directory.path(), "model": "base", "aliases": ["alias"], "supervised_immutable_workers": true}).to_string()).unwrap();
         (directory, contract)
+    }
+
+    pub(crate) fn effective_fixture(directory: &Path, contract: &Path) -> Value {
+        let config_path = directory.join("tokenizer_config.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["add_bos_token"] = json!(false);
+        std::fs::write(config_path, config.to_string()).unwrap();
+        let definition: tokenizers::Tokenizer =
+            serde_json::from_slice(&std::fs::read(directory.join("tokenizer.json")).unwrap())
+                .unwrap();
+        let hashes: HashMap<_, _> = ["config.json", "tokenizer.json", "tokenizer_config.json"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name,
+                    format!(
+                        "{:x}",
+                        Sha256::digest(std::fs::read(directory.join(name)).unwrap())
+                    ),
+                )
+            })
+            .collect();
+        // Unit fixture only. Real startup uses the public official-loader
+        // exporter, not this hand-written shape as a Python behavior oracle.
+        let evidence = json!({
+            "schema": "vllm029-hf517-local-effective-v1",
+            "asset_sha256": hashes,
+            "versions": {"vllm":"0.29.0+cpu", "transformers":"5.17.0", "tokenizers":"0.23.2"},
+            "vllm_source_commit": "g98dff2a81",
+            "backend_tokenizer": serde_json::to_value(definition).unwrap(),
+            "split_special_tokens": false,
+            "backend_encode_special_tokens": false,
+            "route": "stock_hf_tokenizers_completion_v1",
+        });
+        std::fs::write(directory.join("effective.json"), evidence.to_string()).unwrap();
+        let mut body: Value = serde_json::from_slice(&std::fs::read(contract).unwrap()).unwrap();
+        body["local_effective_encoding"] = json!("effective.json");
+        std::fs::write(contract, body.to_string()).unwrap();
+        evidence
+    }
+
+    #[test]
+    fn completion_missing_setting_requires_local_effective_evidence() {
+        let (directory, contract) = assets_fixture();
+        effective_fixture(directory.path(), &contract);
+        let mut body: Value = serde_json::from_slice(&std::fs::read(&contract).unwrap()).unwrap();
+        body.as_object_mut()
+            .unwrap()
+            .remove("local_effective_encoding");
+        std::fs::write(&contract, body.to_string()).unwrap();
+        let assets = load_completion_input_assets(&contract).unwrap();
+        assert!(assets
+            .validate_tokenizer_info(&json!({
+                "tokenizer_class":"TokenizerPoolCachedPreTrainedTokenizerFast"
+            }))
+            .unwrap_err()
+            .contains("add_bos_token"));
+    }
+
+    #[test]
+    fn completion_captured_stock_info_reproduces_missing_declaration_failure() {
+        let info: Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/tokenizer/vllm029_hf517_tokenizer_info.json"
+        ))
+        .unwrap();
+        assert!(info.get("add_bos_token").is_none());
+        assert!(info.get("add_eos_token").is_none());
+        let (_directory, contract) = assets_fixture();
+        let mut assets = load_completion_input_assets(&contract).unwrap();
+        // This tests the captured metadata absence, not a claim that the toy
+        // fixture is the remote Qwen tokenizer or an official encoding oracle.
+        assets.tokenizer_config["tokenizer_class"] = json!("Qwen2Tokenizer");
+        assets.tokenizer_config["add_bos_token"] = json!(false);
+        assert!(assets
+            .validate_tokenizer_info(&info)
+            .unwrap_err()
+            .contains("add_bos_token"));
+    }
+
+    #[test]
+    fn completion_effective_evidence_accepts_missing_not_conflicting_settings() {
+        let (directory, contract) = assets_fixture();
+        effective_fixture(directory.path(), &contract);
+        let assets = load_completion_input_assets(&contract).unwrap();
+        let info = json!({"tokenizer_class":"TokenizerPoolCachedPreTrainedTokenizerFast"});
+        assert!(assets.validate_tokenizer_info(&info).is_ok());
+        let mut conflicting = info;
+        conflicting["add_bos_token"] = json!(true);
+        assert!(assets.validate_tokenizer_info(&conflicting).is_err());
+        assert!(assets.validate_effective_environment(&json!({})).is_err());
+        let valid = json!({
+            "system_env":{"pip_packages":"torch==2.13.0\ntransformers==5.17.0\ntokenizers==0.23.2\n"},
+            "vllm_env":{"VLLM_USE_FASTOKENS":false}
+        });
+        assert!(assets.validate_effective_environment(&valid).is_ok());
+        for fastokens in [json!(true), Value::Null] {
+            let mut incompatible = valid.clone();
+            incompatible["vllm_env"]["VLLM_USE_FASTOKENS"] = fastokens;
+            assert!(assets
+                .validate_effective_environment(&incompatible)
+                .is_err());
+        }
+        // Stock collect_env does not export tokenizers. Its version is a
+        // supervised-launch prerequisite, not an invented HTTP attestation.
+        let mut stock = valid.clone();
+        stock["system_env"]["pip_packages"] = json!("transformers==5.17.0");
+        assert!(assets.validate_effective_environment(&stock).is_ok());
+        for packages in ["transformers==5.16.0", "torch==2.13.0"] {
+            let mut incompatible = valid.clone();
+            incompatible["system_env"]["pip_packages"] = json!(packages);
+            assert!(assets
+                .validate_effective_environment(&incompatible)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn completion_same_class_does_not_authorize_different_effective_encoding() {
+        let (directory, contract) = assets_fixture();
+        let evidence = effective_fixture(directory.path(), &contract);
+        for field in ["post_processor", "added_tokens"] {
+            let mut different = evidence.clone();
+            if field == "post_processor" {
+                different["backend_tokenizer"][field]["single"] =
+                    json!([{"Sequence":{"id":"A", "type_id":0}}]);
+            } else {
+                different["backend_tokenizer"][field][0]["lstrip"] = json!(true);
+            }
+            std::fs::write(
+                directory.path().join("effective.json"),
+                different.to_string(),
+            )
+            .unwrap();
+            assert!(load_completion_input_assets(&contract)
+                .err()
+                .unwrap()
+                .contains("input encoding differs"));
+        }
+    }
+
+    #[test]
+    fn completion_effective_evidence_binds_assets_versions_and_encoding_flags() {
+        let (directory, contract) = assets_fixture();
+        let evidence = effective_fixture(directory.path(), &contract);
+        for (pointer, value) in [
+            ("/schema", json!("unverified")),
+            ("/asset_sha256/tokenizer.json", json!("unbound")),
+            ("/versions/transformers", json!("5.16.0")),
+            ("/versions/tokenizers", json!("0.22.2")),
+            ("/vllm_source_commit", json!("different")),
+            ("/route", json!("custom")),
+            ("/split_special_tokens", json!(true)),
+            ("/backend_encode_special_tokens", json!(true)),
+        ] {
+            let mut different = evidence.clone();
+            *different.pointer_mut(pointer).unwrap() = value;
+            std::fs::write(
+                directory.path().join("effective.json"),
+                different.to_string(),
+            )
+            .unwrap();
+            assert!(load_completion_input_assets(&contract)
+                .err()
+                .unwrap()
+                .contains("provenance/assets/flags"));
+        }
+    }
+
+    #[test]
+    fn completion_effective_evidence_refuses_implicit_added_token_merge() {
+        let (directory, contract) = assets_fixture();
+        let config_path = directory.path().join("tokenizer_config.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["added_tokens_decoder"]["8"] = json!({"content":"<extra>",
+            "single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true});
+        std::fs::write(config_path, config.to_string()).unwrap();
+        effective_fixture(directory.path(), &contract);
+        assert!(load_completion_input_assets(&contract)
+            .err()
+            .unwrap()
+            .contains("materialized added tokens"));
+    }
+
+    #[test]
+    fn completion_input_projection_ignores_only_decoder_and_byte_level_offsets() {
+        let local = json!({"pre_tokenizer":{"type":"Sequence","pretokenizers":[
+            {"type":"ByteLevel","trim_offsets":true,"add_prefix_space":false,"use_regex":true}
+        ]},"post_processor":{"type":"ByteLevel","trim_offsets":true,"add_prefix_space":false},
+        "decoder":{"type":"ByteLevel"},"normalizer":null});
+        let mut offsets = local.clone();
+        offsets["decoder"] = Value::Null;
+        offsets["pre_tokenizer"]["pretokenizers"][0]["trim_offsets"] = json!(false);
+        offsets["post_processor"]["trim_offsets"] = json!(false);
+        assert_eq!(
+            input_encoding_projection(local.clone()),
+            input_encoding_projection(offsets.clone())
+        );
+        offsets["pre_tokenizer"]["pretokenizers"][0]["add_prefix_space"] = json!(true);
+        assert_ne!(
+            input_encoding_projection(local),
+            input_encoding_projection(offsets)
+        );
     }
 
     #[test]

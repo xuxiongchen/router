@@ -1,7 +1,7 @@
 mod completion_activation {
     use super::*;
     use crate::backend::completion_activation::{
-        load_completion_input_assets, tests::assets_fixture,
+        load_completion_input_assets, tests::{assets_fixture, effective_fixture},
     };
     use axum::extract::State;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,7 +30,9 @@ mod completion_activation {
             }
             "/server_info" => serde_json::json!({"vllm_config": {
                 "model_config": {"model":"/mock/base","tokenizer_mode":"hf","skip_tokenizer_init":false,"trust_remote_code":false,"io_processor_plugin":null,"hf_overrides":{}},
-                "parallel_config":{"data_parallel_size":1},"lora_config":null,"speculative_config":null}}),
+                "parallel_config":{"data_parallel_size":1},"lora_config":null,"speculative_config":null},
+                "vllm_env":{"VLLM_USE_FASTOKENS":false},
+                "system_env":{"pip_packages":if worker.invalid == "transformers" {"transformers==5.16.0"} else {"transformers==5.17.0"}}}),
             _ => unreachable!(),
         };
         Json(result)
@@ -81,8 +83,11 @@ mod completion_activation {
         }
     }
 
-    async fn harness(invalid: &'static str, enabled: bool) -> Harness {
+    async fn harness(invalid: &'static str, enabled: bool, effective: bool) -> Harness {
         let (assets, path) = assets_fixture();
+        if effective {
+            effective_fixture(assets.path(), &path);
+        }
         let input = load_completion_input_assets(&path).unwrap();
         let worker = ControlWorker {
             tokenizer: input.tokenizer,
@@ -138,7 +143,7 @@ mod completion_activation {
     #[tokio::test]
     async fn completion_factory_installs_default_off_or_verified_frontend() {
         use crate::routers::factory::RouterFactory;
-        let off = harness("version", false).await;
+        let off = harness("version", false, false).await;
         let router = RouterFactory::create_router(&off.context).await.unwrap();
         assert!(!router
             .as_any()
@@ -146,7 +151,7 @@ mod completion_activation {
             .unwrap()
             .has_completion_frontend());
         assert_eq!(off.worker.probes.load(Ordering::SeqCst), 0);
-        let on = harness("", true).await;
+        let on = harness("", true, false).await;
         let router = RouterFactory::create_router(&on.context).await.unwrap();
         let router = router.as_any().downcast_ref::<Router>().unwrap();
         assert!(router.has_completion_frontend());
@@ -188,7 +193,7 @@ mod completion_activation {
     #[tokio::test]
     async fn completion_factory_rejects_cold_worker_mismatch() {
         for invalid in ["version", "tokens"] {
-            let h = harness(invalid, true).await;
+            let h = harness(invalid, true, false).await;
             assert!(
                 crate::routers::factory::RouterFactory::create_router(&h.context)
                     .await
@@ -200,8 +205,38 @@ mod completion_activation {
     }
 
     #[tokio::test]
+    async fn completion_factory_effective_contract_keeps_probes_and_raw_bytes() {
+        let h = harness("", true, true).await;
+        let router = crate::routers::factory::RouterFactory::create_router(&h.context)
+            .await
+            .unwrap();
+        let router = router.as_any().downcast_ref::<Router>().unwrap();
+        assert!(router.has_completion_frontend());
+        assert_eq!(h.worker.probes.load(Ordering::SeqCst), 12);
+        let raw = bytes::Bytes::from_static(b" { \"model\": \"alias\", \"prompt\": \"hello world\", \"max_tokens\": 1 } \n");
+        let request = serde_json::from_slice(&raw).unwrap();
+        let response = router.route_prepared_completion(None, &request, &raw).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        assert_eq!(h.worker.requests.lock().as_slice(), &[raw]);
+        assert_eq!(h.worker.probes.load(Ordering::SeqCst), 12);
+        assert_eq!(h.context.worker_registry.get_all()[0].load(), 0);
+    }
+
+    #[tokio::test]
+    async fn completion_factory_effective_contract_rejects_remote_behavior_or_version() {
+        for invalid in ["tokens", "transformers"] {
+            let h = harness(invalid, true, true).await;
+            assert!(crate::routers::factory::RouterFactory::create_router(&h.context)
+                .await.is_err());
+            assert!(h.context.worker_registry.get_all().is_empty());
+            assert!(h.worker.requests.lock().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn completion_factory_closes_new_admission_without_resetting_active_guard() {
-        let h = harness("", true).await;
+        let h = harness("", true, false).await;
         let router = crate::routers::factory::RouterFactory::create_router(&h.context)
             .await
             .unwrap();
