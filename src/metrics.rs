@@ -505,6 +505,33 @@ pub struct RouterMetrics;
 pub struct TokenizerMetrics;
 
 impl RouterMetrics {
+    pub fn record_pd_kv_decision(work: Option<u64>, credit: Option<u64>, fallback: Option<&str>) {
+        counter!("vllm_router_pd_prefill_decisions_total",
+            "fallback" => fallback.unwrap_or("none").to_owned())
+        .increment(1);
+        if let Some(work) = work {
+            histogram!("vllm_router_pd_new_prefill_tokens").record(work as f64);
+        }
+        if let Some(credit) = credit {
+            counter!("vllm_router_pd_credited_prefix_tokens_total").increment(credit);
+        }
+    }
+
+    /// Decode-side kv_aware affinity outcome: sticky_hit / sticky_spill /
+    /// bind / no_session.
+    pub fn record_pd_kv_decode_decision(outcome: Option<&str>) {
+        counter!("vllm_router_pd_decode_decisions_total",
+            "outcome" => outcome.unwrap_or("none").to_owned())
+        .increment(1);
+    }
+
+    /// Prefill defection: the chosen P re-computes more than the best-placed
+    /// candidate by more than chunk-boundary noise.
+    pub fn record_pd_kv_defection(extra_new_tokens: u64) {
+        counter!("vllm_router_pd_prefill_defections_total").increment(1);
+        histogram!("vllm_router_pd_prefill_defection_extra_tokens").record(extra_new_tokens as f64);
+    }
+
     // Request metrics
     pub fn record_request(route: &str) {
         counter!("vllm_router_requests_total",
@@ -832,6 +859,15 @@ impl RouterMetrics {
     pub fn record_pd_decode_error(worker: &str) {
         counter!("vllm_router_pd_decode_errors_total",
             "worker" => worker.to_string()
+        )
+        .increment(1);
+    }
+
+    /// A router-buffered stage body exceeded the fixed buffer cap and the
+    /// request failed instead of buffering unbounded.
+    pub fn record_pd_body_over_limit(stage: &str) {
+        counter!("vllm_router_pd_body_over_limit_total",
+            "stage" => stage.to_string()
         )
         .increment(1);
     }

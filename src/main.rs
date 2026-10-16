@@ -2,7 +2,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use std::collections::HashMap;
 use vllm_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PolicyConfig,
+    HealthCheckConfig, HistoryBackend, KvConnector, MetricsConfig, PdKvEventSources, PolicyConfig,
     ProgramSchedulingConfig, RetryConfig, RouterConfig, RoutingMode, TraceConfig,
 };
 use vllm_router_rs::metrics::PrometheusConfig;
@@ -119,7 +119,7 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     worker_urls: Vec<String>,
 
-    /// Load balancing policy to use. kv_aware is supported only in regular mode, not PD disaggregation.
+    /// Load balancing policy to use. kv_aware uses stage-specific load profiles in PD mode.
     #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     policy: String,
 
@@ -146,12 +146,24 @@ struct CliArgs {
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
 
-    /// Specific policy for prefill nodes in PD mode. kv_aware is not supported in PD mode.
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Statically configured KV event sources as
+    /// "PREFILL_URL=ZMQ_PUB_ENDPOINT[,ENDPOINT...]"; the Nth endpoint is DP
+    /// rank N. Can be specified multiple times, once per prefill worker.
+    /// Replay endpoints, block size, and model are only configurable via the
+    /// YAML/JSON config file.
+    #[arg(
+        long = "pd-kv-events",
+        action = ArgAction::Append,
+        value_name = "URL=ENDPOINT[,ENDPOINT...]"
+    )]
+    pd_kv_events: Vec<String>,
+
+    /// Specific policy for prefill nodes in PD mode. kv_aware uses the prefill load profile.
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     prefill_policy: Option<String>,
 
-    /// Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode.
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
+    /// Specific policy for decode nodes in PD mode. kv_aware uses active and pending decode occupancy.
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "kv_aware", "power_of_two", "consistent_hash", "rendezvous_hash"])]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup
@@ -193,6 +205,24 @@ struct CliArgs {
     kv_penalty_external: f64,
     #[arg(long, default_value_t = 0.3)]
     kv_penalty_disk: f64,
+
+    /// kv_aware decode stickiness: a session stays on its bound decode
+    /// worker until that worker's load exceeds the pool minimum by more
+    /// than this margin (requests).
+    #[arg(long, default_value_t = 2)]
+    kv_decode_spill_margin: usize,
+
+    /// kv_aware prefill defection hysteresis: switching away from the
+    /// prefix-holding prefill worker adds this multiple of the extra
+    /// re-computed tokens to the switcher's cost.
+    #[arg(long, default_value_t = 1.0)]
+    kv_defection_hysteresis: f64,
+
+    /// kv_aware prefill defection dead zone, in blocks: candidate gaps within
+    /// this many blocks of the minimum re-computed tokens are not taxed.
+    /// Scales with the discovered block size.
+    #[arg(long, default_value_t = 4)]
+    kv_defection_epsilon_blocks: u64,
 
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912)] // 512MB
@@ -425,6 +455,9 @@ impl CliArgs {
                 kv_penalty_host: self.kv_penalty_host,
                 kv_penalty_external: self.kv_penalty_external,
                 kv_penalty_disk: self.kv_penalty_disk,
+                kv_decode_spill_margin: self.kv_decode_spill_margin,
+                kv_defection_hysteresis: self.kv_defection_hysteresis,
+                kv_defection_epsilon_blocks: self.kv_defection_epsilon_blocks,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5, // Default value
@@ -435,6 +468,43 @@ impl CliArgs {
             "rendezvous_hash" => PolicyConfig::RendezvousHash,
             _ => PolicyConfig::RoundRobin, // Fallback
         }
+    }
+
+    fn parse_pd_kv_events(specs: &[String]) -> ConfigResult<HashMap<String, PdKvEventSources>> {
+        let mut sources = HashMap::new();
+        for spec in specs {
+            let Some((url, endpoints)) = spec.split_once('=') else {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "--pd-kv-events expects URL=ENDPOINT[,ENDPOINT...], got '{spec}'"
+                    ),
+                });
+            };
+            let url = url.trim();
+            let endpoints: Vec<String> = endpoints
+                .split(',')
+                .map(str::trim)
+                .filter(|endpoint| !endpoint.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if url.is_empty() || endpoints.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "--pd-kv-events needs a URL and at least one endpoint, got '{spec}'"
+                    ),
+                });
+            }
+            sources.insert(
+                url.to_owned(),
+                PdKvEventSources {
+                    endpoints,
+                    replay_endpoints: None,
+                    block_size: 16,
+                    model: None,
+                },
+            );
+        }
+        Ok(sources)
     }
 
     /// Convert CLI arguments to RouterConfig
@@ -564,6 +634,8 @@ impl CliArgs {
             self.program_scheduling_config_json.as_deref(),
         )?;
 
+        let pd_kv_event_sources = Self::parse_pd_kv_events(&self.pd_kv_events)?;
+
         // Build RouterConfig
         Ok(RouterConfig {
             epd: self
@@ -575,6 +647,7 @@ impl CliArgs {
                     reason: format!("Invalid --epd-config: {e}"),
                 })?,
             mode,
+            pd_kv_event_sources,
             policy,
             connection_mode,
             host: self.host.clone(),
@@ -878,5 +951,36 @@ mod tests {
 
         assert_eq!(prefill, vec![("http://prefill:8000".to_string(), None)]);
         assert_eq!(other, ["vllm-router", "65536"]);
+    }
+
+    #[test]
+    fn parses_pd_kv_events_specs() {
+        let specs = [
+            "http://prefill:8000=tcp://prefill:5557".to_string(),
+            "http://prefill2:8000=tcp://prefill2:5557, tcp://prefill2:5559".to_string(),
+        ]
+        .to_vec();
+        let sources = CliArgs::parse_pd_kv_events(&specs).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources["http://prefill:8000"].endpoints,
+            vec!["tcp://prefill:5557".to_string()]
+        );
+        assert_eq!(sources["http://prefill:8000"].block_size, 16);
+        // The space after ',' is intentional: exercises endpoint trimming.
+        assert_eq!(
+            sources["http://prefill2:8000"].endpoints,
+            vec![
+                "tcp://prefill2:5557".to_string(),
+                "tcp://prefill2:5559".to_string()
+            ]
+        );
+
+        for bad in ["no-endpoint", "http://p:8000=", "=tcp://p:5557"] {
+            assert!(
+                CliArgs::parse_pd_kv_events(&[bad.to_string()]).is_err(),
+                "should reject '{bad}'"
+            );
+        }
     }
 }

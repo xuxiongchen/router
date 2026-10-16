@@ -29,6 +29,9 @@ class RouterArgs:
     kv_penalty_host: float = 0.8
     kv_penalty_external: float = 0.6
     kv_penalty_disk: float = 0.3
+    kv_decode_spill_margin: int = 2
+    kv_defection_hysteresis: float = 1.0
+    kv_defection_epsilon_blocks: int = 4
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
@@ -166,7 +169,7 @@ class RouterArgs:
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Load balancing policy to use. kv_aware is supported only in regular mode. In PD mode, this is used for both prefill and decode unless overridden",
+            help="Load balancing policy to use. kv_aware uses stage-specific load profiles in PD mode. In PD mode, this is used for both prefill and decode unless overridden",
         )
         parser.add_argument(
             f"--{prefix}prefill-policy",
@@ -176,10 +179,11 @@ class RouterArgs:
                 "random",
                 "round_robin",
                 "cache_aware",
+                "kv_aware",
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Specific policy for prefill nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
+            help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         parser.add_argument(
             f"--{prefix}decode-policy",
@@ -189,10 +193,11 @@ class RouterArgs:
                 "random",
                 "round_robin",
                 "cache_aware",
+                "kv_aware",
                 "power_of_two",
                 "consistent_hash",
             ],
-            help="Specific policy for decode nodes in PD mode. kv_aware is not supported in PD mode. If not specified, uses the main policy",
+            help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
         )
 
         parser.add_argument(
@@ -218,6 +223,24 @@ class RouterArgs:
             type=float,
             default=RouterArgs.kv_penalty_disk,
             help="Disk-tier KV transfer credit for kv_aware (0.0-1.0)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-decode-spill-margin",
+            type=int,
+            default=RouterArgs.kv_decode_spill_margin,
+            help="kv_aware decode stickiness: a session stays on its bound decode worker until that worker's load exceeds the pool minimum by more than this margin (requests)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-defection-hysteresis",
+            type=float,
+            default=RouterArgs.kv_defection_hysteresis,
+            help="kv_aware prefill defection hysteresis: switching away from the prefix-holding prefill worker adds this multiple of the extra re-computed tokens to the switcher's cost (0 disables)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-defection-epsilon-blocks",
+            type=int,
+            default=RouterArgs.kv_defection_epsilon_blocks,
+            help="kv_aware prefill defection dead zone in blocks: candidate gaps within this many blocks of the minimum re-computed tokens are not taxed (scales with the discovered block size)",
         )
 
         # PD-specific arguments
@@ -604,16 +627,6 @@ class RouterArgs:
                     raise ValueError("PD disaggregation mode requires --prefill")
                 if not self.decode_urls:
                     raise ValueError("PD disaggregation mode requires --decode")
-
-            effective_prefill_policy = self.prefill_policy or self.policy
-            effective_decode_policy = self.decode_policy or self.policy
-            if "kv_aware" in (
-                effective_prefill_policy,
-                effective_decode_policy,
-            ):
-                raise ValueError(
-                    "kv_aware is supported only in regular mode, not PD disaggregation"
-                )
 
             # Warn about policy usage in PD mode
             if self.prefill_policy and self.decode_policy and self.policy:

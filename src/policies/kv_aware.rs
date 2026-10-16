@@ -1,7 +1,7 @@
 //! Exact KV-placement and live-load aware worker selection.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -16,8 +16,38 @@ pub trait TieredMatchProvider: Send + Sync {
     fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch>;
 }
 
+/// Immutable P work estimate from one placement snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillWorkEstimate {
+    pub new_prefill_tokens: u64,
+    pub placement_verified: bool,
+}
+
 /// Optional operations used by adapters with tokenized requests and KV discovery.
 pub trait KvAwareOps: Send + Sync {
+    /// P/D uses the same placement/credit contract as colocated routing,
+    /// but accounts token backlog in the shared P/D admission manager.
+    fn estimate_prefill_work(
+        &self,
+        worker: &dyn Worker,
+        tokens: &[u32],
+        credit: bool,
+    ) -> PrefillWorkEstimate;
+    fn pick_prefill(&self, costs: &[f64], occupancy: &[usize]) -> Option<usize>;
+    /// Decode-side selection for P/D: sessions stick to their bound decoder
+    /// within the configured spill margin, otherwise the minimum-load
+    /// decoder wins (ties rotate). `worker_urls` are rank-qualified worker
+    /// URLs (DP ranks on one server must stay distinct), `loads` are
+    /// projected stage occupancies aligned with them.
+    fn pick_decode(
+        &self,
+        session_key: Option<&str>,
+        worker_urls: &[&str],
+        loads: &[usize],
+    ) -> Option<DecodePick>;
+    /// Per-candidate surcharge for abandoning the prefix-holding prefill
+    /// worker: `hysteresis * (new_tokens - min_new)` beyond chunk noise.
+    fn defection_tax(&self, new_tokens: &[u64]) -> Vec<f64>;
     fn register_worker(
         &self,
         worker: &dyn Worker,
@@ -34,6 +64,20 @@ pub trait KvAwareOps: Send + Sync {
     ) -> Option<KvSelectionReceipt>;
     fn begin_request(&self, receipt: KvSelectionReceipt) -> Option<KvRequestSlot>;
 }
+
+/// Decode selection result: the picked candidate plus how session affinity
+/// shaped the choice (carried on `StageDecision::fallback_reason` and into
+/// `vllm_router_pd_decode_decisions_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodePick {
+    pub index: usize,
+    pub outcome: &'static str,
+}
+
+/// Session bindings kept before the affinity map is trimmed back to size.
+const DECODE_AFFINITY_CAP: usize = 8192;
+/// Extra slack that batches trims so the oldest-entry scan amortizes.
+const DECODE_AFFINITY_SLACK: usize = 1024;
 
 /// Resolve the optional capability at the policy boundary. Keep concrete policy
 /// discovery here so adapters and LoadBalancingPolicy stay independent of it.
@@ -267,6 +311,16 @@ pub struct CostParams {
     pub router_temperature: f64,
     pub transfer_credits: TransferCredits,
     pub block_size: u32,
+    /// Decode stickiness margin: a bound session stays on its decoder until
+    /// that decoder's occupancy exceeds the pool minimum by more than this.
+    pub decode_spill_margin: usize,
+    /// Prefill defection hysteresis: leaving the prefix-holding worker adds
+    /// this multiple of the extra re-computed tokens to the defector's cost.
+    pub defection_hysteresis: f64,
+    /// Prefill defection dead zone, in blocks: match credit is block-aligned,
+    /// so a gap of a few blocks between candidates is placement noise rather
+    /// than a defection worth taxing. Scales with the discovered block size.
+    pub defection_epsilon_blocks: u64,
 }
 
 impl Default for CostParams {
@@ -275,6 +329,9 @@ impl Default for CostParams {
             router_temperature: 0.0,
             transfer_credits: TransferCredits::default(),
             block_size: 16,
+            decode_spill_margin: 2,
+            defection_hysteresis: 1.0,
+            defection_epsilon_blocks: 4,
         }
     }
 }
@@ -509,6 +566,18 @@ pub struct KvAwarePolicy {
     picker: Arc<dyn Picker>,
     params: CostParams,
     targets: DashMap<String, TargetBinding>,
+    /// Session -> (bound decoder base URL, last-use epoch). Decode
+    /// stickiness keeps a session on the decoder that already pulled its
+    /// prefix so later rounds transfer only the delta.
+    decode_affinity: DashMap<String, (String, u64)>,
+    /// Round-robin cursor across equal-load decoders, so a stable first-index
+    /// tie-break cannot magnetize every unbound session onto one decoder.
+    decode_tie_cursor: AtomicU64,
+    /// Monotonic clock for the affinity LRU.
+    affinity_epoch: AtomicU64,
+    /// Smallest block size discovered from registered cache identities; 0
+    /// until the first registration. The defection dead zone scales with it.
+    discovered_block_size: AtomicU32,
 }
 
 impl std::fmt::Debug for KvAwarePolicy {
@@ -533,6 +602,10 @@ impl KvAwarePolicy {
             picker: Arc::new(TemperaturePicker::new(params.router_temperature)),
             params,
             targets: DashMap::new(),
+            decode_affinity: DashMap::new(),
+            decode_tie_cursor: AtomicU64::new(0),
+            affinity_epoch: AtomicU64::new(0),
+            discovered_block_size: AtomicU32::new(0),
         }
     }
 
@@ -551,6 +624,10 @@ impl KvAwarePolicy {
             picker,
             params,
             targets: DashMap::new(),
+            decode_affinity: DashMap::new(),
+            decode_tie_cursor: AtomicU64::new(0),
+            affinity_epoch: AtomicU64::new(0),
+            discovered_block_size: AtomicU32::new(0),
         }
     }
 
@@ -574,6 +651,22 @@ impl KvAwarePolicy {
         matches: Arc<dyn TieredMatchProvider>,
     ) {
         let block_size = cache_key.block_size;
+        // Track the smallest live block size so the defection dead zone
+        // scales with the fleet instead of a config constant.
+        if block_size != 0 {
+            let mut current = self.discovered_block_size.load(Ordering::Relaxed);
+            while current == 0 || block_size < current {
+                match self.discovered_block_size.compare_exchange_weak(
+                    current,
+                    block_size,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+        }
         self.targets.insert(
             worker_url.into(),
             TargetBinding {
@@ -590,6 +683,56 @@ impl KvAwarePolicy {
             if let Some(slot_manager) = &self.slot_manager {
                 slot_manager.unregister_target(&binding.target);
             }
+        }
+        // Sessions bound to the removed decoder rebind on their next request
+        // anyway (a stale URL misses and rebinds); dropping the bindings here
+        // keeps the affinity map honest. Affinity keys are base URLs, while
+        // registration may use DP-suffixed URLs, so match both forms.
+        let base_url = worker_url
+            .rsplit_once('@')
+            .map(|(head, _)| head)
+            .unwrap_or(worker_url);
+        let stale: Vec<String> = self
+            .decode_affinity
+            .iter()
+            .filter(|entry| {
+                let bound = entry.value().0.as_str();
+                bound == worker_url || bound == base_url
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        for key in stale {
+            self.decode_affinity.remove(&key);
+        }
+    }
+
+    fn next_affinity_epoch(&self) -> u64 {
+        self.affinity_epoch.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn bind_decode(&self, session_key: &str, worker_url: &str) {
+        self.decode_affinity.insert(
+            session_key.to_owned(),
+            (worker_url.to_owned(), self.next_affinity_epoch()),
+        );
+        self.trim_decode_affinity();
+    }
+
+    /// Trim in batches once the map overshoots the cap, so the oldest-entry
+    /// scan amortizes across inserts instead of running per request.
+    fn trim_decode_affinity(&self) {
+        if self.decode_affinity.len() <= DECODE_AFFINITY_CAP + DECODE_AFFINITY_SLACK {
+            return;
+        }
+        let mut epochs: Vec<(u64, String)> = self
+            .decode_affinity
+            .iter()
+            .map(|entry| (entry.value().1, entry.key().clone()))
+            .collect();
+        epochs.sort_unstable();
+        let excess = epochs.len().saturating_sub(DECODE_AFFINITY_CAP);
+        for (_, key) in epochs.into_iter().take(excess) {
+            self.decode_affinity.remove(&key);
         }
     }
 
@@ -643,6 +786,30 @@ impl KvAwarePolicy {
         crate::kv_index::local_block_hash_strings(token_ids, block_size, lora_name)
     }
 
+    fn placement_matches(
+        binding: &TargetBinding,
+        token_ids: Option<&[u32]>,
+        lora_name: Option<&str>,
+        enabled: bool,
+    ) -> Vec<TierMatch> {
+        let local_hashes = if enabled {
+            token_ids
+                .map(|ids| Self::local_hashes_with_lora(ids, binding.block_size, lora_name))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if local_hashes.is_empty() {
+            Vec::new()
+        } else {
+            binding.matches.find_tiered_matches(&MatchQuery {
+                group_idx: 0,
+                local_hashes,
+                tiers_of_interest: Self::tiers_of_interest(),
+            })
+        }
+    }
+
     pub fn select_worker_with_token_ids(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -679,22 +846,7 @@ impl KvAwarePolicy {
             if matches_by_identity.contains_key(&identity) {
                 continue;
             }
-            let local_hashes = if placement_enabled {
-                token_ids
-                    .map(|ids| Self::local_hashes_with_lora(ids, binding.block_size, lora_name))
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let matches = if local_hashes.is_empty() {
-                Vec::new()
-            } else {
-                binding.matches.find_tiered_matches(&MatchQuery {
-                    group_idx: 0,
-                    local_hashes,
-                    tiers_of_interest: Self::tiers_of_interest(),
-                })
-            };
+            let matches = Self::placement_matches(binding, token_ids, lora_name, placement_enabled);
             matches_by_identity.insert(identity, matches);
         }
 
@@ -836,6 +988,145 @@ impl LoadBalancingPolicy for KvAwarePolicy {
 }
 
 impl KvAwareOps for KvAwarePolicy {
+    fn estimate_prefill_work(
+        &self,
+        worker: &dyn Worker,
+        tokens: &[u32],
+        credit: bool,
+    ) -> PrefillWorkEstimate {
+        let binding = self.binding_for_worker(worker);
+        let verified = credit && binding.cache_key.is_some();
+        let mut params = self.params;
+        params.block_size = binding.block_size;
+        let matches: Vec<_> = Self::placement_matches(&binding, Some(tokens), None, verified)
+            .into_iter()
+            .filter(|hit| hit.target == binding.target)
+            .collect();
+        let candidate = CandidateView {
+            target: &binding.target,
+            matches: &matches,
+            load: LoadSample::default(),
+            input_tokens: tokens.len(),
+        };
+        PrefillWorkEstimate {
+            new_prefill_tokens: request_prefill_tokens(&candidate, &params),
+            placement_verified: verified,
+        }
+    }
+
+    fn pick_prefill(&self, costs: &[f64], occupancy: &[usize]) -> Option<usize> {
+        if costs.len() != occupancy.len() || costs.iter().any(|cost| !cost.is_finite()) {
+            return None;
+        }
+        if self.params.router_temperature <= 0.0 {
+            costs
+                .iter()
+                .enumerate()
+                .min_by(|(li, left), (ri, right)| {
+                    left.total_cmp(right)
+                        .then_with(|| occupancy[*li].cmp(&occupancy[*ri]))
+                })
+                .map(|(index, _)| index)
+        } else {
+            self.picker.pick(costs)
+        }
+    }
+
+    fn pick_decode(
+        &self,
+        session_key: Option<&str>,
+        worker_urls: &[&str],
+        loads: &[usize],
+    ) -> Option<DecodePick> {
+        if worker_urls.is_empty() || worker_urls.len() != loads.len() {
+            return None;
+        }
+        let min_load = *loads.iter().min()?;
+        let tied: Vec<usize> = loads
+            .iter()
+            .enumerate()
+            .filter(|&(_, load)| *load == min_load)
+            .map(|(index, _)| index)
+            .collect();
+        let cursor = self.decode_tie_cursor.fetch_add(1, Ordering::Relaxed) as usize;
+        let fresh = tied[cursor % tied.len()];
+
+        let Some(session_key) = session_key else {
+            return Some(DecodePick {
+                index: fresh,
+                outcome: "no_session",
+            });
+        };
+        enum Affinity {
+            Hit(usize),
+            Spill(usize),
+            Rebind,
+        }
+        let action = if let Some(mut entry) = self.decode_affinity.get_mut(session_key) {
+            match worker_urls.iter().position(|url| *url == entry.0.as_str()) {
+                Some(index) if loads[index] <= min_load + self.params.decode_spill_margin => {
+                    entry.1 = self.next_affinity_epoch();
+                    Affinity::Hit(index)
+                }
+                Some(_) => {
+                    // The bound decoder is hot beyond the spill margin: hand
+                    // the session to the lightest decoder and rebind there.
+                    *entry = (worker_urls[fresh].to_owned(), self.next_affinity_epoch());
+                    Affinity::Spill(fresh)
+                }
+                // The bound decoder left the pool; fall through to rebind.
+                None => Affinity::Rebind,
+            }
+        } else {
+            Affinity::Rebind
+        };
+        match action {
+            Affinity::Hit(index) => Some(DecodePick {
+                index,
+                outcome: "sticky_hit",
+            }),
+            Affinity::Spill(index) => Some(DecodePick {
+                index,
+                outcome: "sticky_spill",
+            }),
+            Affinity::Rebind => {
+                self.bind_decode(session_key, worker_urls[fresh]);
+                Some(DecodePick {
+                    index: fresh,
+                    outcome: "bind",
+                })
+            }
+        }
+    }
+
+    fn defection_tax(&self, new_tokens: &[u64]) -> Vec<f64> {
+        let Some(&min_new) = new_tokens.iter().min() else {
+            return Vec::new();
+        };
+        // Dead zone of a few blocks: match credit is block-aligned, so gaps
+        // within it are placement noise, not a defection worth taxing. Scale
+        // with the discovered block size; the config default covers the
+        // window before the first registration.
+        let block_size = match self.discovered_block_size.load(Ordering::Relaxed) {
+            0 => self.params.block_size,
+            discovered => discovered,
+        } as u64;
+        let epsilon = self
+            .params
+            .defection_epsilon_blocks
+            .saturating_mul(block_size);
+        new_tokens
+            .iter()
+            .map(|&tokens| {
+                if tokens > min_new + epsilon {
+                    self.params.defection_hysteresis * (tokens - min_new) as f64
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
     fn register_worker(
         &self,
         worker: &dyn Worker,
@@ -1629,5 +1920,109 @@ mod tests {
                 .as_ref(),
             worker.base_url()
         );
+    }
+
+    #[test]
+    fn pick_decode_binds_sticks_and_spills_within_margin() {
+        let policy = KvAwarePolicy::default(); // spill margin 2
+        let urls = ["http://d0", "http://d1"];
+
+        let first = policy.pick_decode(Some("s1"), &urls, &[0, 0]).unwrap();
+        assert_eq!((first.index, first.outcome), (0, "bind"));
+
+        // The bound decoder stays sticky while within the margin of the
+        // pool minimum (loads [2, 0]: 2 <= 0 + 2).
+        let hit = policy.pick_decode(Some("s1"), &urls, &[2, 0]).unwrap();
+        assert_eq!((hit.index, hit.outcome), (0, "sticky_hit"));
+
+        // Beyond the margin the session spills to the lighter decoder and
+        // rebinds there.
+        let spill = policy.pick_decode(Some("s1"), &urls, &[3, 0]).unwrap();
+        assert_eq!((spill.index, spill.outcome), (1, "sticky_spill"));
+        let rehit = policy.pick_decode(Some("s1"), &urls, &[3, 3]).unwrap();
+        assert_eq!((rehit.index, rehit.outcome), (1, "sticky_hit"));
+    }
+
+    #[test]
+    fn pick_decode_rebinds_when_bound_worker_leaves_pool() {
+        let policy = KvAwarePolicy::default();
+        let _ = policy
+            .pick_decode(Some("s1"), &["http://d0", "http://d1"], &[0, 0])
+            .unwrap();
+        // Pool shrank to d1 only: the stale binding must rebind, not fail.
+        let pick = policy
+            .pick_decode(Some("s1"), &["http://d1"], &[5])
+            .unwrap();
+        assert_eq!((pick.index, pick.outcome), (0, "bind"));
+    }
+
+    #[test]
+    fn pick_decode_without_session_uses_pure_min_load() {
+        let policy = KvAwarePolicy::default();
+        let pick = policy
+            .pick_decode(None, &["http://d0", "http://d1"], &[4, 1])
+            .unwrap();
+        assert_eq!((pick.index, pick.outcome), (1, "no_session"));
+        assert!(policy.pick_decode(None, &[], &[]).is_none());
+        assert!(policy.pick_decode(None, &["http://d0"], &[0, 0]).is_none());
+    }
+
+    #[test]
+    fn pick_decode_rotates_equal_load_ties() {
+        let policy = KvAwarePolicy::default();
+        let first = policy
+            .pick_decode(None, &["http://d0", "http://d1"], &[0, 0])
+            .unwrap();
+        let second = policy
+            .pick_decode(None, &["http://d0", "http://d1"], &[0, 0])
+            .unwrap();
+        assert_ne!(first.index, second.index);
+    }
+
+    #[test]
+    fn defection_tax_charges_only_recompute_gap() {
+        let policy = KvAwarePolicy::default(); // hysteresis 1.0
+                                               // 40 - 32 = 8 is inside the 4-block dead zone and stays untaxed.
+        assert_eq!(policy.defection_tax(&[32, 1000, 40]), vec![0.0, 968.0, 0.0]);
+        let untaxed = KvAwarePolicy::new(CostParams {
+            defection_hysteresis: 0.0,
+            ..CostParams::default()
+        });
+        assert!(untaxed
+            .defection_tax(&[32, 1000])
+            .iter()
+            .all(|tax| *tax == 0.0));
+        assert!(KvAwarePolicy::default().defection_tax(&[]).is_empty());
+    }
+
+    #[test]
+    fn defection_dead_zone_scales_with_discovered_block_size() {
+        let policy = KvAwarePolicy::default(); // dead zone = 4 blocks
+                                               // Before any registration the config default (16-token blocks)
+                                               // applies: a 64-token gap is exactly the dead zone, so untaxed.
+        assert_eq!(policy.defection_tax(&[32, 96]), vec![0.0, 0.0]);
+        let worker: Arc<dyn Worker> = Arc::new(DPAwareWorker::new(
+            "http://w".into(),
+            0,
+            1,
+            WorkerType::Regular,
+        ));
+        kv_aware_ops(&policy).unwrap().register_worker(
+            worker.as_ref(),
+            &WorkerKvInfo {
+                instance_id: "engine-instance".into(),
+                cache_key: Some(CacheKey {
+                    model: Arc::from("model"),
+                    hash_mode: crate::kv_index::HashMode::Sha256,
+                    block_size: 32,
+                }),
+                ..WorkerKvInfo::default()
+            },
+            Some(Arc::new(EmptyMatchProvider)),
+        );
+        // With 32-token blocks the dead zone widens to 128 tokens: a
+        // 64-token gap stays untaxed, a 129-token gap is taxed.
+        assert_eq!(policy.defection_tax(&[32, 96]), vec![0.0, 0.0]);
+        assert_eq!(policy.defection_tax(&[32, 161]), vec![0.0, 129.0]);
     }
 }

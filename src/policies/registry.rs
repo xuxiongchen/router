@@ -208,6 +208,9 @@ impl PolicyRegistry {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                kv_decode_spill_margin,
+                kv_defection_hysteresis,
+                kv_defection_epsilon_blocks,
             } => Arc::new(KvAwarePolicy::new(CostParams {
                 router_temperature: *router_temperature,
                 transfer_credits: TransferCredits {
@@ -216,6 +219,9 @@ impl PolicyRegistry {
                     external: *kv_penalty_external,
                     disk: *kv_penalty_disk,
                 },
+                decode_spill_margin: *kv_decode_spill_margin,
+                defection_hysteresis: *kv_defection_hysteresis,
+                defection_epsilon_blocks: *kv_defection_epsilon_blocks,
                 ..CostParams::default()
             })),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),

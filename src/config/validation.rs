@@ -394,6 +394,9 @@ impl ConfigValidator {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                kv_decode_spill_margin,
+                kv_defection_hysteresis,
+                kv_defection_epsilon_blocks,
             } => {
                 if !router_temperature.is_finite() || *router_temperature < 0.0 {
                     return Err(ConfigError::InvalidValue {
@@ -415,6 +418,15 @@ impl ConfigValidator {
                         });
                     }
                 }
+                if !kv_defection_hysteresis.is_finite() || *kv_defection_hysteresis < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "kv_defection_hysteresis".to_string(),
+                        value: kv_defection_hysteresis.to_string(),
+                        reason: "Must be finite and >= 0.0".to_string(),
+                    });
+                }
+                let _ = kv_decode_spill_margin;
+                let _ = kv_defection_epsilon_blocks;
             }
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
@@ -647,24 +659,6 @@ impl ConfigValidator {
             return Ok(());
         }
 
-        if let RoutingMode::VllmPrefillDecode {
-            prefill_policy,
-            decode_policy,
-            ..
-        } = &config.mode
-        {
-            let effective_prefill = prefill_policy.as_ref().unwrap_or(&config.policy);
-            let effective_decode = decode_policy.as_ref().unwrap_or(&config.policy);
-            if matches!(effective_prefill, PolicyConfig::KvAware { .. })
-                || matches!(effective_decode, PolicyConfig::KvAware { .. })
-            {
-                return Err(ConfigError::IncompatibleConfig {
-                    reason: "kv_aware is supported only in regular mode, not PD disaggregation"
-                        .to_string(),
-                });
-            }
-        }
-
         // Check if service discovery is enabled for worker count validation.
         // This covers both K8s service discovery (config.discovery) and vLLM ZMQ
         // service discovery (VllmPrefillDecode { discovery_address: Some(_) }).
@@ -733,6 +727,60 @@ impl ConfigValidator {
                         run with `--vllm-discovery-address ${address}`"
                     .to_string(),
             });
+        }
+
+        // Static KV event sources are only meaningful with a KV-aware
+        // prefill policy; anything else would silently ignore them.
+        if !config.pd_kv_event_sources.is_empty() {
+            if let RoutingMode::VllmPrefillDecode { prefill_urls, .. } = &config.mode {
+                for (url, sources) in &config.pd_kv_event_sources {
+                    if !prefill_urls.iter().any(|(prefill, _)| prefill == url) {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: format!(
+                                "pd_kv_event_sources key '{url}' is not a configured prefill URL"
+                            ),
+                        });
+                    }
+                    if sources.endpoints.is_empty() {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: format!("pd_kv_event_sources['{url}'] has no endpoints"),
+                        });
+                    }
+                    if sources.block_size == 0 {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: format!("pd_kv_event_sources['{url}'] block_size must be > 0"),
+                        });
+                    }
+                    for endpoint in sources
+                        .endpoints
+                        .iter()
+                        .chain(sources.replay_endpoints.iter().flatten())
+                    {
+                        if !(endpoint.starts_with("tcp://") || endpoint.starts_with("ipc://")) {
+                            return Err(ConfigError::IncompatibleConfig {
+                                reason: format!(
+                                    "pd_kv_event_sources['{url}'] endpoint '{endpoint}' must be \
+                                     a ZMQ address (tcp:// or ipc://)"
+                                ),
+                            });
+                        }
+                    }
+                }
+            } else {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "pd_kv_event_sources requires vllm_prefill_decode mode".to_string(),
+                });
+            }
+            if !matches!(
+                config.mode.get_prefill_policy(&config.policy),
+                PolicyConfig::CacheAware { .. } | PolicyConfig::KvAware { .. }
+            ) {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "pd_kv_event_sources requires a cache_aware or kv_aware prefill \
+                             policy (other policies ignore KV event sources)"
+                        .to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -1178,7 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rejects_kv_aware_for_disaggregated_pd_mode() {
+    fn test_accepts_kv_aware_for_disaggregated_pd_mode() {
         let config = RouterConfig::new(
             RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
@@ -1192,11 +1240,13 @@ mod tests {
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
+                kv_decode_spill_margin: 2,
+                kv_defection_hysteresis: 1.0,
+                kv_defection_epsilon_blocks: 4,
             },
         );
 
-        let error = ConfigValidator::validate(&config).unwrap_err();
-        assert!(error.to_string().contains("not PD disaggregation"));
+        ConfigValidator::validate(&config).unwrap();
     }
 
     #[test]
@@ -1261,5 +1311,115 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    fn pd_config_with_static_kv_sources() -> RouterConfig {
+        let mut config = RouterConfig::new(
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
+                decode_urls: vec!["http://decode:8000".to_string()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 5,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 60,
+                max_tree_size: 4096,
+            },
+        );
+        config.pd_kv_event_sources.insert(
+            "http://prefill:8000".to_string(),
+            PdKvEventSources {
+                endpoints: vec!["tcp://prefill:5557".to_string()],
+                replay_endpoints: None,
+                block_size: 16,
+                model: None,
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_valid() {
+        assert!(ConfigValidator::validate(&pd_config_with_static_kv_sources()).is_ok());
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_rejects_unknown_prefill_url() {
+        let mut config = pd_config_with_static_kv_sources();
+        let sources = config
+            .pd_kv_event_sources
+            .remove("http://prefill:8000")
+            .unwrap();
+        config
+            .pd_kv_event_sources
+            .insert("http://other:8000".to_string(), sources);
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("not a configured prefill URL"), "{err}");
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_rejects_bad_endpoints() {
+        let mut config = pd_config_with_static_kv_sources();
+        let sources = config
+            .pd_kv_event_sources
+            .get_mut("http://prefill:8000")
+            .unwrap();
+        sources.endpoints = vec!["http://prefill:5557".to_string()];
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("must be a ZMQ address"), "{err}");
+
+        let mut config = pd_config_with_static_kv_sources();
+        let sources = config
+            .pd_kv_event_sources
+            .get_mut("http://prefill:8000")
+            .unwrap();
+        sources.endpoints = vec![];
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("no endpoints"), "{err}");
+
+        let mut config = pd_config_with_static_kv_sources();
+        let sources = config
+            .pd_kv_event_sources
+            .get_mut("http://prefill:8000")
+            .unwrap();
+        sources.block_size = 0;
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("block_size"), "{err}");
+    }
+
+    #[test]
+    fn test_pd_kv_event_sources_requires_pd_mode_and_kv_aware_policy() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://prefill:8000".to_string()],
+            },
+            PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 5,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 60,
+                max_tree_size: 4096,
+            },
+        );
+        config.pd_kv_event_sources.insert(
+            "http://prefill:8000".to_string(),
+            PdKvEventSources {
+                endpoints: vec!["tcp://prefill:5557".to_string()],
+                replay_endpoints: None,
+                block_size: 16,
+                model: None,
+            },
+        );
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("requires vllm_prefill_decode mode"), "{err}");
+
+        let mut config = pd_config_with_static_kv_sources();
+        config.policy = PolicyConfig::RoundRobin;
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("cache_aware or kv_aware"), "{err}");
     }
 }

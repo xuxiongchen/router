@@ -39,6 +39,9 @@ impl PolicyFactory {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                kv_decode_spill_margin,
+                kv_defection_hysteresis,
+                kv_defection_epsilon_blocks,
             } => Arc::new(KvAwarePolicy::new(CostParams {
                 router_temperature: *router_temperature,
                 transfer_credits: TransferCredits {
@@ -47,6 +50,9 @@ impl PolicyFactory {
                     external: *kv_penalty_external,
                     disk: *kv_penalty_disk,
                 },
+                decode_spill_margin: *kv_decode_spill_margin,
+                defection_hysteresis: *kv_defection_hysteresis,
+                defection_epsilon_blocks: *kv_defection_epsilon_blocks,
                 ..CostParams::default()
             })),
             PolicyConfig::ConsistentHash { virtual_nodes: _ } => {
@@ -108,6 +114,9 @@ mod tests {
             kv_penalty_host: 0.8,
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
+            kv_decode_spill_margin: 2,
+            kv_defection_hysteresis: 1.0,
+            kv_defection_epsilon_blocks: 4,
         });
         assert_eq!(policy.name(), "kv_aware");
 
