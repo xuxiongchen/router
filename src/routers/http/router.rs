@@ -1,7 +1,5 @@
 use super::program_adapter::ProgramCompletion;
-use crate::backend::preprocess::{
-    dense_token_ids, http_kv_input, http_rendered_tokens, HttpKvInput,
-};
+use crate::backend::preprocess::prepare_http_token_inputs;
 use crate::backend::{stream_output::OutputFrameConsumer, PrepareError};
 use crate::config::types::RetryConfig;
 use crate::core::{
@@ -1224,41 +1222,6 @@ impl Router {
         }
     }
 
-    async fn worker_input_json(
-        &self,
-        worker_url: &str,
-        path: &str,
-        body: &serde_json::Value,
-        headers: Option<&HeaderMap>,
-    ) -> Result<serde_json::Value, &'static str> {
-        let mut request = self
-            .client
-            .post(format!("{}{path}", worker_url.trim_end_matches('/')))
-            .timeout(Duration::from_secs(5))
-            .json(body);
-        if let Some(value) = headers.and_then(|headers| headers.get("authorization")) {
-            request = request.header("authorization", value);
-        }
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| "preparation_unavailable")?;
-        match response.status() {
-            StatusCode::NOT_FOUND
-            | StatusCode::METHOD_NOT_ALLOWED
-            | StatusCode::NOT_IMPLEMENTED => return Err("render_unavailable"),
-            status if !status.is_success() => return Err("preparation_rejected"),
-            _ => {}
-        }
-        response
-            .json()
-            .await
-            .map_err(|_| "invalid_preparation_response")
-    }
-
     async fn prepare_http_kv_inputs(
         &self,
         headers: Option<&HeaderMap>,
@@ -1266,98 +1229,39 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
     ) -> Option<WorkerTokenInputs> {
-        let input = match http_kv_input(body, route) {
-            Ok(input) => input,
-            Err(reason) => {
-                RouterMetrics::record_kv_routing_input("http", reason);
-                return None;
-            }
-        };
         let workers = match model_id {
             Some(model) => self.worker_registry.get_by_model_fast(model),
             None => self.worker_registry.get_all(),
         };
-        let mut urls: Vec<_> = workers
+        let urls = workers
             .iter()
             .filter(|worker| worker.is_available())
-            .map(|worker| worker.base_url().to_string())
+            .map(|worker| worker.base_url().to_owned())
             .collect();
-        urls.sort();
-        urls.dedup();
-        if urls.is_empty() {
-            return None;
-        }
-        if let HttpKvInput::Direct(prompts) = input {
-            RouterMetrics::record_kv_routing_input("http", "token_ids");
-            return Some(urls.into_iter().map(|url| (url, prompts.clone())).collect());
-        }
-        let HttpKvInput::Render {
-            path,
-            tokenize_fallback,
-        } = input
-        else {
-            unreachable!()
-        };
-        let expected_prompts = if route == "/v1/completions" {
-            body.get("prompt")
-                .and_then(serde_json::Value::as_array)
-                .filter(|items| {
-                    items
-                        .first()
-                        .is_some_and(|item| item.is_string() || item.is_array())
-                })
-                .map_or(1, Vec::len)
-        } else {
-            1
-        };
-        let results: Vec<_> = futures_util::stream::iter(urls)
-            .map(|url| {
-                let tokenize_fallback = &tokenize_fallback;
-                async move {
-                    let (prompts, source) =
-                        match self.worker_input_json(&url, path, body, headers).await {
-                            Ok(rendered) => (http_rendered_tokens(&rendered)?, "render"),
-                            Err("render_unavailable") => {
-                                let requests =
-                                    tokenize_fallback.as_ref().ok_or("render_unavailable")?;
-                                let mut prompts = Vec::with_capacity(requests.len());
-                                for request in requests {
-                                    let tokenized = self
-                                        .worker_input_json(&url, "/tokenize", request, headers)
-                                        .await?;
-                                    let ids = dense_token_ids(&tokenized["tokens"])?;
-                                    if tokenized["count"].as_u64() != Some(ids.len() as u64) {
-                                        return Err("invalid_preparation_response");
-                                    }
-                                    prompts.push(ids);
-                                }
-                                (Arc::from(prompts), "tokenize")
-                            }
-                            Err(reason) => return Err(reason),
-                        };
-                    if prompts.len() != expected_prompts {
-                        return Err("invalid_preparation_response");
-                    }
-                    Ok((url, prompts, source))
-                }
-            })
-            .buffer_unordered(8)
-            .collect()
-            .await;
+        let results = prepare_http_token_inputs(
+            &self.client,
+            urls,
+            body,
+            route,
+            headers,
+            self.api_key.as_deref(),
+        )
+        .await;
         let mut inputs = WorkerTokenInputs::new();
-        for result in results {
+        for (url, result) in results {
             match result {
-                Ok((url, prompts, source)) => {
-                    RouterMetrics::record_kv_routing_input("http", source);
-                    inputs.insert(url, prompts);
+                Ok(input) => {
+                    RouterMetrics::record_kv_routing_input("http", input.source);
+                    inputs.insert(url, input.prompts);
                 }
                 Err(reason) => {
                     RouterMetrics::record_kv_routing_input("http", reason);
-                    debug!(reason, "KV-aware input preparation fell back to load");
-                    return None;
+                    debug!(worker = %url, reason, "Prefix input preparation unavailable");
                 }
             }
         }
+        // Keep valid workers' inputs instead of discarding them on the first
+        // error. Both policies explicitly report an incomplete-pool fallback.
         Some(inputs)
     }
 
@@ -1411,7 +1315,16 @@ impl Router {
             });
         }
 
-        let idx = policy.select_worker_with_headers(&available, text, request_headers.as_ref())?;
+        let idx = if let Some(cache) = policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache.select_worker_with_inputs(
+                &available, token_ids, lora_name, cache_salt, "regular",
+            )?
+        } else {
+            policy.select_worker_with_headers(&available, text, request_headers.as_ref())?
+        };
         Some(SelectedWorker {
             worker: available.get(idx)?.clone(),
             kv_receipt: None,
@@ -1503,11 +1416,12 @@ impl Router {
             ) if route == "/v1/completions" => completion.extract_text_for_grpc_routing(),
             _ => typed_req.extract_text_for_routing(),
         };
-        let cache_key = std::sync::OnceLock::new();
 
         let http_inputs = if prepared.is_none()
-            && kv_aware_ops(self.policy_for_model(model_id).as_ref()).is_some()
-        {
+            && matches!(
+                self.policy_for_model(model_id).name(),
+                "kv_aware" | "cache_aware"
+            ) {
             match serde_json::to_value(typed_req) {
                 Ok(body) => {
                     self.prepare_http_kv_inputs(headers, &body, route, model_id)
@@ -1586,11 +1500,7 @@ impl Router {
                     let excluded_workers = failed_workers.lock().clone();
                     self.select_worker_for_model(
                         model_id,
-                        Some(if policy.name() == "cache_aware" {
-                            cache_key.get_or_init(|| typed_req.extract_cache_routing_key())
-                        } else {
-                            &text
-                        }),
+                        Some(&text),
                         headers,
                         request_tokens,
                         lora_name,
@@ -2911,12 +2821,13 @@ impl RouterTrait for Router {
             .get("stream")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let http_inputs = if *method == Method::POST && kv_aware_ops(policy.as_ref()).is_some() {
-            self.prepare_http_kv_inputs(headers, &body, path, None)
-                .await
-        } else {
-            None
-        };
+        let http_inputs =
+            if *method == Method::POST && matches!(policy.name(), "kv_aware" | "cache_aware") {
+                self.prepare_http_kv_inputs(headers, &body, path, None)
+                    .await
+            } else {
+                None
+            };
         let request_tokens = http_inputs
             .as_ref()
             .map(KvRequestTokens::PerWorker)
@@ -2985,6 +2896,22 @@ impl RouterTrait for Router {
                 worker: workers[receipt.worker_index].clone(),
                 kv_receipt: Some(receipt),
             })
+        } else if let Some(cache) = policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>()
+        {
+            cache
+                .select_worker_with_inputs(
+                    &workers,
+                    request_tokens,
+                    lora_name,
+                    cache_salt,
+                    "regular",
+                )
+                .map(|index| SelectedWorker {
+                    worker: workers[index].clone(),
+                    kv_receipt: None,
+                })
         } else {
             let cache_key = (policy.name() == "cache_aware")
                 .then(|| crate::protocols::spec::cache_routing::for_route(&body, path));

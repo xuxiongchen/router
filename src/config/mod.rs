@@ -149,6 +149,44 @@ pub fn parse_static_kv_event_sources(
     Ok(sources)
 }
 
+/// Parse repeatable static PD KV-source specifications for both launchers.
+pub fn parse_pd_kv_events(
+    specs: &[String],
+) -> ConfigResult<std::collections::HashMap<String, PdKvEventSources>> {
+    let mut sources = std::collections::HashMap::new();
+    for spec in specs {
+        let Some((url, endpoints)) = spec.split_once('=') else {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!("--pd-kv-events expects URL=ENDPOINT[,ENDPOINT...], got '{spec}'"),
+            });
+        };
+        let url = url.trim();
+        let endpoints: Vec<String> = endpoints
+            .split(',')
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if url.is_empty() || endpoints.is_empty() {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!(
+                    "--pd-kv-events needs a URL and at least one endpoint, got '{spec}'"
+                ),
+            });
+        }
+        sources.insert(
+            url.to_owned(),
+            PdKvEventSources {
+                endpoints,
+                replay_endpoints: None,
+                block_size: 16,
+                model: None,
+            },
+        );
+    }
+    Ok(sources)
+}
+
 #[cfg(test)]
 mod static_kv_event_source_tests {
     use super::*;

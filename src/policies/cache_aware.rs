@@ -18,9 +18,10 @@
 
     1. Cache-Aware Routing (Approximate Tree)
     -------------------------------------------
-    This strategy maintains an approximate radix tree for each worker based on request history,
-    eliminating the need for direct cache state queries. The tree stores raw text characters
-    instead of token IDs to avoid tokenization overhead.
+    This strategy maintains an approximate radix tree from request history.
+    Router paths use backend-effective token keys, shared with KV-aware input
+    preparation, including every prompt in a batch. Legacy text-only callers
+    can still supply text keys. This history is not an engine residency index.
 
     Process:
     a. For each request, find the worker with the highest prefix match
@@ -60,14 +61,16 @@
     a hard process-memory limit.
 */
 
-use super::{get_healthy_worker_indices, CacheAwareConfig, LoadBalancingPolicy, RequestHeaders};
+use super::{
+    get_healthy_worker_indices, CacheAwareConfig, KvRequestTokens, LoadBalancingPolicy,
+    RequestHeaders,
+};
 use crate::core::Worker;
 use crate::metrics::RouterMetrics;
 use crate::policies::normalize_model_key;
 use crate::protocols::spec::cache_routing;
 use crate::tree::Tree;
 use dashmap::DashMap;
-use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
@@ -238,6 +241,120 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Compare all batch prompts using the same effective tokens consumed by
+    /// KV-aware routing. No template, truncation, or session reinterpretation.
+    pub fn select_worker_with_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        tokens: KvRequestTokens<'_>,
+        lora_name: Option<&str>,
+        cache_salt: Option<&str>,
+        stage: &'static str,
+    ) -> Option<usize> {
+        let healthy = get_healthy_worker_indices(workers);
+        if healthy.is_empty() {
+            return None;
+        }
+        let prompts: Vec<_> = healthy
+            .iter()
+            .map(|&index| tokens.prompts_for(workers[index].as_ref()))
+            .collect();
+        let complete = prompts
+            .iter()
+            .all(|batch| !batch.is_empty() && batch.iter().all(|ids| !ids.is_empty()));
+        let min_load = healthy.iter().map(|&i| workers[i].load()).min()?;
+        let max_load = healthy.iter().map(|&i| workers[i].load()).max()?;
+        let imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
+            && max_load as f32 > min_load as f32 * self.config.balance_rel_threshold;
+        if imbalanced {
+            RouterMetrics::record_load_balancing_event();
+            RouterMetrics::set_load_range(max_load, min_load);
+        }
+        if !complete {
+            RouterMetrics::record_prefix_routing_decision("cache_aware", stage, "missing_tokens");
+            let index = *healthy.iter().min_by_key(|&&i| workers[i].load())?;
+            workers[index].increment_processed();
+            RouterMetrics::record_processed_request(workers[index].url());
+            RouterMetrics::record_policy_decision(self.name(), workers[index].url());
+            return Some(index);
+        }
+        // A different adapter or salt must never share historical cache hints.
+        let mut scope = normalize_model_key(workers[healthy[0]].model_id()).to_owned();
+        if lora_name.is_some() || cache_salt.is_some() {
+            use sha2::{Digest, Sha256};
+            let identity = serde_json::to_vec(&(lora_name, cache_salt)).ok()?;
+            scope.push_str(&format!(":{:x}", Sha256::digest(identity)));
+        }
+        // Lazy initialization also covers discovery pools and newly seen models.
+        let tree = self
+            .trees
+            .entry(scope)
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .clone();
+        let keys: Vec<Vec<_>> = prompts
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|ids| cache_routing::token_ids(ids))
+                    .collect()
+            })
+            .collect();
+        let rates: Vec<f64> = healthy
+            .iter()
+            .zip(&keys)
+            .map(|(&i, keys)| {
+                let mut matched = 0usize;
+                let mut input = 0usize;
+                for key in keys {
+                    let hit = tree.prefix_match_tenant_char_count(key, workers[i].url());
+                    // Complete fixed-width token IDs only; namespaces never count.
+                    let (hit_tokens, input_tokens) = cache_routing::token_prefix_counts(key, hit);
+                    matched += hit_tokens;
+                    input += input_tokens;
+                }
+                if input == 0 {
+                    0.0
+                } else {
+                    matched as f64 / input as f64
+                }
+            })
+            .collect();
+        let best_rate = rates.iter().copied().fold(0.0_f64, f64::max);
+        let use_prefix = !imbalanced && best_rate > self.config.cache_threshold as f64;
+        let position = (0..healthy.len())
+            .filter(|&i| !use_prefix || rates[i] == best_rate)
+            .min_by_key(|&i| workers[healthy[i]].load())?;
+        let index = healthy[position];
+        for key in &keys[position] {
+            tree.insert(key, workers[index].url());
+        }
+        RouterMetrics::record_cache_routing_key("tokens");
+        RouterMetrics::record_prefix_routing_decision(
+            "cache_aware",
+            stage,
+            if imbalanced {
+                "load_imbalance"
+            } else if use_prefix {
+                "prefix_hit"
+            } else {
+                "prefix_miss"
+            },
+        );
+        debug!(
+            stage,
+            selected = workers[index].url(),
+            match_rate = rates[position],
+            ?rates,
+            batch_prompts = keys[position].len(),
+            "Cache prefix decision"
+        );
+        workers[index].increment_processed();
+        RouterMetrics::record_processed_request(workers[index].url());
+        RouterMetrics::record_policy_decision(self.name(), workers[index].url());
+        Some(index)
+    }
+
     fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -268,19 +385,10 @@ impl CacheAwarePolicy {
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
-            // Get the tree reference without locking the entire HashMap
-            // DashMap only locks the specific shard containing this key
-            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-            if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
-                tree.insert(text, worker_url);
-            } else {
-                debug!(
-                    "Warning: No tree found for model '{}', skipping cache update",
-                    model_id
-                );
-            }
+            self.trees
+                .entry(model_id.to_owned())
+                .or_insert_with(|| Arc::new(Tree::new()))
+                .insert(text, workers[min_load_idx].url());
         }
 
         // Increment processed counter
@@ -351,28 +459,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // Use cache-aware routing when balanced
         // Get the tree reference without locking the entire HashMap
         // DashMap only locks the specific shard containing this key
-        let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-        let keys: Vec<_> = self.trees.iter().map(|entry| entry.key().clone()).collect();
-        debug!("Available tree keys: {:?}", keys);
-
-        let Some(tree) = tree else {
-            // No tree for this model, log warning and use random selection
-            debug!(
-                "Warning: No tree found for model '{}', using random worker selection",
-                model_id
-            );
-            // Return a random healthy worker
-            let mut rng = rand::rng();
-            let random_idx = rng.random_range(0..healthy_indices.len());
-            let selected_idx = healthy_indices[random_idx];
-
-            workers[selected_idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[selected_idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[selected_idx].url());
-
-            return Some(selected_idx);
-        };
+        let tree = self
+            .trees
+            .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .clone();
         debug!("Using cache-aware routing for model '{}'", model_id);
         // Now we work with the tree without holding the HashMap lock
         // Use prefix_match_with_counts to avoid redundant chars().count() calls
@@ -555,6 +646,123 @@ mod tests {
     use crate::protocols::spec::{CompletionRequest, GenerationRequest};
 
     #[test]
+    fn discovered_pools_use_all_effective_batch_prompts_without_initialization() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let seed: Arc<[Vec<u32>]> = Arc::from(vec![vec![1], vec![7; 64]]);
+        let seed_inputs = workers
+            .iter()
+            .map(|worker| (worker.base_url().to_owned(), seed.clone()))
+            .collect();
+        // Discovery can first expose only rank/worker 1. No init_workers call.
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                std::slice::from_ref(&workers[1]),
+                KvRequestTokens::PerWorker(&seed_inputs),
+                None,
+                None,
+                "prefill"
+            ),
+            Some(0)
+        );
+        workers[1].increment_load();
+        let query: Arc<[Vec<u32>]> = Arc::from(vec![vec![999], vec![7; 64]]);
+        let query_inputs = workers
+            .iter()
+            .map(|worker| (worker.base_url().to_owned(), query.clone()))
+            .collect();
+        // Prompt 0 misses. The long second prompt must still retain affinity.
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&query_inputs),
+                None,
+                None,
+                "prefill"
+            ),
+            Some(1)
+        );
+        // A salt identifies a distinct engine cache and historical hint scope.
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&query_inputs),
+                None,
+                Some("another-cache"),
+                "prefill"
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn incomplete_effective_inputs_do_not_claim_a_prefix_hit() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|i| {
+                Arc::new(BasicWorker::new(
+                    format!("http://w{i}:8000"),
+                    WorkerType::Regular,
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let ids = [1, 2, 3, 4];
+        policy
+            .select_worker_with_inputs(
+                std::slice::from_ref(&workers[1]),
+                KvRequestTokens::Shared(Some(&ids)),
+                None,
+                None,
+                "regular",
+            )
+            .unwrap();
+        workers[1].increment_load();
+        let mut inputs = crate::policies::WorkerTokenInputs::new();
+        inputs.insert(
+            workers[1].base_url().to_owned(),
+            Arc::from(vec![ids.to_vec()]),
+        );
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&inputs),
+                None,
+                None,
+                "regular"
+            ),
+            Some(0)
+        );
+        // Restoring the missing worker restores a real prefix comparison.
+        inputs.insert(
+            workers[0].base_url().to_owned(),
+            Arc::from(vec![ids.to_vec()]),
+        );
+        assert_eq!(
+            policy.select_worker_with_inputs(
+                &workers,
+                KvRequestTokens::PerWorker(&inputs),
+                None,
+                None,
+                "regular"
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn content_keys_do_not_turn_unrelated_tokens_or_sessions_into_hits() {
         let key = |value| {
             serde_json::from_value::<CompletionRequest>(value)
@@ -576,7 +784,7 @@ mod tests {
             ),
             (
                 serde_json::json!({"prompt": "a", "session_params": {"session_id": "sess-0001"}}),
-                serde_json::json!({"prompt": "a", "session_params": {"session_id": "sess-0002"}}),
+                serde_json::json!({"prompt": "b", "session_params": {"session_id": "sess-0001"}}),
             ),
         ];
         for (seed, query) in pairs {

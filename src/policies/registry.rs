@@ -58,10 +58,7 @@ impl PolicyRegistry {
             model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
             default_policy,
             prefill_policy: Arc::new(RwLock::new(None)),
-            decode_policy: Arc::new(RwLock::new(Some(Self::create_policy_from_config(
-                &PolicyConfig::DEFAULT_DECODE,
-                &kv_affinity_table,
-            )))),
+            decode_policy: Arc::new(RwLock::new(None)),
             kv_affinity_table,
         }
     }
@@ -160,6 +157,13 @@ impl PolicyRegistry {
     /// Get the default policy
     pub fn get_default_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         Arc::clone(&self.default_policy)
+    }
+
+    /// The registry-owned KV affinity table. Its idle TTL carries the
+    /// router-level session-affinity setting; policies created outside this
+    /// registry must share this table or their affinity gate stays closed.
+    pub fn kv_affinity_table(&self) -> Arc<KvAffinityTable> {
+        Arc::clone(&self.kv_affinity_table)
     }
 
     /// Get policy for a model, or default if not found
@@ -299,7 +303,7 @@ impl PolicyRegistry {
             .unwrap_or_else(|| self.get_default_policy())
     }
 
-    /// Get the decode policy for PD mode (least-load unless overridden).
+    /// Get the decode override, or the main policy when no override is set.
     pub fn get_decode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         let decode_policy = self.decode_policy.read().unwrap();
         decode_policy
