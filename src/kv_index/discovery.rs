@@ -56,6 +56,17 @@ pub struct KvEventSourceEntry {
 /// /kv_event_sources body: a JSON object keyed by DP rank (as string).
 pub type KvEventSourcesResponse = HashMap<String, KvEventSourceEntry>;
 
+/// Operator-supplied immutable source facts, matching the static P/D shape.
+/// This is a deployment contract, not remote identity attestation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StaticKvEventSources {
+    pub endpoints: Vec<String>,
+    pub replay_endpoints: Option<Vec<String>>,
+    pub block_size: u32,
+    pub model: String,
+}
+
 /// What on_worker_added learned and spawned.
 #[derive(Debug, Clone, Default)]
 pub struct WorkerKvInfo {
@@ -90,6 +101,8 @@ struct WorkerSubs {
 pub struct KvIndexSupervisor {
     client: reqwest::Client,
     hash_mode: HashMode,
+    dense_http: bool,
+    static_sources: HashMap<String, StaticKvEventSources>,
     /// Shared across every subscriber — one I/O thread pool, not one per task.
     ctx: Arc<zmq::Context>,
     /// One indexer per cache-identity core.
@@ -125,6 +138,8 @@ impl KvIndexSupervisor {
         let supervisor = KvIndexSupervisor {
             client,
             hash_mode,
+            dense_http: false,
+            static_sources: HashMap::new(),
             ctx: Arc::new(zmq::Context::new()),
             indexers: DashMap::new(),
             identity_refs: Mutex::new(HashMap::new()),
@@ -133,6 +148,58 @@ impl KvIndexSupervisor {
             first_block_size: Mutex::new(None),
         };
         (supervisor, signal_rx)
+    }
+
+    pub(crate) fn new_http_dense(
+        client: reqwest::Client,
+        hash_mode: HashMode,
+        worker_urls: &[String],
+    ) -> Result<(Self, mpsc::Receiver<IngestionSignal>), String> {
+        let (mut supervisor, signals) = Self::new(client, hash_mode);
+        supervisor.dense_http = true;
+        if let Ok(value) = std::env::var("VLLM_ROUTER_KV_EVENT_SOURCES") {
+            supervisor.static_sources = serde_json::from_str(&value)
+                .map_err(|error| format!("static KV sources: {error}"))?;
+            let mut endpoints = std::collections::HashSet::new();
+            for (worker, source) in &mut supervisor.static_sources {
+                if !worker_urls.contains(worker)
+                    || source.endpoints.len() != 1
+                    || source
+                        .replay_endpoints
+                        .as_ref()
+                        .is_some_and(|endpoints| endpoints.len() != 1)
+                    || source.block_size == 0
+                    || source.model.trim().is_empty()
+                {
+                    return Err(format!("invalid static DP1 KV source for {worker}"));
+                }
+                source.endpoints[0] = crate::kv_index::parse_endpoint_mapping(&format!(
+                    "{worker}={}",
+                    source.endpoints[0]
+                ))?
+                .1;
+                if !endpoints.insert(source.endpoints[0].clone()) {
+                    return Err("static KV publishers must be independent".into());
+                }
+                if let Some(replay) = &mut source.replay_endpoints {
+                    replay[0] = crate::kv_index::parse_endpoint_mapping(&format!(
+                        "{worker}={}",
+                        replay[0]
+                    ))?
+                    .1;
+                }
+            }
+        }
+        Ok((supervisor, signals))
+    }
+
+    pub(crate) fn worker_has_dense_model(&self, worker_url: &str, model: &str) -> bool {
+        self.dense_http
+            && self
+                .workers
+                .lock()
+                .get(worker_url)
+                .is_some_and(|worker| worker.key.model.as_ref() == model && worker.ranks == [0])
     }
 
     pub fn hash_mode(&self) -> HashMode {
@@ -153,7 +220,10 @@ impl KvIndexSupervisor {
             self.on_worker_removed(worker_url);
         }
 
-        let discovery = discover_worker(&self.client, worker_url).await;
+        let discovery = match self.static_sources.get(worker_url) {
+            Some(source) => static_discovery(worker_url, source),
+            None => discover_worker(&self.client, worker_url).await,
+        };
         let server_info = discovery.server_info.unwrap_or_else(|e| {
             warn!(
                 "kv_index {}: {} — falling back to URL as instance/model id",
@@ -252,11 +322,25 @@ impl KvIndexSupervisor {
                     continue;
                 }
             };
-            let pub_endpoint = resolve_endpoint(&entry.endpoint, &worker_host);
-            let replay_endpoint = entry
+            let pub_endpoint = match resolve_endpoint(&entry.endpoint, &worker_host) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    warn!(worker_url, rank, %error, "invalid KV publisher endpoint");
+                    continue;
+                }
+            };
+            let replay_endpoint = match entry
                 .replay_endpoint
                 .as_deref()
-                .map(|e| resolve_endpoint(e, &worker_host));
+                .map(|e| resolve_endpoint(e, &worker_host))
+                .transpose()
+            {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    warn!(worker_url, rank, %error, "invalid KV replay endpoint");
+                    continue;
+                }
+            };
             let ev = EventSource {
                 source: source_id.clone(),
                 dp_rank: rank,
@@ -265,7 +349,12 @@ impl KvIndexSupervisor {
                 topic: entry.topic.clone(),
                 hwm: entry.hwm,
             };
-            let handle = spawn_subscriber(
+            let spawn = if self.dense_http {
+                crate::kv_index::subscriber::spawn_dense
+            } else {
+                spawn_subscriber
+            };
+            let handle = spawn(
                 ev,
                 indexer.clone(),
                 Some(self.signal_tx.clone()),
@@ -386,6 +475,42 @@ impl KvIndexSupervisor {
             }
             _ => {}
         }
+    }
+}
+
+fn static_discovery(worker_url: &str, config: &StaticKvEventSources) -> WorkerDiscovery {
+    let server_info = ServerInfo {
+        model_id: Some(config.model.clone()),
+        instance_id: Some(worker_url.to_string()),
+        kv_block_size: Some(config.block_size),
+        ..Default::default()
+    };
+    let sources = config
+        .endpoints
+        .iter()
+        .enumerate()
+        .map(|(rank, endpoint)| {
+            (
+                rank.to_string(),
+                KvEventSourceEntry {
+                    endpoint: endpoint.clone(),
+                    replay_endpoint: config
+                        .replay_endpoints
+                        .as_ref()
+                        .and_then(|replay| replay.get(rank).cloned()),
+                    publisher: Some("zmq".to_owned()),
+                    encoding: Some("msgpack".to_owned()),
+                    schema_version: Some(1),
+                    enable_kv_cache_events: Some(true),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    WorkerDiscovery {
+        server_info: Ok(server_info),
+        sources: Ok(sources),
+        model_id: Ok(Some(config.model.clone())),
     }
 }
 
@@ -537,17 +662,22 @@ fn events_enabled(entry: &KvEventSourceEntry) -> bool {
     !entry.endpoint.is_empty()
 }
 
-/// Rewrite a ZMQ bind address's host (`*` / `0.0.0.0`) to `worker_host`.
+/// Rewrite a ZMQ bind host before validating the TCP connect endpoint.
 /// `tcp://*:5557` → `tcp://10.0.0.5:5557`.
-fn resolve_endpoint(endpoint: &str, worker_host: &str) -> String {
+fn resolve_endpoint(endpoint: &str, worker_host: &str) -> Result<String, String> {
     if let Some(rest) = endpoint.strip_prefix("tcp://") {
-        if let Some((host, port)) = rest.split_once(':') {
-            if host == "*" || host == "0.0.0.0" {
-                return format!("tcp://{}:{}", worker_host, port);
+        if let Some((host, port)) = rest.rsplit_once(':') {
+            if matches!(host, "*" | "0.0.0.0" | "[::]") {
+                return super::endpoints::canonical_endpoint(&format!(
+                    "tcp://{worker_host}:{port}"
+                ));
             }
         }
+        return super::endpoints::canonical_endpoint(endpoint);
     }
-    endpoint.to_string()
+    // IPC/inproc and other transports retain their existing ZMQ contract;
+    // the HTTP-only worker mapping helper must not gate gRPC discovery.
+    Ok(endpoint.to_string())
 }
 
 /// Extract the host from a worker URL (`http://10.0.0.5:8000` → `10.0.0.5`).
@@ -581,11 +711,11 @@ mod tests {
     #[test]
     fn resolve_endpoint_rewrites_bind_star() {
         assert_eq!(
-            resolve_endpoint("tcp://*:5557", "10.0.0.5"),
+            resolve_endpoint("tcp://*:5557", "10.0.0.5").unwrap(),
             "tcp://10.0.0.5:5557"
         );
         assert_eq!(
-            resolve_endpoint("tcp://0.0.0.0:5558", "10.0.0.5"),
+            resolve_endpoint("tcp://0.0.0.0:5558", "10.0.0.5").unwrap(),
             "tcp://10.0.0.5:5558"
         );
     }
@@ -593,14 +723,32 @@ mod tests {
     #[test]
     fn resolve_endpoint_keeps_resolved_host() {
         assert_eq!(
-            resolve_endpoint("tcp://10.0.0.5:5557", "ignored"),
+            resolve_endpoint("tcp://10.0.0.5:5557", "ignored").unwrap(),
             "tcp://10.0.0.5:5557"
         );
     }
 
     #[test]
     fn resolve_endpoint_passthrough_non_tcp() {
-        assert_eq!(resolve_endpoint("ipc:///tmp/x", "h"), "ipc:///tmp/x");
+        assert_eq!(
+            resolve_endpoint("ipc:///tmp/x", "h").unwrap(),
+            "ipc:///tmp/x"
+        );
+        assert_eq!(resolve_endpoint("inproc://x", "h").unwrap(), "inproc://x");
+    }
+
+    #[test]
+    fn resolved_tcp_sources_reuse_connect_validation_without_http_worker_admission() {
+        let host = worker_host("grpc://[::1]:50051").unwrap();
+        assert_eq!(
+            resolve_endpoint("tcp://[::]:5557", &host).unwrap(),
+            "tcp://[::1]:5557"
+        );
+        assert_eq!(
+            resolve_endpoint("tcp://[::ffff:127.0.0.1]:5557", &host).unwrap(),
+            "tcp://127.0.0.1:5557"
+        );
+        assert!(resolve_endpoint("tcp://*:0", &host).is_err());
     }
 
     #[test]
