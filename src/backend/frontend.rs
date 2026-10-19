@@ -80,6 +80,17 @@ impl EngineFrontend {
         self.tokenizer.pin_test_token_ids(token_ids);
     }
 
+    pub(crate) async fn completion_tokenizer(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<super::vllm_frontend::DynTokenizer> {
+        self.tokenizer
+            .resolve(Some(model))
+            .await?
+            .tokenizer()
+            .ok_or_else(|| anyhow::anyhow!("Completion requires a real tokenizer backend"))
+    }
+
     /// Chat template + encode. Call once, before `policy.select`.
     pub async fn prepare(
         &self,
