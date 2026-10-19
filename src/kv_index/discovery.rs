@@ -274,11 +274,25 @@ impl KvIndexSupervisor {
                     continue;
                 }
             };
-            let pub_endpoint = resolve_endpoint(&entry.endpoint, &worker_host);
-            let replay_endpoint = entry
+            let pub_endpoint = match resolve_endpoint(&entry.endpoint, &worker_host) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    warn!(worker_url, rank, %error, "invalid KV publisher endpoint");
+                    continue;
+                }
+            };
+            let replay_endpoint = match entry
                 .replay_endpoint
                 .as_deref()
-                .map(|e| resolve_endpoint(e, &worker_host));
+                .map(|e| resolve_endpoint(e, &worker_host))
+                .transpose()
+            {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    warn!(worker_url, rank, %error, "invalid KV replay endpoint");
+                    continue;
+                }
+            };
             let ev = EventSource {
                 source: source_id.clone(),
                 dp_rank: rank,
@@ -684,17 +698,22 @@ fn worker_get(client: &reqwest::Client, url: &str) -> reqwest::RequestBuilder {
     }
 }
 
-/// Rewrite a ZMQ bind address's host (`*` / `0.0.0.0`) to `worker_host`.
+/// Rewrite a ZMQ bind host before validating the TCP connect endpoint.
 /// `tcp://*:5557` → `tcp://10.0.0.5:5557`.
-fn resolve_endpoint(endpoint: &str, worker_host: &str) -> String {
+fn resolve_endpoint(endpoint: &str, worker_host: &str) -> Result<String, String> {
     if let Some(rest) = endpoint.strip_prefix("tcp://") {
-        if let Some((host, port)) = rest.split_once(':') {
-            if host == "*" || host == "0.0.0.0" {
-                return format!("tcp://{}:{}", worker_host, port);
+        if let Some((host, port)) = rest.rsplit_once(':') {
+            if matches!(host, "*" | "0.0.0.0" | "[::]") {
+                return super::endpoints::canonical_endpoint(&format!(
+                    "tcp://{worker_host}:{port}"
+                ));
             }
         }
+        return super::endpoints::canonical_endpoint(endpoint);
     }
-    endpoint.to_string()
+    // IPC/inproc and other transports retain their existing ZMQ contract;
+    // the HTTP-only worker mapping helper must not gate gRPC discovery.
+    Ok(endpoint.to_string())
 }
 
 /// Extract the host from a worker URL (`http://10.0.0.5:8000` → `10.0.0.5`).
@@ -728,11 +747,11 @@ mod tests {
     #[test]
     fn resolve_endpoint_rewrites_bind_star() {
         assert_eq!(
-            resolve_endpoint("tcp://*:5557", "10.0.0.5"),
+            resolve_endpoint("tcp://*:5557", "10.0.0.5").unwrap(),
             "tcp://10.0.0.5:5557"
         );
         assert_eq!(
-            resolve_endpoint("tcp://0.0.0.0:5558", "10.0.0.5"),
+            resolve_endpoint("tcp://0.0.0.0:5558", "10.0.0.5").unwrap(),
             "tcp://10.0.0.5:5558"
         );
     }
@@ -740,14 +759,32 @@ mod tests {
     #[test]
     fn resolve_endpoint_keeps_resolved_host() {
         assert_eq!(
-            resolve_endpoint("tcp://10.0.0.5:5557", "ignored"),
+            resolve_endpoint("tcp://10.0.0.5:5557", "ignored").unwrap(),
             "tcp://10.0.0.5:5557"
         );
     }
 
     #[test]
     fn resolve_endpoint_passthrough_non_tcp() {
-        assert_eq!(resolve_endpoint("ipc:///tmp/x", "h"), "ipc:///tmp/x");
+        assert_eq!(
+            resolve_endpoint("ipc:///tmp/x", "h").unwrap(),
+            "ipc:///tmp/x"
+        );
+        assert_eq!(resolve_endpoint("inproc://x", "h").unwrap(), "inproc://x");
+    }
+
+    #[test]
+    fn resolved_tcp_sources_reuse_connect_validation_without_http_worker_admission() {
+        let host = worker_host("grpc://[::1]:50051").unwrap();
+        assert_eq!(
+            resolve_endpoint("tcp://[::]:5557", &host).unwrap(),
+            "tcp://[::1]:5557"
+        );
+        assert_eq!(
+            resolve_endpoint("tcp://[::ffff:127.0.0.1]:5557", &host).unwrap(),
+            "tcp://127.0.0.1:5557"
+        );
+        assert!(resolve_endpoint("tcp://*:0", &host).is_err());
     }
 
     #[test]
@@ -970,5 +1007,35 @@ mod tests {
         assert_eq!(key.model.as_ref(), worker_url);
         assert!(supervisor.match_provider_for_worker(worker_url).is_some());
         supervisor.on_worker_removed(worker_url);
+    }
+
+    #[tokio::test]
+    async fn static_sources_reject_invalid_tcp_connect_endpoints_before_registration() {
+        for (endpoint, replay) in [
+            ("tcp://127.0.0.1:0", None),
+            ("tcp://127.0.0.1:5557/path", None),
+            ("tcp://[::ffff:0.0.0.0]:5557", None),
+            ("tcp://127.0.0.1:5557", Some("tcp://127.0.0.1:0")),
+        ] {
+            let worker_url = "http://127.0.0.1:1";
+            let sources = std::iter::once((
+                worker_url.to_owned(),
+                crate::config::types::PdKvEventSources {
+                    endpoints: vec![endpoint.into()],
+                    replay_endpoints: replay.map(|endpoint| vec![endpoint.into()]),
+                    block_size: 16,
+                    model: Some("m".into()),
+                },
+            ))
+            .collect();
+            let (supervisor, _signals) =
+                KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMode::Sha256, sources);
+            let info = supervisor.on_worker_added(worker_url).await.unwrap();
+            assert!(
+                info.ranks.is_empty(),
+                "endpoint={endpoint}, replay={replay:?}"
+            );
+            supervisor.on_worker_removed(worker_url);
+        }
     }
 }

@@ -3,14 +3,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rmp_serde::from_slice;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::kv_index::indexer::KvBlockIndexer;
 use crate::kv_index::types::{ClearScope, ResidencyOwner, SourceId, StorageTier};
 use crate::kv_index::wire::{ExternalBlockHash, KVEvent, KVEventBatch};
-use crate::kv_index::IngestionSignal;
+use crate::kv_index::{decode_batch, IngestionSignal};
 
 /// sha256 of each block's token-id bytes, seeded by `lora_name`.
 /// The seed is re-applied per block (no parent chaining here) so identical
@@ -119,7 +118,15 @@ fn spawn_inner(
             }
             match sub.recv_multipart(zmq::DONTWAIT) {
                 Ok(frames) => {
-                    if frames.len() < 3 || frames[1].len() != 8 {
+                    // ZMQ SUB matches topic prefixes, not complete topics.
+                    if frames
+                        .first()
+                        .is_some_and(|frame| frame.as_slice() != topic.as_bytes())
+                    {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    if frames.len() != 3 || frames[1].len() != 8 {
                         indexer.invalidate_source(&source_id, dp_rank);
                         suspended = true;
                         tokio::task::yield_now().await;
@@ -188,6 +195,7 @@ fn spawn_inner(
                                 incarnation,
                                 signals.clone(),
                                 pd_dense,
+                                &topic,
                             )
                             .await
                             {
@@ -212,7 +220,19 @@ fn spawn_inner(
                     if let Some(batch) = batch {
                         // After unrecoverable loss, credit only fresh observations
                         // on the now-clean source; absence is a conservative miss.
-                        apply_batch(&indexer, &source_id, dp_rank, incarnation, &batch, pd_dense);
+                        if !apply_batch(
+                            &indexer,
+                            &source_id,
+                            dp_rank,
+                            incarnation,
+                            &batch,
+                            pd_dense,
+                        ) {
+                            indexer.invalidate_source(&source_id, dp_rank);
+                            suspended = true;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
                         last_seq = seq;
                         if suspended {
                             indexer.resume_source(&source_id, dp_rank);
@@ -225,6 +245,7 @@ fn spawn_inner(
                                 last_seq: seq,
                             },
                         );
+                        debug!(source = %source_id, rank = dp_rank, seq, "kv_index live batch applied");
                     }
                     // A sustained publisher starves EAGAIN; yield so this task
                     // can't monopolize the runtime worker.
@@ -271,7 +292,7 @@ fn read_seq(bytes: &[u8]) -> i64 {
 }
 
 fn decode(payload: &[u8]) -> Option<KVEventBatch> {
-    match from_slice::<KVEventBatch>(payload) {
+    match decode_batch(payload) {
         Ok(b) => Some(b),
         Err(e) => {
             warn!("kv_index decode batch: {}", e);
@@ -334,18 +355,16 @@ fn apply_batch(
     incarnation: u64,
     batch: &KVEventBatch,
     pd_dense: bool,
-) {
+) -> bool {
     // Batch rank if the 3-element array carries it; else the discovery rank.
     let rank = batch.data_parallel_rank.unwrap_or(dp_rank);
-    for ev in &batch.events {
-        match ev {
+    // Reject before publishing any prefix or eviction from an unmodeled batch.
+    if pd_dense
+        && batch.events.iter().any(|event| match event {
             KVEvent::BlockStored(s) => {
-                // Local token hashes cannot distinguish salt/MM/layout
-                // identities. Never publish credit for an unmodeled event.
-                // Named LoRA remains isolated by the local hash seed.
-                if pd_dense
-                    && (s.extra_keys.as_ref().is_some_and(|keys| {
-                        keys.iter().any(|key| {
+                s.extra_keys.as_ref().is_some_and(|keys| {
+                    keys.len() != s.block_hashes.len()
+                        || keys.iter().any(|key| {
                             !key.is_nil()
                                 && !s.lora_name.as_ref().is_some_and(|name| {
                                     key.as_array().is_some_and(|parts| {
@@ -353,18 +372,36 @@ fn apply_batch(
                                     })
                                 })
                         })
-                    }) || s
-                        .kv_cache_spec_kind
-                        .as_deref()
-                        .is_some_and(|kind| kind != "full_attention")
-                        || s.kv_cache_spec_sliding_window.is_some()
-                        || (s.lora_id.is_some() && s.lora_name.is_none())
-                        || s.block_size == 0
-                        || s.block_hashes.len().checked_mul(s.block_size as usize)
-                            != Some(s.token_ids.len()))
-                {
-                    continue;
-                }
+                }) || s
+                    .kv_cache_spec_kind
+                    .as_deref()
+                    .is_some_and(|kind| kind != "full_attention")
+                    || s.kv_cache_spec_sliding_window.is_some()
+                    || s.session_id.is_some()
+                    || !dense_residency_supported(
+                        s.medium.as_deref(),
+                        s.locality.as_deref(),
+                        s.ownership.as_deref(),
+                    )
+                    || (s.lora_id.is_some() && s.lora_name.is_none())
+                    || s.lora_name.as_ref().is_some_and(|name| name.is_empty())
+                    || s.block_size == 0
+                    || s.block_hashes.len().checked_mul(s.block_size as usize)
+                        != Some(s.token_ids.len())
+            }
+            KVEvent::BlockRemoved(r) => !dense_residency_supported(
+                r.medium.as_deref(),
+                r.locality.as_deref(),
+                r.ownership.as_deref(),
+            ),
+            KVEvent::AllBlocksCleared(_) => false,
+        })
+    {
+        return false;
+    }
+    for ev in &batch.events {
+        match ev {
+            KVEvent::BlockStored(s) => {
                 let group = s.group_idx.unwrap_or(0);
                 let owner = event_owner(source_id, rank, incarnation, s.ownership.as_deref());
                 let tier = event_tier(&owner, s.medium.as_deref());
@@ -392,6 +429,22 @@ fn apply_batch(
             }
         }
     }
+    true
+}
+
+fn dense_residency_supported(
+    medium: Option<&str>,
+    locality: Option<&str>,
+    ownership: Option<&str>,
+) -> bool {
+    let pool = ownership.is_some_and(|owner| !owner.is_empty());
+    locality.is_none_or(|locality| locality == if pool { "REMOTE" } else { "LOCAL" })
+        && medium.is_none_or(|medium| {
+            matches!(
+                medium.to_ascii_uppercase().as_str(),
+                "GPU" | "DEVICE" | "CPU" | "HOST" | "HOST_PINNED" | "STORAGE" | "DISK"
+            )
+        })
 }
 
 /// Backfill `(last_seq, ∞)` from the replay ROUTER via a DEALER socket.
@@ -412,6 +465,7 @@ async fn replay(
     incarnation: u64,
     signals: Option<mpsc::Sender<IngestionSignal>>,
     pd_dense: bool,
+    topic: &str,
 ) -> Option<i64> {
     let dealer = match ctx.socket(zmq::DEALER) {
         Ok(s) => s,
@@ -446,12 +500,19 @@ async fn replay(
         match dealer.recv_multipart(zmq::DONTWAIT) {
             Ok(frames) => {
                 // DEALER reply: [empty, topic, seq, payload]; seq is 2nd-from-last.
-                if frames.len() < 4 || frames[frames.len() - 2].len() != 8 {
+                if frames.len() != 4 || !frames[0].is_empty() || frames[2].len() != 8 {
                     break;
                 }
                 let seq = read_seq(&frames[frames.len() - 2]);
                 if seq == END_SEQ {
+                    // vLLM sends an empty topic and payload for this control frame.
+                    if !frames[1].is_empty() || !frames[3].is_empty() {
+                        return None;
+                    }
                     break;
+                }
+                if frames[1].as_slice() != topic.as_bytes() || seq < 0 {
+                    return None;
                 }
                 if seq <= high {
                     continue;
@@ -473,7 +534,9 @@ async fn replay(
                     );
                     return None;
                 }
-                apply_batch(indexer, source_id, dp_rank, incarnation, &batch, pd_dense);
+                if !apply_batch(indexer, source_id, dp_rank, incarnation, &batch, pd_dense) {
+                    return None;
+                }
                 high = seq;
                 emit(
                     &signals,
@@ -482,6 +545,7 @@ async fn replay(
                         last_seq: seq,
                     },
                 );
+                debug!(source = %source_id, rank = dp_rank, seq, "kv_index replay batch applied");
                 if high >= through_seq {
                     return Some(high);
                 }
@@ -572,7 +636,9 @@ mod tests {
                 );
                 event.lora_name = name.map(str::to_owned);
                 event.extra_keys = extra.clone();
-                event.session_id = Some("session-annotation".to_owned());
+                // Generic ingestion retains annotations; the dense consumer's
+                // unmodeled session namespace is covered by its rejection test.
+                event.session_id = (!dense_only).then(|| "session-annotation".to_owned());
                 apply_batch(
                     &index,
                     &SourceId::from("p"),
@@ -858,10 +924,17 @@ mod tests {
         events: &[KVEvent],
         rank: Option<u32>,
     ) {
-        let payload = rmp_serde::to_vec(&(ts, events, &rank)).unwrap();
+        // vLLM's EventBatch is array-like, but each tagged event is a map.
+        let payload = rmp_serde::to_vec_named(&(ts, events, &rank)).unwrap();
+        let decoded = crate::kv_index::decode_batch(&payload);
+        assert!(decoded.is_ok(), "invalid publisher fixture: {decoded:?}");
         let seq_bytes = seq.to_be_bytes();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "subscriber never advanced to seq {seq}"
+            );
             let frames: Vec<&[u8]> = vec![topic, seq_bytes.as_slice(), payload.as_slice()];
             pub_sock.send_multipart(frames, 0).unwrap();
             match tokio::time::timeout(Duration::from_millis(300), sig_rx.recv()).await {
@@ -1039,14 +1112,89 @@ mod tests {
         assert_eq!(hits(&f.indexer, &tokens).len(), 1);
     }
 
+    #[tokio::test]
+    async fn live_topic_prefix_does_not_publish_or_consume_the_sequence() {
+        let mut f = fixture(false);
+        publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 0, 0.0, &[], Some(0)).await;
+        let unrelated = [1, 2, 3, 4];
+        let expected = [5, 6, 7, 8];
+        let payload = batch_payload(&[store_event(100, &unrelated)], 0);
+        f.publisher
+            .send_multipart([b"kv-other".as_slice(), &1i64.to_be_bytes(), &payload], 0)
+            .unwrap();
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            1,
+            1.0,
+            &[store_event(101, &expected)],
+            Some(0),
+        )
+        .await;
+        assert!(hits(&f.indexer, &unrelated).is_empty());
+        assert_eq!(hits(&f.indexer, &expected).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn live_unknown_field_rejects_the_whole_batch_without_advance() {
+        let mut f = fixture(false);
+        publish_until_advanced(&f.publisher, &mut f.signals, b"kv", 0, 0.0, &[], Some(0)).await;
+        let tokens = [1, 2, 3, 4];
+        let mut event = serde_json::to_value(store_event(100, &tokens)).unwrap();
+        event["future_namespace"] = serde_json::json!("not-plain");
+        let payload = rmp_serde::to_vec(&(
+            1.0,
+            [
+                serde_json::to_value(store_event(101, &[5, 6, 7, 8])).unwrap(),
+                event,
+            ],
+            0u32,
+        ))
+        .unwrap();
+        f.publisher
+            .send_multipart([b"kv".as_slice(), &1i64.to_be_bytes(), &payload], 0)
+            .unwrap();
+        let signal = tokio::time::timeout(Duration::from_secs(5), f.signals.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            signal,
+            IngestionSignal::Gap {
+                from_seq: 1,
+                to_seq: 1,
+                ..
+            }
+        ));
+        assert!(hits(&f.indexer, &tokens).is_empty());
+        assert!(hits(&f.indexer, &[5, 6, 7, 8]).is_empty());
+        assert!(
+            f.signals.try_recv().is_err(),
+            "bad batch must not emit Advance"
+        );
+        publish_until_advanced(
+            &f.publisher,
+            &mut f.signals,
+            b"kv",
+            1,
+            1.0,
+            &[store_event(100, &tokens)],
+            Some(0),
+        )
+        .await;
+        assert_eq!(hits(&f.indexer, &tokens).len(), 1);
+    }
+
     fn batch_payload(events: &[KVEvent], rank: u32) -> Vec<u8> {
-        rmp_serde::to_vec(&(1.0, events, Some(rank))).unwrap()
+        rmp_serde::to_vec_named(&(1.0, events, Some(rank))).unwrap()
     }
 
     async fn serve_replay(
         socket: &zmq::Socket,
         replies: &[(i64, Vec<u8>)],
         index: &KvBlockIndexer,
+        topic: &[u8],
     ) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let request = loop {
@@ -1069,7 +1217,11 @@ mod tests {
                     [
                         request[0].clone(),
                         vec![],
-                        b"kv".to_vec(),
+                        if *seq == END_SEQ {
+                            vec![]
+                        } else {
+                            topic.to_vec()
+                        },
                         seq.to_be_bytes().to_vec(),
                         payload.clone(),
                     ],
@@ -1115,6 +1267,7 @@ mod tests {
             "corrupt" => vec![(1, first), (2, vec![0xc1]), eof],
             "early_eof" => vec![(1, first), eof],
             "wrong_rank" => vec![(1, first), (2, batch_payload(&[], 1)), eof],
+            "wrong_topic" => vec![(1, first), (2, eviction), (3, third)],
             _ => panic!("unknown replay case"),
         };
         let live_events = [store_event(400, &fresh)];
@@ -1128,7 +1281,16 @@ mod tests {
                 &live_events,
                 Some(0)
             ),
-            serve_replay(f.replay_server.as_ref().unwrap(), &replies, &f.indexer),
+            serve_replay(
+                f.replay_server.as_ref().unwrap(),
+                &replies,
+                &f.indexer,
+                if case == "wrong_topic" {
+                    b"kv-other"
+                } else {
+                    b"kv"
+                }
+            ),
         );
         assert!(
             hits(&f.indexer, &old).is_empty(),
@@ -1179,6 +1341,124 @@ mod tests {
     #[tokio::test]
     async fn replay_wrong_rank_clears_partial_stores() {
         check_replay_case("wrong_rank").await;
+    }
+
+    #[tokio::test]
+    async fn replay_wrong_topic_clears_partial_stores() {
+        check_replay_case("wrong_topic").await;
+    }
+
+    #[test]
+    fn dense_empty_adapter_name_does_not_alias_plain_tokens() {
+        let index = KvBlockIndexer::new();
+        let mut event = stored(
+            vec![ExternalBlockHash::Int(100)],
+            vec![1, 2, 3, 4],
+            Some("GPU"),
+            None,
+        );
+        event.lora_id = Some(7);
+        event.lora_name = Some(String::new());
+        assert!(!apply_batch(
+            &index,
+            &SourceId::from("p"),
+            0,
+            0,
+            &KVEventBatch {
+                ts: 1.0,
+                events: vec![KVEvent::BlockStored(event)],
+                data_parallel_rank: Some(0),
+            },
+            true
+        ));
+        assert!(hits(&index, &[1, 2, 3, 4]).is_empty());
+    }
+
+    #[test]
+    fn dense_unmodeled_metadata_never_becomes_device_credit() {
+        let mut unexpected = Vec::new();
+        for reason in [
+            "remote-worker",
+            "local-pool",
+            "session",
+            "extra-count",
+            "medium",
+        ] {
+            let index = KvBlockIndexer::new();
+            let mut event = stored(
+                vec![ExternalBlockHash::Int(100)],
+                vec![1, 2, 3, 4],
+                Some("GPU"),
+                None,
+            );
+            match reason {
+                "remote-worker" => event.locality = Some("REMOTE".into()),
+                "local-pool" => {
+                    event.ownership = Some("pool".into());
+                    event.locality = Some("LOCAL".into());
+                }
+                "session" => event.session_id = Some("unmodeled-session".into()),
+                "extra-count" => event.extra_keys = Some(vec![]),
+                "medium" => event.medium = Some("unmodeled-medium".into()),
+                _ => unreachable!(),
+            }
+            apply_batch(
+                &index,
+                &SourceId::from("p"),
+                0,
+                0,
+                &KVEventBatch {
+                    ts: 1.0,
+                    events: vec![KVEvent::BlockStored(event)],
+                    data_parallel_rank: Some(0),
+                },
+                true,
+            );
+            let all = index.find_matches(&MatchQuery {
+                group_idx: 0,
+                local_hashes: local_hashes(&[1, 2, 3, 4], 4, None)
+                    .iter()
+                    .map(|hash| Arc::from(hex(hash)))
+                    .collect(),
+                tiers_of_interest: vec![StorageTier::Device, StorageTier::External],
+            });
+            if !all.is_empty() {
+                unexpected.push(reason);
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "unmodeled metadata received credit: {unexpected:?}"
+        );
+    }
+
+    #[test]
+    fn dense_rejected_batch_does_not_publish_its_valid_prefix() {
+        let index = KvBlockIndexer::new();
+        let mut unsupported = stored(
+            vec![ExternalBlockHash::Int(101)],
+            vec![5, 6, 7, 8],
+            Some("GPU"),
+            None,
+        );
+        unsupported.extra_keys = Some(vec![rmpv::Value::from("unmodeled-namespace")]);
+        apply_batch(
+            &index,
+            &SourceId::from("p"),
+            0,
+            0,
+            &KVEventBatch {
+                ts: 1.0,
+                events: vec![
+                    store_event(100, &[1, 2, 3, 4]),
+                    KVEvent::BlockStored(unsupported),
+                ],
+                data_parallel_rank: Some(0),
+            },
+            true,
+        );
+        assert!(hits(&index, &[1, 2, 3, 4]).is_empty());
+        assert!(hits(&index, &[5, 6, 7, 8]).is_empty());
     }
 
     #[test]

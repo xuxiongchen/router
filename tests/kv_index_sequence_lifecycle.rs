@@ -419,6 +419,37 @@ fn no_parent_starts_at_root() {
 }
 
 #[test]
+fn unknown_parent_suffix_cannot_leave_a_cross_source_claim_after_clear() {
+    let index = KvBlockIndexer::new();
+    let a = worker("a", 3);
+    let b = worker("b", 3);
+    // Source A attaches mid-cache; Y is not a standalone request prefix.
+    index.store(
+        0,
+        a.clone(),
+        StorageTier::Device,
+        Some(Arc::from("i:100")),
+        &blocks(&[("i:101", "y")]),
+    );
+    assert_eq!(depth(&index, 0, &a, StorageTier::Device, &["y"]), 0);
+    // A different source subsequently announces the complete X -> Y chain,
+    // using the same engine hashes as the incomplete observation.
+    index.store(
+        0,
+        b.clone(),
+        StorageTier::Device,
+        None,
+        &blocks(&[("i:100", "x"), ("i:101", "y")]),
+    );
+    assert_eq!(depth(&index, 0, &b, StorageTier::Device, &["x", "y"]), 2);
+    index.clear(&a, ClearScope::Worker);
+    assert_eq!(depth(&index, 0, &a, StorageTier::Device, &["y"]), 0);
+    assert_eq!(depth(&index, 0, &a, StorageTier::Device, &["x", "y"]), 0);
+    assert_eq!(depth(&index, 0, &b, StorageTier::Device, &["y"]), 0);
+    assert_eq!(depth(&index, 0, &b, StorageTier::Device, &["x", "y"]), 2);
+}
+
+#[test]
 fn unknown_initial_parent_is_not_credited_until_ancestry_is_known() {
     let index = KvBlockIndexer::new();
     let owner = worker("a", 3);
