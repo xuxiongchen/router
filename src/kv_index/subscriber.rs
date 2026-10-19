@@ -59,7 +59,8 @@ pub fn spawn(
     spawn_inner(source, indexer, signal_tx, ctx, false)
 }
 
-pub(crate) fn spawn_pd(
+/// Dense HTTP inputs can only query identities represented by local token hashes.
+pub(crate) fn spawn_dense(
     source: EventSource,
     indexer: Arc<KvBlockIndexer>,
     signal_tx: Option<mpsc::Sender<IngestionSignal>>,
@@ -73,7 +74,7 @@ fn spawn_inner(
     indexer: Arc<KvBlockIndexer>,
     signal_tx: Option<mpsc::Sender<IngestionSignal>>,
     ctx: Arc<zmq::Context>,
-    pd_dense: bool,
+    dense: bool,
 ) -> SubscriberHandle {
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
     let pub_endpoint = source.pub_endpoint.clone();
@@ -194,7 +195,7 @@ fn spawn_inner(
                                 dp_rank,
                                 incarnation,
                                 signals.clone(),
-                                pd_dense,
+                                dense,
                                 &topic,
                             )
                             .await
@@ -220,14 +221,7 @@ fn spawn_inner(
                     if let Some(batch) = batch {
                         // After unrecoverable loss, credit only fresh observations
                         // on the now-clean source; absence is a conservative miss.
-                        if !apply_batch(
-                            &indexer,
-                            &source_id,
-                            dp_rank,
-                            incarnation,
-                            &batch,
-                            pd_dense,
-                        ) {
+                        if !apply_batch(&indexer, &source_id, dp_rank, incarnation, &batch, dense) {
                             indexer.invalidate_source(&source_id, dp_rank);
                             suspended = true;
                             tokio::task::yield_now().await;
@@ -354,14 +348,16 @@ fn apply_batch(
     dp_rank: u32,
     incarnation: u64,
     batch: &KVEventBatch,
-    pd_dense: bool,
+    dense: bool,
 ) -> bool {
     // Batch rank if the 3-element array carries it; else the discovery rank.
     let rank = batch.data_parallel_rank.unwrap_or(dp_rank);
     // Reject before publishing any prefix or eviction from an unmodeled batch.
-    if pd_dense
+    if dense
         && batch.events.iter().any(|event| match event {
             KVEvent::BlockStored(s) => {
+                // Keep unmodeled salt/MM/layout identities out of this token-only
+                // query space. Named LoRA is already isolated by the hash seed.
                 s.extra_keys.as_ref().is_some_and(|keys| {
                     keys.len() != s.block_hashes.len()
                         || keys.iter().any(|key| {
@@ -464,7 +460,7 @@ async fn replay(
     dp_rank: u32,
     incarnation: u64,
     signals: Option<mpsc::Sender<IngestionSignal>>,
-    pd_dense: bool,
+    dense: bool,
     topic: &str,
 ) -> Option<i64> {
     let dealer = match ctx.socket(zmq::DEALER) {
@@ -534,7 +530,7 @@ async fn replay(
                     );
                     return None;
                 }
-                if !apply_batch(indexer, source_id, dp_rank, incarnation, &batch, pd_dense) {
+                if !apply_batch(indexer, source_id, dp_rank, incarnation, &batch, dense) {
                     return None;
                 }
                 high = seq;
@@ -721,6 +717,89 @@ mod tests {
         assert_eq!(wkr_res[0].locality, Locality::Local);
         assert_eq!(&*wkr_res[0].target.instance_id, "w0");
         assert_eq!(wkr_res[0].target.dp_rank, 1);
+    }
+
+    #[test]
+    fn dense_batch_rejects_unmodeled_residency_and_namespace_atomically() {
+        let source = SourceId::from("dense");
+        let valid = stored(
+            vec![ExternalBlockHash::Int(1)],
+            vec![1, 2, 3, 4],
+            Some("GPU"),
+            None,
+        );
+        for case in [
+            "remote",
+            "local-pool",
+            "unknown-medium",
+            "session",
+            "extra-count",
+            "salt",
+            "layout",
+            "empty-lora",
+        ] {
+            let index = KvBlockIndexer::new();
+            let mut invalid = valid.clone();
+            match case {
+                "remote" => invalid.locality = Some("REMOTE".into()),
+                "local-pool" => {
+                    invalid.locality = Some("LOCAL".into());
+                    invalid.ownership = Some("pool".into());
+                }
+                "unknown-medium" => invalid.medium = Some("unknown".into()),
+                "session" => invalid.session_id = Some("session".into()),
+                "extra-count" => invalid.extra_keys = Some(vec![]),
+                "salt" => {
+                    invalid.extra_keys =
+                        Some(vec![rmpv::Value::Array(vec![rmpv::Value::from("tenant")])])
+                }
+                "layout" => invalid.kv_cache_spec_kind = Some("sliding_window".into()),
+                "empty-lora" => {
+                    invalid.lora_id = Some(1);
+                    invalid.lora_name = Some(String::new());
+                }
+                _ => unreachable!(),
+            }
+            let batch = KVEventBatch {
+                ts: 0.0,
+                events: vec![
+                    KVEvent::BlockStored(valid.clone()),
+                    KVEvent::BlockStored(invalid),
+                ],
+                data_parallel_rank: Some(0),
+            };
+            assert!(!apply_batch(&index, &source, 0, 0, &batch, true), "{case}");
+            assert!(
+                hits(&index, &[1, 2, 3, 4]).is_empty(),
+                "valid prefix of rejected batch leaked: {case}"
+            );
+            // The default generic subscriber keeps its wider structural domain.
+            assert!(apply_batch(&index, &source, 0, 0, &batch, false), "{case}");
+        }
+        for (medium, ownership, locality, tier) in [
+            ("GPU", None, "LOCAL", StorageTier::Device),
+            ("CPU", None, "LOCAL", StorageTier::HostPinned),
+            ("GPU", Some("pool"), "REMOTE", StorageTier::External),
+        ] {
+            let index = KvBlockIndexer::new();
+            let mut event = valid.clone();
+            event.medium = Some(medium.into());
+            event.ownership = ownership.map(str::to_owned);
+            event.locality = Some(locality.into());
+            let batch = KVEventBatch {
+                ts: 0.0,
+                events: vec![KVEvent::BlockStored(event)],
+                data_parallel_rank: Some(0),
+            };
+            assert!(apply_batch(&index, &source, 0, 0, &batch, true));
+            let matches = index.find_matches(&MatchQuery {
+                group_idx: 0,
+                local_hashes: crate::kv_index::local_block_hash_strings(&[1, 2, 3, 4], 4, None),
+                tiers_of_interest: vec![tier],
+            });
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].tier, tier);
+        }
     }
 
     #[test]

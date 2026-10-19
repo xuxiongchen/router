@@ -56,6 +56,17 @@ pub struct KvEventSourceEntry {
 /// /kv_event_sources body: a JSON object keyed by DP rank (as string).
 pub type KvEventSourcesResponse = HashMap<String, KvEventSourceEntry>;
 
+/// Operator-supplied immutable source facts, matching the static P/D shape.
+/// This is a deployment contract, not remote identity attestation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StaticKvEventSources {
+    pub endpoints: Vec<String>,
+    pub replay_endpoints: Option<Vec<String>>,
+    pub block_size: u32,
+    pub model: String,
+}
+
 /// What on_worker_added learned and spawned.
 #[derive(Debug, Clone, Default)]
 pub struct WorkerKvInfo {
@@ -91,9 +102,11 @@ pub struct KvIndexSupervisor {
     client: reqwest::Client,
     hash_mode: HashMode,
     http_pd: bool,
+    dense_http: bool,
     /// Static KV event sources per prefill URL; these workers skip HTTP
     /// discovery entirely.
     static_pd_sources: HashMap<String, crate::config::types::PdKvEventSources>,
+    static_sources: HashMap<String, StaticKvEventSources>,
     /// Shared across every subscriber — one I/O thread pool, not one per task.
     ctx: Arc<zmq::Context>,
     /// One indexer per cache-identity core.
@@ -131,6 +144,8 @@ impl KvIndexSupervisor {
             hash_mode,
             http_pd: false,
             static_pd_sources: HashMap::new(),
+            dense_http: false,
+            static_sources: HashMap::new(),
             ctx: Arc::new(zmq::Context::new()),
             indexers: DashMap::new(),
             identity_refs: Mutex::new(HashMap::new()),
@@ -150,8 +165,61 @@ impl KvIndexSupervisor {
     ) -> (Self, mpsc::Receiver<IngestionSignal>) {
         let (mut supervisor, signals) = Self::new(client, hash_mode);
         supervisor.http_pd = true;
+        supervisor.dense_http = true;
         supervisor.static_pd_sources = static_pd_sources;
         (supervisor, signals)
+    }
+
+    pub(crate) fn new_http_dense(
+        client: reqwest::Client,
+        hash_mode: HashMode,
+        worker_urls: &[String],
+    ) -> Result<(Self, mpsc::Receiver<IngestionSignal>), String> {
+        let (mut supervisor, signals) = Self::new(client, hash_mode);
+        supervisor.dense_http = true;
+        if let Ok(value) = std::env::var("VLLM_ROUTER_KV_EVENT_SOURCES") {
+            supervisor.static_sources = serde_json::from_str(&value)
+                .map_err(|error| format!("static KV sources: {error}"))?;
+            let mut endpoints = std::collections::HashSet::new();
+            for (worker, source) in &mut supervisor.static_sources {
+                if !worker_urls.contains(worker)
+                    || source.endpoints.len() != 1
+                    || source
+                        .replay_endpoints
+                        .as_ref()
+                        .is_some_and(|endpoints| endpoints.len() != 1)
+                    || source.block_size == 0
+                    || source.model.trim().is_empty()
+                {
+                    return Err(format!("invalid static DP1 KV source for {worker}"));
+                }
+                source.endpoints[0] = crate::kv_index::parse_endpoint_mapping(&format!(
+                    "{worker}={}",
+                    source.endpoints[0]
+                ))?
+                .1;
+                if !endpoints.insert(source.endpoints[0].clone()) {
+                    return Err("static KV publishers must be independent".into());
+                }
+                if let Some(replay) = &mut source.replay_endpoints {
+                    replay[0] = crate::kv_index::parse_endpoint_mapping(&format!(
+                        "{worker}={}",
+                        replay[0]
+                    ))?
+                    .1;
+                }
+            }
+        }
+        Ok((supervisor, signals))
+    }
+
+    pub(crate) fn worker_has_dense_model(&self, worker_url: &str, model: &str) -> bool {
+        self.dense_http
+            && self
+                .workers
+                .lock()
+                .get(worker_url)
+                .is_some_and(|worker| worker.key.model.as_ref() == model && worker.ranks == [0])
     }
 
     pub fn hash_mode(&self) -> HashMode {
@@ -172,9 +240,12 @@ impl KvIndexSupervisor {
             self.on_worker_removed(worker_url);
         }
 
-        let discovery = match self.static_pd_sources.get(worker_url) {
-            Some(config) => static_pd_discovery(worker_url, config),
-            None => discover_worker(&self.client, worker_url, self.http_pd).await,
+        let discovery = if let Some(source) = self.static_sources.get(worker_url) {
+            static_discovery(worker_url, source)
+        } else if let Some(config) = self.static_pd_sources.get(worker_url) {
+            static_pd_discovery(worker_url, config)
+        } else {
+            discover_worker(&self.client, worker_url, self.http_pd).await
         };
         let server_info = discovery.server_info.unwrap_or_else(|e| {
             warn!(
@@ -301,8 +372,8 @@ impl KvIndexSupervisor {
                 topic: entry.topic.clone(),
                 hwm: entry.hwm,
             };
-            let spawn = if self.http_pd {
-                crate::kv_index::subscriber::spawn_pd
+            let spawn = if self.dense_http {
+                crate::kv_index::subscriber::spawn_dense
             } else {
                 spawn_subscriber
             };
@@ -427,6 +498,42 @@ impl KvIndexSupervisor {
             }
             _ => {}
         }
+    }
+}
+
+fn static_discovery(worker_url: &str, config: &StaticKvEventSources) -> WorkerDiscovery {
+    let server_info = ServerInfo {
+        model_id: Some(config.model.clone()),
+        instance_id: Some(worker_url.to_string()),
+        kv_block_size: Some(config.block_size),
+        ..Default::default()
+    };
+    let sources = config
+        .endpoints
+        .iter()
+        .enumerate()
+        .map(|(rank, endpoint)| {
+            (
+                rank.to_string(),
+                KvEventSourceEntry {
+                    endpoint: endpoint.clone(),
+                    replay_endpoint: config
+                        .replay_endpoints
+                        .as_ref()
+                        .and_then(|replay| replay.get(rank).cloned()),
+                    publisher: Some("zmq".to_owned()),
+                    encoding: Some("msgpack".to_owned()),
+                    schema_version: Some(1),
+                    enable_kv_cache_events: Some(true),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    WorkerDiscovery {
+        server_info: Ok(server_info),
+        sources: Ok(sources),
+        model_id: Ok(Some(config.model.clone())),
     }
 }
 

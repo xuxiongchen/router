@@ -242,7 +242,7 @@ vllm-router --policy cache_aware \
 
 ## KV Aware
 
-The `kv_aware` policy combines reusable KV placement with live load. Colocated routing uses a multiplicative cost; P/D routing uses separate prefill and decode costs. Unverified placement receives no KV credit.
+The `kv_aware` policy combines reusable KV placement with live load. Colocated routing uses a multiplicative cost; P/D routing uses separate prefill and decode costs. Unverified placement receives no KV credit. In regular routing, gRPC Chat supplies prepared tokens by default; static HTTP Completion has an [opt-in input contract](http_completion_kv.md). Other regular HTTP requests use load-only scoring.
 
 ```bash
 vllm-router --policy kv_aware \
