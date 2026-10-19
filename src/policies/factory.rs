@@ -40,6 +40,7 @@ impl PolicyFactory {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                ..
             } => Arc::new(KvAwarePolicy::new(CostParams {
                 router_temperature: *router_temperature,
                 transfer_credits: TransferCredits {
@@ -110,6 +111,7 @@ mod tests {
             kv_penalty_host: 0.8,
             kv_penalty_external: 0.6,
             kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
         });
         assert_eq!(policy.name(), "kv_aware");
 

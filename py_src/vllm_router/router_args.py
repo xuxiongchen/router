@@ -29,6 +29,10 @@ class RouterArgs:
     kv_penalty_host: float = 0.8
     kv_penalty_external: float = 0.6
     kv_penalty_disk: float = 0.3
+    kv_event_source: List[str] = dataclasses.field(default_factory=list)
+    kv_event_replay_source: List[str] = dataclasses.field(default_factory=list)
+    kv_event_block_size: int = 16
+    kv_event_model: Optional[str] = None
     worker_startup_timeout_secs: int = 600
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
@@ -221,6 +225,32 @@ class RouterArgs:
             type=float,
             default=RouterArgs.kv_penalty_disk,
             help="Disk-tier KV transfer credit for kv_aware (0.0-1.0)",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-event-source",
+            action="append",
+            default=[],
+            metavar="WORKER_URL=ENDPOINT[,ENDPOINT...]",
+            help="Static ZMQ KV event source for a kv_aware worker; repeat per worker",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-event-replay-source",
+            action="append",
+            default=[],
+            metavar="WORKER_URL=ENDPOINT[,ENDPOINT...]",
+            help="Optional ZMQ replay endpoint(s) matching a worker's static event source",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-event-block-size",
+            type=int,
+            default=RouterArgs.kv_event_block_size,
+            help="KV block size for static event sources",
+        )
+        parser.add_argument(
+            f"--{prefix}kv-event-model",
+            type=str,
+            default=None,
+            help="Shared model identity for workers with static event sources",
         )
 
         # PD-specific arguments

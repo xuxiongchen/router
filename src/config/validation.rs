@@ -7,6 +7,15 @@ pub struct ConfigValidator;
 impl ConfigValidator {
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(ttl_secs) = config.kv_aware_session_affinity_ttl_secs {
+            if !(1..=31_536_000).contains(&ttl_secs) {
+                return Err(ConfigError::InvalidValue {
+                    field: "kv_aware_session_affinity_ttl_secs".to_string(),
+                    value: ttl_secs.to_string(),
+                    reason: "Must be between 1 and 31536000 seconds".to_string(),
+                });
+            }
+        }
         // Check if service discovery is enabled (either via discovery config or vLLM mode)
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled)
             || matches!(
@@ -394,6 +403,7 @@ impl ConfigValidator {
                 kv_penalty_host,
                 kv_penalty_external,
                 kv_penalty_disk,
+                static_kv_event_sources,
             } => {
                 if !router_temperature.is_finite() || *router_temperature < 0.0 {
                     return Err(ConfigError::InvalidValue {
@@ -413,6 +423,53 @@ impl ConfigValidator {
                             value: value.to_string(),
                             reason: "Must be finite and between 0.0 and 1.0".to_string(),
                         });
+                    }
+                }
+                for (worker, source) in static_kv_event_sources.iter() {
+                    if worker.trim().is_empty() || source.model.trim().is_empty() {
+                        return Err(ConfigError::ValidationFailed {
+                            reason:
+                                "static KV event sources require worker URLs and model identity"
+                                    .to_string(),
+                        });
+                    }
+                    if source.block_size == 0 || source.endpoints.is_empty() {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!(
+                                "static KV event source for '{worker}' needs a nonzero block size and at least one endpoint"
+                            ),
+                        });
+                    }
+                    if source
+                        .replay_endpoints
+                        .as_ref()
+                        .is_some_and(|replay| replay.len() != source.endpoints.len())
+                    {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!(
+                                "static KV replay endpoint count for '{worker}' must match its event endpoint count"
+                            ),
+                        });
+                    }
+                    for endpoint in source
+                        .endpoints
+                        .iter()
+                        .chain(source.replay_endpoints.iter().flatten())
+                    {
+                        let valid = url::Url::parse(endpoint).is_ok_and(|parsed| {
+                            parsed.scheme() == "tcp"
+                                && parsed.host_str().is_some_and(|host| {
+                                    host != "*" && host != "0.0.0.0" && host != "::"
+                                })
+                                && parsed.port().is_some_and(|port| port != 0)
+                        });
+                        if !valid {
+                            return Err(ConfigError::ValidationFailed {
+                                reason: format!(
+                                    "static KV event endpoint must be reachable tcp://HOST:PORT: '{endpoint}'"
+                                ),
+                            });
+                        }
                     }
                 }
             }
@@ -667,6 +724,36 @@ impl ConfigValidator {
             }
         }
 
+        if let PolicyConfig::KvAware {
+            static_kv_event_sources,
+            ..
+        } = &config.policy
+        {
+            if !static_kv_event_sources.is_empty() {
+                let RoutingMode::Regular { worker_urls } = &config.mode else {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "static --kv-event-source is only supported in regular mode"
+                            .to_string(),
+                    });
+                };
+                if !config
+                    .discovery
+                    .as_ref()
+                    .is_some_and(|discovery| discovery.enabled)
+                {
+                    for worker in static_kv_event_sources.keys() {
+                        if !worker_urls.contains(worker) {
+                            return Err(ConfigError::ValidationFailed {
+                                reason: format!(
+                                    "static KV event source worker '{worker}' is not in --worker-urls"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         // Check if service discovery is enabled for worker count validation.
         // This covers both K8s service discovery (config.discovery) and vLLM ZMQ
         // service discovery (VllmPrefillDecode { discovery_address: Some(_) }).
@@ -810,6 +897,25 @@ impl ConfigValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_affinity_ttl_is_optional_and_bounded() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        config.kv_aware_session_affinity_ttl_secs = Some(300);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for ttl in [0, 31_536_001] {
+            config.kv_aware_session_affinity_ttl_secs = Some(ttl);
+            assert!(ConfigValidator::validate(&config).is_err());
+        }
+    }
 
     #[test]
     fn test_validate_program_scheduling_boundaries() {
@@ -1194,6 +1300,7 @@ mod tests {
                 kv_penalty_host: 0.8,
                 kv_penalty_external: 0.6,
                 kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
             },
         );
 
