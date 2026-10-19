@@ -389,7 +389,7 @@ struct Binding {
 /// A successful refresh probe: `(signature, base_models)`.
 type Discovery = (String, HashSet<String>);
 
-/// The most recent P pool and effective policy seen on the request path.
+/// The startup P pool and effective policy, updated by valid requests.
 /// The background refresh loop binds from it; recording it is a few Arc
 /// clones, so requests never wait for control-plane probes.
 #[derive(Clone, Default)]
@@ -491,8 +491,19 @@ impl PdKvState {
         }
     }
 
-    /// Reconcile bindings off the request path. Requests only record their
-    /// pool and policy; they never wait for control-plane probes, so one
+    async fn record_refresh_inputs(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        policy: &Arc<dyn LoadBalancingPolicy>,
+    ) {
+        *self.refresh_inputs.lock().await = RefreshInputs {
+            workers: workers.iter().cloned().collect(),
+            policy: Some(policy.clone()),
+        };
+    }
+
+    /// Reconcile bindings off the request path. Startup and requests record
+    /// their pool and policy without waiting for control-plane probes, so one
     /// hung P endpoint can no longer delay admission. Until the first
     /// successful bind, requests see no binding and route with no KV credit.
     pub(super) fn spawn_refresh(self: &Arc<Self>) {
@@ -744,10 +755,7 @@ impl PdKvState {
         if input.is_ok() {
             // Record the pool for the background refresh loop; the request
             // path never waits for control-plane probes.
-            *self.refresh_inputs.lock().await = RefreshInputs {
-                workers: workers.iter().cloned().collect(),
-                policy: Some(policy.clone()),
-            };
+            self.record_refresh_inputs(workers, policy).await;
         }
         let bases: HashSet<_> = workers
             .iter()
@@ -1615,15 +1623,22 @@ impl PdRouterBase {
         // Note: Health checking is now handled centrally by RouterManager
         // Individual routers no longer need to manage health checkers
 
+        let kv_state = if kv_aware_ops(prefill_policy.as_ref()).is_some() {
+            let state = Arc::new(PdKvState::new_with_statics(
+                ctx.client.clone(),
+                ctx.router_config.pd_kv_event_sources.clone(),
+            ));
+            state
+                .record_refresh_inputs(&ctx.worker_registry.get_prefill_workers(), &prefill_policy)
+                .await;
+            state.spawn_refresh();
+            Some(state)
+        } else {
+            None
+        };
+
         Ok(PdRouterBase {
-            kv_state: kv_aware_ops(prefill_policy.as_ref()).is_some().then(|| {
-                let state = Arc::new(PdKvState::new_with_statics(
-                    ctx.client.clone(),
-                    ctx.router_config.pd_kv_event_sources.clone(),
-                ));
-                state.spawn_refresh();
-                state
-            }),
+            kv_state,
             pd_load: Arc::new(PdLoadManager::default()),
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -3975,6 +3990,200 @@ mod kv_input_tests {
         assert!(warm[&base].work_by_rank[&None].placement_verified);
         drop(state);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn per_prefill_tokenization_keeps_distinct_inputs_and_prefix_credit() {
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        let context = zmq::Context::new();
+        let mut publishers = Vec::new();
+        let mut tasks = Vec::new();
+        let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+        let mut sources = HashMap::new();
+        let inputs: Vec<Vec<u32>> = vec![(0..33).collect(), (100..133).collect()];
+        for tokens in &inputs {
+            let publisher = context.socket(zmq::PUB).unwrap();
+            publisher.bind("tcp://127.0.0.1:*").unwrap();
+            let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+            let tokens = tokens.clone();
+            let app = Router::new()
+                .route(
+                    "/v1/models",
+                    get(|| async { Json(json!({"data":[{"id":"m","parent":null}]})) }),
+                )
+                .route(
+                    "/tokenize",
+                    post(move |Json(body): Json<Value>| {
+                        let tokens = tokens.clone();
+                        async move {
+                            assert_eq!(body["prompt"], "same text");
+                            Json(
+                                json!({"count":tokens.len(), "tokens":tokens, "max_model_len":128}),
+                            )
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            tasks.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+            sources.insert(
+                base.clone(),
+                crate::config::types::PdKvEventSources {
+                    endpoints: vec![endpoint],
+                    replay_endpoints: None,
+                    block_size: 16,
+                    model: Some("m".into()),
+                },
+            );
+            workers.push(Arc::new(BasicWorker::new(base, WorkerType::Regular)));
+            publishers.push(publisher);
+        }
+        let state = PdKvState::new_with_statics(Client::new(), sources);
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
+        let ops = kv_aware_ops(policy.as_ref()).unwrap();
+        state.bind(&workers, ops).await;
+        let request = json!({"model":"m", "prompt":"same text"});
+        let cold = state
+            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .await;
+        for (worker, tokens) in workers.iter().zip(&inputs) {
+            assert_eq!(
+                cold[worker.base_url()].token_ids.as_deref(),
+                Some(tokens.as_slice())
+            );
+            assert_eq!(
+                cold[worker.base_url()].work_by_rank[&None].new_prefill_tokens,
+                33
+            );
+        }
+        let payload = rmp_serde::to_vec(&(
+            1.0,
+            vec![json!({
+                "type":"BlockStored", "block_hashes":[1,2], "parent_block_hash":null,
+                "token_ids":&inputs[1][..32], "block_size":16,
+                "lora_id":null, "lora_name":null, "medium":"GPU"
+            })],
+            0u32,
+        ))
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                publishers[1]
+                    .send_multipart([b"".as_slice(), &0u64.to_be_bytes(), &payload], 0)
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if ops
+                    .estimate_prefill_work(workers[1].as_ref(), &inputs[1], true)
+                    .new_prefill_tokens
+                    == 1
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("second P's direct event must be consumed");
+        let warm = state
+            .prepare(&workers, &policy, &request, "/v1/completions", None)
+            .await;
+        assert_eq!(
+            warm[workers[0].base_url()].work_by_rank[&None].new_prefill_tokens,
+            33
+        );
+        assert_eq!(
+            warm[workers[1].base_url()].work_by_rank[&None].new_prefill_tokens,
+            1
+        );
+        assert!(warm[workers[1].base_url()].work_by_rank[&None].placement_verified);
+        drop(state);
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_subscribes_static_prefill_before_any_request() {
+        use crate::config::{KvConnector, RouterConfig, RoutingMode};
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let zmq = zmq::Context::new();
+        let publisher = zmq.socket(zmq::XPUB).unwrap();
+        publisher.bind("tcp://127.0.0.1:*").unwrap();
+        let tokenize_calls = Arc::new(AtomicUsize::new(0));
+        let calls = tokenize_calls.clone();
+        let app = Router::new()
+            .route("/p/health", get(|| async { "ok" }))
+            .route("/d/health", get(|| async { "ok" }))
+            .route(
+                "/p/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"m"}]})) }),
+            )
+            .route(
+                "/p/tokenize",
+                post(move || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    async { Json(json!({"tokens":[1,2,3]})) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let prefill = format!("{base}/p");
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(prefill.clone(), None)],
+                decode_urls: vec![format!("{base}/d")],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: serde_json::from_value(json!({"type":"kv_aware"})).unwrap(),
+            kv_connector: KvConnector::Nixl,
+            pd_kv_event_sources: HashMap::from([(
+                prefill,
+                crate::config::types::PdKvEventSources {
+                    endpoints: vec![publisher.get_last_endpoint().unwrap().unwrap()],
+                    replay_endpoints: None,
+                    block_size: 16,
+                    model: Some("m".into()),
+                },
+            )]),
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        let context = Arc::new(
+            crate::server::AppContext::new(config, Client::new(), 64, None, vec![]).unwrap(),
+        );
+        let router = crate::routers::RouterFactory::create_router(&context)
+            .await
+            .unwrap();
+        let subscribed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match publisher.recv_bytes(zmq::DONTWAIT) {
+                    Ok(frame) => break frame,
+                    Err(zmq::Error::EAGAIN) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("XPUB receive failed: {error}"),
+                }
+            }
+        })
+        .await;
+        drop(router);
+        drop(context);
+        server.abort();
+        assert_eq!(tokenize_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            subscribed.expect("static P must subscribe before the first request"),
+            [1]
+        );
     }
 
     fn healthy_binding(signature: &str, probe_failures: u8) -> Binding {
