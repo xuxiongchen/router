@@ -11,6 +11,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         return None
     policy_map = {
         "random": PolicyType.Random,
+        "least_load": PolicyType.LeastLoad,
         "round_robin": PolicyType.RoundRobin,
         "cache_aware": PolicyType.CacheAware,
         "kv_aware": PolicyType.KvAware,

@@ -9,7 +9,8 @@ use crate::config::KvConnector;
 use crate::core::{BasicWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
-use crate::policies::PolicyRegistry;
+use crate::policies::{LoadBalancingPolicy, PolicyRegistry};
+use crate::protocols::spec::GenerationRequest;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
 use async_trait::async_trait;
 use axum::{
@@ -69,6 +70,39 @@ pub struct VllmPDRouter {
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
 /// Must match `MoRIIOConstants.TRANSFER_PREFIX` in the vLLM Python connector.
 const MORIIO_TRANSFER_PREFIX: &str = "tx";
+
+/// Prepare each routing representation once, only if a P/D policy consumes it.
+struct PolicyRequestText {
+    legacy: Option<String>,
+    cache: Option<String>,
+}
+
+impl PolicyRequestText {
+    fn new(
+        prefill: &dyn LoadBalancingPolicy,
+        decode: &dyn LoadBalancingPolicy,
+        legacy_text: impl FnOnce() -> Option<String>,
+        cache_key: impl FnOnce() -> String,
+    ) -> Self {
+        let policies = [prefill, decode];
+        let needs_cache = policies.iter().any(|policy| policy.name() == "cache_aware");
+        let needs_legacy = policies
+            .iter()
+            .any(|policy| policy.name() != "cache_aware" && policy.needs_request_text());
+        Self {
+            legacy: needs_legacy.then(legacy_text).flatten(),
+            cache: needs_cache.then(cache_key),
+        }
+    }
+
+    fn for_policy(&self, policy: &dyn LoadBalancingPolicy) -> Option<&str> {
+        if policy.name() == "cache_aware" {
+            self.cache.as_deref()
+        } else {
+            self.legacy.as_deref()
+        }
+    }
+}
 
 /// Discovery-backed P/D routing is ready only after both worker types register.
 /// Without this guard, `PdRouterBase::health` sees the unused static registry and
@@ -629,7 +663,7 @@ impl VllmPDRouter {
         &self,
         instances: &[(String, String)],
         is_prefill: bool,
-        request_text: Option<&str>,
+        request_text: &PolicyRequestText,
     ) -> Option<usize> {
         if instances.is_empty() {
             return None;
@@ -646,7 +680,7 @@ impl VllmPDRouter {
         };
 
         // Use policy to select worker
-        policy.select_worker(&workers, request_text)
+        policy.select_worker(&workers, request_text.for_policy(policy.as_ref()))
     }
 
     /// Process vLLM request using pure service discovery
@@ -686,11 +720,17 @@ impl VllmPDRouter {
         }
 
         // Use policy-based load balancing to select prefill and decode workers
-        let request_text = serde_json::to_string(&request_json).ok();
-        let request_str = request_text.as_deref();
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+        let request_text = PolicyRequestText::new(
+            prefill_policy.as_ref(),
+            decode_policy.as_ref(),
+            || serde_json::to_string(&request_json).ok(),
+            || crate::protocols::spec::cache_routing::for_route(&request_json, path),
+        );
 
         let prefill_idx =
-            match self.select_worker_with_policy(&prefill_instances, true, request_str) {
+            match self.select_worker_with_policy(&prefill_instances, true, &request_text) {
                 Some(idx) => idx,
                 None => {
                     RouterMetrics::record_pd_error("server_selection");
@@ -702,18 +742,18 @@ impl VllmPDRouter {
                 }
             };
 
-        let decode_idx = match self.select_worker_with_policy(&decode_instances, false, request_str)
-        {
-            Some(idx) => idx,
-            None => {
-                RouterMetrics::record_pd_error("server_selection");
-                return (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "Decode policy failed to select a worker".to_string(),
-                )
-                    .into_response();
-            }
-        };
+        let decode_idx =
+            match self.select_worker_with_policy(&decode_instances, false, &request_text) {
+                Some(idx) => idx,
+                None => {
+                    RouterMetrics::record_pd_error("server_selection");
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "Decode policy failed to select a worker".to_string(),
+                    )
+                        .into_response();
+                }
+            };
 
         let (prefill_http, prefill_zmq) = &prefill_instances[prefill_idx];
         let (decode_http, decode_zmq) = &decode_instances[decode_idx];
@@ -2340,8 +2380,14 @@ impl RouterTrait for VllmPDRouter {
             }
 
             // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
+            let prefill_policy = self.policy_registry.get_prefill_policy();
+            let decode_policy = self.policy_registry.get_decode_policy();
+            let request_text = PolicyRequestText::new(
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+                || serde_json::to_string(&request_json).ok(),
+                || body.extract_cache_routing_key(),
+            );
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
                     .filter_map(|(name, value)| {
@@ -2353,12 +2399,9 @@ impl RouterTrait for VllmPDRouter {
                     .collect()
             });
 
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
             let prefill_idx = match prefill_policy.select_worker_with_headers(
                 &prefill_workers,
-                request_str,
+                request_text.for_policy(prefill_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2374,7 +2417,7 @@ impl RouterTrait for VllmPDRouter {
 
             let decode_idx = match decode_policy.select_worker_with_headers(
                 &decode_workers,
-                request_str,
+                request_text.for_policy(decode_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2511,8 +2554,14 @@ impl RouterTrait for VllmPDRouter {
             }
 
             // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
+            let prefill_policy = self.policy_registry.get_prefill_policy();
+            let decode_policy = self.policy_registry.get_decode_policy();
+            let request_text = PolicyRequestText::new(
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+                || serde_json::to_string(&request_json).ok(),
+                || body.extract_cache_routing_key(),
+            );
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
                     .filter_map(|(name, value)| {
@@ -2524,12 +2573,9 @@ impl RouterTrait for VllmPDRouter {
                     .collect()
             });
 
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
             let prefill_idx = match prefill_policy.select_worker_with_headers(
                 &prefill_workers,
-                request_str,
+                request_text.for_policy(prefill_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2545,7 +2591,7 @@ impl RouterTrait for VllmPDRouter {
 
             let decode_idx = match decode_policy.select_worker_with_headers(
                 &decode_workers,
-                request_str,
+                request_text.for_policy(decode_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2733,8 +2779,14 @@ impl RouterTrait for VllmPDRouter {
             }
 
             // Select workers using policy with headers for consistent hash
-            let request_text = serde_json::to_string(&request_json).ok();
-            let request_str = request_text.as_deref();
+            let prefill_policy = self.policy_registry.get_prefill_policy();
+            let decode_policy = self.policy_registry.get_decode_policy();
+            let request_text = PolicyRequestText::new(
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+                || serde_json::to_string(&request_json).ok(),
+                || crate::protocols::spec::cache_routing::for_route(&request_json, path),
+            );
             let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
                 h.iter()
                     .filter_map(|(name, value)| {
@@ -2746,12 +2798,9 @@ impl RouterTrait for VllmPDRouter {
                     .collect()
             });
 
-            let prefill_policy = self.policy_registry.get_prefill_policy();
-            let decode_policy = self.policy_registry.get_decode_policy();
-
             let prefill_idx = match prefill_policy.select_worker_with_headers(
                 &prefill_workers,
-                request_str,
+                request_text.for_policy(prefill_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2767,7 +2816,7 @@ impl RouterTrait for VllmPDRouter {
 
             let decode_idx = match decode_policy.select_worker_with_headers(
                 &decode_workers,
-                request_str,
+                request_text.for_policy(decode_policy.as_ref()),
                 request_headers.as_ref(),
             ) {
                 Some(idx) => idx,
@@ -2841,6 +2890,59 @@ impl WorkerManagement for VllmPDRouter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pd_request_text_only_builds_representations_consumed_by_policies() {
+        use crate::policies::{
+            CacheAwareConfig, CacheAwarePolicy, ConsistentHashPolicy, LeastLoadPolicy,
+        };
+        use std::cell::Cell;
+
+        let cache = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let load = LeastLoadPolicy::default();
+        let hash = ConsistentHashPolicy::new();
+        let cache = &cache as &dyn LoadBalancingPolicy;
+        let load = &load as &dyn LoadBalancingPolicy;
+        let hash = &hash as &dyn LoadBalancingPolicy;
+        for (prefill, decode, cache_count, legacy_count) in [
+            (load, load, 0, 0),
+            (cache, load, 1, 0),
+            (load, cache, 1, 0),
+            (cache, cache, 1, 0),
+            (hash, load, 0, 1),
+            (load, hash, 0, 1),
+            (hash, hash, 0, 1),
+            (cache, hash, 1, 1),
+            (hash, cache, 1, 1),
+        ] {
+            let cache_calls = Cell::new(0);
+            let legacy_calls = Cell::new(0);
+            let input = PolicyRequestText::new(
+                prefill,
+                decode,
+                || {
+                    legacy_calls.set(legacy_calls.get() + 1);
+                    Some(r#"{"prompt":"raw"}"#.into())
+                },
+                || {
+                    cache_calls.set(cache_calls.get() + 1);
+                    "\0ca:t:raw".into()
+                },
+            );
+            for policy in [prefill, decode] {
+                if policy.name() == "cache_aware" {
+                    assert_eq!(input.for_policy(policy), Some("\0ca:t:raw"));
+                } else if policy.needs_request_text() {
+                    assert_eq!(input.for_policy(policy), Some(r#"{"prompt":"raw"}"#));
+                }
+            }
+            assert_eq!(cache_calls.get(), cache_count);
+            assert_eq!(legacy_calls.get(), legacy_count);
+        }
+    }
 
     #[test]
     fn test_discovery_health_requires_prefill_and_decode_workers() {
