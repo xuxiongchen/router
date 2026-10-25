@@ -3966,6 +3966,21 @@ mod kv_input_tests {
         ))];
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test".parse().unwrap());
+        let before_binding = state
+            .prepare(
+                &workers,
+                &policy,
+                &json!({"model":"m","prompt":"hello"}),
+                "/v1/completions",
+                Some(&headers),
+            )
+            .await;
+        let input = &before_binding[&base];
+        assert_eq!(input.prompts.as_deref(), Some([vec![7, 8, 9]].as_slice()));
+        assert!(!input.allow_credit);
+        assert_eq!(input.fallback_reason, Some("unverified_model"));
+        assert_eq!(input.work_by_rank[&None].new_prefill_tokens, 3);
+        assert!(!input.work_by_rank[&None].placement_verified);
         state
             .bind(&workers, kv_aware_ops(policy.as_ref()).unwrap())
             .await;
@@ -4084,6 +4099,8 @@ mod kv_input_tests {
         let static_sources = std::iter::once((
             base.clone(),
             crate::config::types::PdKvEventSources {
+                topic: String::new(),
+                hwm: None,
                 endpoints: vec![endpoint],
                 replay_endpoints: None,
                 block_size: 16,

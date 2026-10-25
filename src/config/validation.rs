@@ -761,6 +761,7 @@ impl ConfigValidator {
         // prefill policy; anything else would silently ignore them.
         if !config.pd_kv_event_sources.is_empty() {
             if let RoutingMode::VllmPrefillDecode { prefill_urls, .. } = &config.mode {
+                let mut publishers = std::collections::HashSet::new();
                 for (url, sources) in &config.pd_kv_event_sources {
                     // Static sources are looked up by `Worker::base_url()`, which
                     // drops the `@dp_rank` suffix, so a rank-pinned prefill URL
@@ -786,10 +787,23 @@ impl ConfigValidator {
                             reason: format!("pd_kv_event_sources['{url}'] block_size must be > 0"),
                         });
                     }
-                    for endpoint in sources
+                    if sources.hwm.is_some_and(|hwm| hwm < 0)
+                        || sources
+                            .replay_endpoints
+                            .as_ref()
+                            .is_some_and(|replay| replay.len() > sources.endpoints.len())
+                    {
+                        return Err(ConfigError::IncompatibleConfig {
+                            reason: format!(
+                                "pd_kv_event_sources['{url}'] requires nonnegative hwm and no more replay endpoints than publishers"
+                            ),
+                        });
+                    }
+                    for (position, endpoint) in sources
                         .endpoints
                         .iter()
                         .chain(sources.replay_endpoints.iter().flatten())
+                        .enumerate()
                     {
                         if !(endpoint.starts_with("tcp://") || endpoint.starts_with("ipc://")) {
                             return Err(ConfigError::IncompatibleConfig {
@@ -797,6 +811,20 @@ impl ConfigValidator {
                                     "pd_kv_event_sources['{url}'] endpoint '{endpoint}' must be \
                                      a ZMQ address (tcp:// or ipc://)"
                                 ),
+                            });
+                        }
+                        let canonical = if endpoint.starts_with("tcp://") {
+                            crate::kv_index::canonical_endpoint(endpoint).map_err(|reason| {
+                                ConfigError::IncompatibleConfig {
+                                    reason: format!("pd_kv_event_sources['{url}']: {reason}"),
+                                }
+                            })?
+                        } else {
+                            endpoint.clone()
+                        };
+                        if position < sources.endpoints.len() && !publishers.insert(canonical) {
+                            return Err(ConfigError::IncompatibleConfig {
+                                reason: "pd_kv_event_sources publishers must be independent across sources and ranks".into(),
                             });
                         }
                     }
@@ -1399,6 +1427,8 @@ mod tests {
         config.pd_kv_event_sources.insert(
             "http://prefill:8000".to_string(),
             PdKvEventSources {
+                topic: String::new(),
+                hwm: None,
                 endpoints: vec!["tcp://prefill:5557".to_string()],
                 replay_endpoints: None,
                 block_size: 16,
@@ -1411,6 +1441,68 @@ mod tests {
     #[test]
     fn test_pd_kv_event_sources_valid() {
         assert!(ConfigValidator::validate(&pd_config_with_static_kv_sources()).is_ok());
+    }
+
+    #[test]
+    fn static_pd_sources_validate_transport_bounds_and_publisher_identity() {
+        let worker = "http://prefill:8000";
+        for block_size in [8, 16, 32] {
+            let mut config = pd_config_with_static_kv_sources();
+            let source = config.pd_kv_event_sources.get_mut(worker).unwrap();
+            source.block_size = block_size;
+            source.topic = "kv/prefill".into();
+            source.hwm = Some(0);
+            source.endpoints = vec![
+                "tcp://127.0.0.1:5557".into(),
+                "ipc:///tmp/pd-config-rank1".into(),
+            ];
+            // A short replay list and a shared replay service remain legal.
+            source.replay_endpoints = Some(vec!["tcp://127.0.0.1:5558".into()]);
+            assert!(ConfigValidator::validate(&config).is_ok());
+            config
+                .pd_kv_event_sources
+                .get_mut(worker)
+                .unwrap()
+                .replay_endpoints = Some(vec!["tcp://127.0.0.1:5558".into(); 2]);
+            assert!(ConfigValidator::validate(&config).is_ok());
+        }
+        for (field, value) in [
+            ("endpoints", serde_json::json!(["tcp://*:5557"])),
+            ("endpoints", serde_json::json!(["tcp://0.0.0.0:5557"])),
+            (
+                "endpoints",
+                serde_json::json!(["tcp://[::ffff:0.0.0.0]:5557"]),
+            ),
+            ("endpoints", serde_json::json!(["tcp://127.0.0.1:0"])),
+            (
+                "endpoints",
+                serde_json::json!(["tcp://127.0.0.1:5557", "tcp://[::ffff:127.0.0.1]:5557"]),
+            ),
+            ("replay_endpoints", serde_json::json!(["tcp://*:5558"])),
+            (
+                "replay_endpoints",
+                serde_json::json!(["tcp://prefill:5558", "tcp://prefill:5559"]),
+            ),
+            ("hwm", serde_json::json!(-1)),
+        ] {
+            let mut config = pd_config_with_static_kv_sources();
+            let mut source = serde_json::to_value(&config.pd_kv_event_sources[worker]).unwrap();
+            source[field] = value;
+            config
+                .pd_kv_event_sources
+                .insert(worker.into(), serde_json::from_value(source).unwrap());
+            assert!(ConfigValidator::validate(&config).is_err(), "{field}");
+        }
+        let mut config = pd_config_with_static_kv_sources();
+        if let RoutingMode::VllmPrefillDecode { prefill_urls, .. } = &mut config.mode {
+            prefill_urls.push(("http://prefill:8001".into(), None));
+        }
+        let source = config.pd_kv_event_sources[worker].clone();
+        config
+            .pd_kv_event_sources
+            .insert("http://prefill:8001".into(), source);
+        let error = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(error.contains("publishers must be independent"), "{error}");
     }
 
     /// A rank-pinned prefill URL is keyed by its base URL at runtime.
@@ -1488,6 +1580,8 @@ mod tests {
         config.pd_kv_event_sources.insert(
             "http://prefill:8000".to_string(),
             PdKvEventSources {
+                topic: String::new(),
+                hwm: None,
                 endpoints: vec!["tcp://prefill:5557".to_string()],
                 replay_endpoints: None,
                 block_size: 16,
