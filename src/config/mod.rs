@@ -104,6 +104,8 @@ pub fn parse_static_kv_event_sources(
         let source = StaticKvEventSources {
             endpoints,
             replay_endpoints: None,
+            topic: String::new(),
+            hwm: None,
             block_size,
             model: model.to_owned(),
         };

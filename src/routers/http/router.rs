@@ -361,10 +361,28 @@ impl Router {
         let mut kv_worker_info = HashMap::new();
         let (kv_index_supervisor, kv_signal_handle) =
             if kv_aware_ops(default_policy.as_ref()).is_some() {
-                let (supervisor, mut signals) = crate::kv_index::KvIndexSupervisor::new(
-                    ctx.client.clone(),
-                    crate::kv_index::HashMode::Sha256,
-                );
+                let (supervisor, mut signals) = if pool_kind
+                    == Some(crate::backend::WorkerPoolKind::Http)
+                    && std::env::var_os("VLLM_ROUTER_KV_EVENT_SOURCES").is_some()
+                {
+                    if dp_size != 1 {
+                        return Err(concat!(
+                            "static HTTP KV sources require ",
+                            "independently addressed DP1 workers"
+                        )
+                        .into());
+                    }
+                    crate::kv_index::KvIndexSupervisor::new_http_dense(
+                        ctx.client.clone(),
+                        crate::kv_index::HashMode::Sha256,
+                        &kv_discovery_urls,
+                    )?
+                } else {
+                    crate::kv_index::KvIndexSupervisor::new(
+                        ctx.client.clone(),
+                        crate::kv_index::HashMode::Sha256,
+                    )
+                };
                 let static_kv_event_sources = match &ctx.router_config.policy {
                     crate::config::PolicyConfig::KvAware {
                         static_kv_event_sources,

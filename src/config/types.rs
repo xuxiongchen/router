@@ -747,12 +747,18 @@ pub enum PolicyConfig {
 
 /// Manually configured KV event publishers for one regular-mode worker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct StaticKvEventSources {
     /// One externally reachable ZMQ PUB endpoint per DP rank.
     pub endpoints: Vec<String>,
     /// Optional replay ROUTER endpoint per DP rank for loss recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_endpoints: Option<Vec<String>>,
+    /// Topic and queue bound for the configured event stream.
+    #[serde(default)]
+    pub topic: String,
+    #[serde(default)]
+    pub hwm: Option<i32>,
     /// KV cache block size used to calculate prefix placement.
     pub block_size: u32,
     /// Shared model identity across workers that serve the same model.
