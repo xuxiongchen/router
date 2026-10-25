@@ -179,6 +179,8 @@ pub fn parse_pd_kv_events(
         sources.insert(
             url.to_owned(),
             PdKvEventSources {
+                topic: String::new(),
+                hwm: None,
                 endpoints,
                 replay_endpoints: None,
                 block_size: 16,

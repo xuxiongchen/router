@@ -793,7 +793,13 @@ impl VllmPDRouter {
     ) -> Option<AffinityKey> {
         let affinity_on =
             kv_aware_ops(decode_policy).is_some_and(|kv| kv.session_affinity_enabled());
-        if !affinity_on {
+        // Explicit adapters are outside the declared binding identity, just as
+        // they are outside the prepared-input cache-credit contract.
+        if !affinity_on
+            || ["lora_name", "lora_path"]
+                .iter()
+                .any(|field| request.get(field).is_some_and(|value| !value.is_null()))
+        {
             return None;
         }
         let model_scope = request
@@ -2760,6 +2766,195 @@ impl WorkerManagement for VllmPDRouter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn pd_explicit_adapters_bypass_session_binding_through_http() {
+        use crate::config::{PolicyConfig, RouterConfig, RoutingMode};
+        use crate::policies::PolicyFactory;
+        use axum::{
+            extract::State,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        #[derive(Clone)]
+        struct Backend {
+            role: &'static str,
+            requests: mpsc::UnboundedSender<(&'static str, Value)>,
+        }
+        async fn complete(State(backend): State<Backend>, Json(body): Json<Value>) -> Json<Value> {
+            backend.requests.send((backend.role, body)).unwrap();
+            if backend.role == "P" {
+                Json(json!({"kv_transfer_params": {"remote_engine_id": "P"}}))
+            } else {
+                Json(json!({"choices": [{"index": 0, "text": "ok", "finish_reason": "stop"}]}))
+            }
+        }
+        async fn dispatch(
+            router: &VllmPDRouter,
+            requests: &mut mpsc::UnboundedReceiver<(&'static str, Value)>,
+            body: Value,
+        ) -> &'static str {
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                router.route_transparent(None, "/v1/completions", &Method::POST, body.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut decode = None;
+            for _ in 0..2 {
+                let (role, actual) = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                for field in [
+                    "model",
+                    "prompt",
+                    "session_id",
+                    "cache_salt",
+                    "lora_name",
+                    "lora_path",
+                ] {
+                    assert_eq!(actual.get(field), body.get(field), "{role} changed {field}");
+                }
+                if role == "P" {
+                    assert_eq!(actual["max_tokens"], 1);
+                } else {
+                    assert_eq!(actual["max_tokens"], body["max_tokens"]);
+                    decode = Some(role);
+                }
+            }
+            assert!(router.pd_router.pd_load.snapshot().is_empty());
+            assert!(router
+                .pd_router
+                .worker_registry
+                .get_all()
+                .iter()
+                .all(|worker| worker.load() == 0));
+            decode.unwrap()
+        }
+
+        let (send, mut requests) = mpsc::unbounded_channel();
+        let mut urls = Vec::new();
+        let mut servers = Vec::new();
+        for role in ["P", "D0", "D1"] {
+            let app = Router::new()
+                .route("/health", get(|| async { "ok" }))
+                .route("/v1/completions", post(complete))
+                .route(
+                    "/tokenize",
+                    post(|| async { Json(json!({"tokens": [1, 2]})) }),
+                )
+                .with_state(Backend {
+                    role,
+                    requests: send.clone(),
+                });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            urls.push(format!("http://{}", listener.local_addr().unwrap()));
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+        }
+        let kv_policy = PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        };
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![(urls[0].clone(), None)],
+                decode_urls: urls[1..].to_vec(),
+                prefill_policy: Some(kv_policy.clone()),
+                decode_policy: Some(kv_policy.clone()),
+                discovery_address: None,
+            },
+            policy: kv_policy,
+            kv_aware_session_affinity_ttl_secs: Some(60),
+            worker_startup_timeout_secs: 5,
+            ..RouterConfig::default()
+        };
+        let context = Arc::new(
+            crate::server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![])
+                .unwrap(),
+        );
+        let table = context.policy_registry.kv_affinity_table();
+        let policy = &context.router_config.policy;
+        context
+            .policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(
+                context.router_config.mode.get_prefill_policy(policy),
+                Some(&table),
+            ));
+        context
+            .policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(
+                context.router_config.mode.get_decode_policy(policy),
+                Some(&table),
+            ));
+        for policy in [
+            context.policy_registry.get_prefill_policy(),
+            context.policy_registry.get_decode_policy(),
+        ] {
+            assert_eq!(policy.name(), "kv_aware");
+            assert!(kv_aware_ops(policy.as_ref())
+                .unwrap()
+                .session_affinity_enabled());
+        }
+        let router = VllmPDRouter::new(
+            vec![(urls[0].clone(), None)],
+            urls[1..].to_vec(),
+            None,
+            &context,
+        )
+        .await
+        .unwrap();
+        let plain = json!({
+            "model": "test", "prompt": "hello", "max_tokens": 4,
+            "stream": false, "session_id": "same-session"
+        });
+        let bound = dispatch(&router, &mut requests, plain.clone()).await;
+        assert_eq!(dispatch(&router, &mut requests, plain.clone()).await, bound);
+        let mut null_adapter = plain.clone();
+        null_adapter["lora_name"] = Value::Null;
+        null_adapter["lora_path"] = Value::Null;
+        assert_eq!(dispatch(&router, &mut requests, null_adapter).await, bound);
+
+        for field in ["lora_name", "lora_path"] {
+            for adapter in ["adapter-a", "adapter-b"] {
+                let mut body = plain.clone();
+                body[field] = json!(adapter);
+                dispatch(&router, &mut requests, body.clone()).await;
+                let prefill = router.pd_router.worker_registry.get_prefill_workers();
+                let decode = router.pd_router.worker_registry.get_decode_workers();
+                let (selection, attempt) = router
+                    .admit_pair(&prefill, &decode, &body, "/v1/completions", None, false)
+                    .await
+                    .unwrap();
+                assert_eq!(selection.prefill.credited_prefix_tokens, None);
+                assert_eq!(
+                    selection.prefill.fallback_reason,
+                    Some("unsupported_cache_identity")
+                );
+                assert_eq!(selection.prefill.affinity_outcome, None);
+                assert_eq!(selection.decode.affinity_outcome, None);
+                drop(attempt);
+                assert!(router.pd_router.pd_load.snapshot().is_empty());
+            }
+        }
+        let mut scoped = plain.clone();
+        scoped["model"] = json!("other-model-alias");
+        scoped["cache_salt"] = json!("tenant-salt");
+        dispatch(&router, &mut requests, scoped).await;
+        assert_eq!(dispatch(&router, &mut requests, plain).await, bound);
+        for server in servers {
+            server.abort();
+        }
+    }
 
     #[test]
     fn pd_session_identity_requires_kv_aware_decode_with_ttl() {

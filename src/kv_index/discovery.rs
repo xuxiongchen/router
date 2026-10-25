@@ -166,6 +166,7 @@ impl KvIndexSupervisor {
     ) -> (Self, mpsc::Receiver<IngestionSignal>) {
         let (mut supervisor, signals) = Self::new(client, hash_mode);
         supervisor.http_pd = true;
+        supervisor.dense_http = true;
         supervisor.static_pd_sources = static_pd_sources;
         (supervisor, signals)
     }
@@ -339,13 +340,6 @@ impl KvIndexSupervisor {
                     Some(self.signal_tx.clone()),
                     self.ctx.clone(),
                     key.block_size,
-                )
-            } else if self.http_pd {
-                crate::kv_index::subscriber::spawn_pd(
-                    ev,
-                    indexer.clone(),
-                    Some(self.signal_tx.clone()),
-                    self.ctx.clone(),
                 )
             } else {
                 spawn_subscriber(
@@ -572,36 +566,23 @@ fn static_pd_discovery(
         kv_block_size: Some(config.block_size),
         ..Default::default()
     };
-    let sources = config
-        .endpoints
-        .iter()
-        .enumerate()
-        .map(|(rank, endpoint)| {
-            (
-                rank.to_string(),
-                KvEventSourceEntry {
-                    endpoint: endpoint.clone(),
-                    replay_endpoint: config
-                        .replay_endpoints
-                        .as_ref()
-                        .and_then(|replay| replay.get(rank).cloned()),
-                    publisher: Some("zmq".to_owned()),
-                    encoding: Some("msgpack".to_owned()),
-                    schema_version: Some(1),
-                    enable_kv_cache_events: Some(true),
-                    ..Default::default()
-                },
-            )
-        })
-        .collect();
     WorkerDiscovery {
         server_info: Ok(server_info),
-        sources: Ok(sources),
+        sources: Ok(static_source_entries(
+            &config.endpoints,
+            config.replay_endpoints.as_deref(),
+            &config.topic,
+            config.hwm,
+        )),
         model_id: Ok(Some(model_id)),
     }
 }
 
-async fn discover_worker(client: &reqwest::Client, worker_url: &str, http_pd: bool) -> WorkerDiscovery {
+async fn discover_worker(
+    client: &reqwest::Client,
+    worker_url: &str,
+    http_pd: bool,
+) -> WorkerDiscovery {
     if crate::backend::is_grpc_url(worker_url) {
         let timeout = Duration::from_secs(10);
         let server = crate::backend::control::get_grpc_server_info(worker_url, timeout).await;
@@ -1142,12 +1123,29 @@ mod tests {
     async fn dense_source_block_size_mismatch_revokes_only_affected_source() {
         for (expected, actual) in [(16, 8), (8, 16)] {
             for use_static in [false, true] {
-                check_dense_source_block_size(expected, actual, use_static).await;
+                check_dense_source_block_size(expected, actual, use_static, false, false).await;
             }
         }
     }
 
-    async fn check_dense_source_block_size(expected: u32, actual: u32, use_static: bool) {
+    #[tokio::test]
+    async fn pd_dense_source_contract_covers_live_and_replay() {
+        for (expected, actual) in [(16, 8), (8, 16)] {
+            for use_static in [false, true] {
+                for replay in [false, true] {
+                    check_dense_source_block_size(expected, actual, use_static, true, replay).await;
+                }
+            }
+        }
+    }
+
+    async fn check_dense_source_block_size(
+        expected: u32,
+        actual: u32,
+        use_static: bool,
+        pd: bool,
+        replay: bool,
+    ) {
         use crate::kv_index::{MatchQuery, StorageTier};
         use axum::{routing::get, Json, Router};
         use serde_json::json;
@@ -1156,26 +1154,46 @@ mod tests {
         let publisher = context.socket(zmq::XPUB).unwrap();
         publisher.bind("tcp://127.0.0.1:*").unwrap();
         let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
-        let (mut supervisor, mut signals) =
-            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
-        // Static Regular and the discovered Dense consumer share this admission.
-        supervisor.dense_http = true;
+        let replay_server = replay.then(|| {
+            let socket = context.socket(zmq::ROUTER).unwrap();
+            socket.bind("tcp://127.0.0.1:*").unwrap();
+            socket
+        });
+        let replay_endpoint = replay_server
+            .as_ref()
+            .map(|socket| socket.get_last_endpoint().unwrap().unwrap());
+        let (mut supervisor, mut signals) = if pd {
+            KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMode::Sha256, HashMap::new())
+        } else {
+            KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256)
+        };
+        if !pd {
+            supervisor.dense_http = true;
+        }
         let rank = if use_static { 0 } else { 3 };
         let (worker, http_task) = if use_static {
             let worker = "http://127.0.0.1:1".to_string();
-            supervisor.static_sources = parse_static_sources(
-                &json!({&worker: {
-                    "endpoints": [endpoint], "block_size": expected,
-                    "model": "dense-model", "topic": "kv/dense"
-                }})
-                .to_string(),
-                std::slice::from_ref(&worker),
-            )
-            .unwrap();
+            let source = json!({
+                "endpoints": [endpoint], "block_size": expected,
+                "model": "dense-model", "topic": "kv/dense",
+                "replay_endpoints": replay_endpoint.as_ref().map(|endpoint| vec![endpoint])
+            });
+            if pd {
+                supervisor
+                    .static_pd_sources
+                    .insert(worker.clone(), serde_json::from_value(source).unwrap());
+            } else {
+                supervisor.static_sources = parse_static_sources(
+                    &json!({&worker: source}).to_string(),
+                    std::slice::from_ref(&worker),
+                )
+                .unwrap();
+            }
             (worker, None)
         } else {
             let sources = json!({(rank.to_string()): {
-                "endpoint": endpoint, "topic": "kv/dense", "publisher": "zmq",
+                "endpoint": endpoint, "replay_endpoint": replay_endpoint,
+                "topic": "kv/dense", "publisher": "zmq",
                 "encoding": "msgpack", "schema_version": 1, "enable_kv_cache_events": true
             }});
             let app = Router::new()
@@ -1297,9 +1315,73 @@ mod tests {
                 rank,
             ))
             .unwrap();
+            let wire_seq = if replay && seq == 1 { 2 } else { seq };
             publisher
-                .send_multipart([b"kv/dense".as_slice(), &seq.to_be_bytes(), &payload], 0)
+                .send_multipart(
+                    [b"kv/dense".as_slice(), &wire_seq.to_be_bytes(), &payload],
+                    0,
+                )
                 .unwrap();
+            if replay && seq == 1 {
+                let socket = replay_server.as_ref().unwrap();
+                let request = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match socket.recv_multipart(zmq::DONTWAIT) {
+                            Ok(request) => break request,
+                            Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                            Err(error) => panic!("PD replay request: {error}"),
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(request.last().unwrap(), &1i64.to_be_bytes());
+                socket
+                    .send_multipart(
+                        [
+                            request[0].clone(),
+                            vec![],
+                            b"kv/dense".to_vec(),
+                            1i64.to_be_bytes().to_vec(),
+                            payload.clone(),
+                        ],
+                        0,
+                    )
+                    .unwrap();
+                socket
+                    .send_multipart(
+                        [
+                            request[0].clone(),
+                            vec![],
+                            vec![],
+                            (-1i64).to_be_bytes().to_vec(),
+                            vec![],
+                        ],
+                        0,
+                    )
+                    .unwrap();
+                // A contiguous empty frame is a processing barrier after the
+                // rejected replay and live batch; it must not restore credit.
+                let empty =
+                    rmp_serde::to_vec(&(1.0, Vec::<serde_json::Value>::new(), rank)).unwrap();
+                publisher
+                    .send_multipart([b"kv/dense".as_slice(), &1i64.to_be_bytes(), &empty], 0)
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let signal = signals.recv().await.unwrap();
+                        assert!(!matches!(
+                            signal,
+                            IngestionSignal::Advance { last_seq: 2, .. }
+                        ));
+                        if matches!(signal, IngestionSignal::Advance { last_seq: 1, .. }) {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            }
             if seq == 0 {
                 assert!(matches!(
                     tokio::time::timeout(Duration::from_secs(5), signals.recv())
@@ -1322,7 +1404,7 @@ mod tests {
                             break;
                         }
                         if let Ok(signal) = signals.try_recv() {
-                            if matches!(signal, IngestionSignal::Advance { last_seq: 1, .. }) {
+                            if matches!(signal, IngestionSignal::Advance { last_seq, .. } if last_seq == wire_seq) {
                                 use crate::policies::{cost_components, CandidateView, CostParams};
                                 let hits = indexer.find_matches(&query(&new_tokens));
                                 for hit in &hits {
@@ -1335,7 +1417,7 @@ mod tests {
                                         hit.tier, hit.segments, new_tokens.len(), cost.ptoken);
                                 }
                             }
-                            assert!(!matches!(signal, IngestionSignal::Advance { last_seq: 1, .. }),
+                            assert!(!matches!(signal, IngestionSignal::Advance { last_seq, .. } if last_seq == wire_seq),
                                 "accepted mismatched Dense batch: source={expected}, event={actual}, static={use_static}, old={:?}, mismatched={:?}",
                                 indexer.find_matches(&query(&old_tokens)),
                                 indexer.find_matches(&query(&new_tokens)));
@@ -1358,21 +1440,30 @@ mod tests {
         use axum::{routing::get, Json, Router};
         use serde_json::json;
 
-        for (use_static, block_size) in [
-            (false, 8u32),
-            (false, 16),
-            (false, 32),
-            (true, 8),
-            (true, 16),
-            (true, 32),
+        for (pd, use_static, block_size) in [
+            (false, false, 8u32),
+            (false, false, 16),
+            (false, false, 32),
+            (false, true, 8),
+            (false, true, 16),
+            (false, true, 32),
+            (true, false, 8),
+            (true, false, 16),
+            (true, false, 32),
+            (true, true, 8),
+            (true, true, 16),
+            (true, true, 32),
         ] {
             let context = zmq::Context::new();
             let publisher = context.socket(zmq::XPUB).unwrap();
             publisher.bind("tcp://127.0.0.1:*").unwrap();
             let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
             let rank = if use_static { 0u32 } else { 3 };
-            let (mut supervisor, mut signals) =
-                KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256);
+            let (mut supervisor, mut signals) = if pd {
+                KvIndexSupervisor::new_pd(reqwest::Client::new(), HashMode::Sha256, HashMap::new())
+            } else {
+                KvIndexSupervisor::new(reqwest::Client::new(), HashMode::Sha256)
+            };
             let (worker, http_task) = if use_static {
                 let worker = "http://127.0.0.1:1".to_string();
                 let value = json!({
@@ -1382,9 +1473,15 @@ mod tests {
                     }
                 })
                 .to_string();
-                supervisor.dense_http = true;
-                supervisor.static_sources =
-                    parse_static_sources(&value, std::slice::from_ref(&worker)).unwrap();
+                if !pd {
+                    supervisor.dense_http = true;
+                }
+                if pd {
+                    supervisor.static_pd_sources = serde_json::from_str(&value).unwrap();
+                } else {
+                    supervisor.static_sources =
+                        parse_static_sources(&value, std::slice::from_ref(&worker)).unwrap();
+                }
                 (worker, None)
             } else {
                 let sources = json!({(rank.to_string()): {
@@ -1521,6 +1618,8 @@ mod tests {
     #[test]
     fn static_pd_discovery_builds_one_source_per_rank() {
         let config = crate::config::types::PdKvEventSources {
+            topic: "kv/pd".into(),
+            hwm: Some(128),
             endpoints: vec!["tcp://10.0.0.5:5557".into(), "tcp://10.0.0.5:5559".into()],
             replay_endpoints: Some(vec!["tcp://10.0.0.5:5558".into()]),
             block_size: 32,
@@ -1540,6 +1639,8 @@ mod tests {
                 events_enabled(&sources[rank]),
                 "rank {rank} should be enabled"
             );
+            assert_eq!(sources[rank].topic, "kv/pd");
+            assert_eq!(sources[rank].hwm, Some(128));
         }
         assert_eq!(sources["0"].endpoint, "tcp://10.0.0.5:5557");
         assert_eq!(
@@ -1554,6 +1655,8 @@ mod tests {
     #[test]
     fn static_pd_discovery_falls_back_to_worker_url_as_model() {
         let config = crate::config::types::PdKvEventSources {
+            topic: String::new(),
+            hwm: None,
             endpoints: vec!["tcp://127.0.0.1:5557".into()],
             replay_endpoints: None,
             block_size: 16,
@@ -1584,6 +1687,8 @@ mod tests {
         let static_sources = std::iter::once((
             worker_url.to_string(),
             crate::config::types::PdKvEventSources {
+                topic: String::new(),
+                hwm: None,
                 endpoints: vec![endpoint],
                 replay_endpoints: None,
                 block_size: 16,

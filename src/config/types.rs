@@ -592,6 +592,12 @@ pub struct PdKvEventSources {
     /// Optional ZMQ ROUTER (replay) endpoints, same ordering as `endpoints`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_endpoints: Option<Vec<String>>,
+    /// Exact ZMQ topic used by the publisher; empty subscribes to its default.
+    #[serde(default)]
+    pub topic: String,
+    /// Receive high-water mark; None retains the ZMQ default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwm: Option<i32>,
     /// KV cache block size of the engine. Must match the engine's
     /// `--block-size` (vLLM default: 16).
     #[serde(default = "default_pd_kv_block_size")]
@@ -1148,6 +1154,8 @@ mod tests {
         config.pd_kv_event_sources.insert(
             "http://prefill:8000".to_string(),
             PdKvEventSources {
+                topic: "kv/prefill".into(),
+                hwm: Some(128),
                 endpoints: vec!["tcp://prefill:5557".to_string()],
                 replay_endpoints: Some(vec!["tcp://prefill:5558".to_string()]),
                 block_size: 32,
@@ -1164,6 +1172,14 @@ mod tests {
             deserialized.pd_kv_event_sources["http://prefill:8000"].block_size,
             32
         );
+        assert_eq!(
+            deserialized.pd_kv_event_sources["http://prefill:8000"].topic,
+            "kv/prefill"
+        );
+        assert_eq!(
+            deserialized.pd_kv_event_sources["http://prefill:8000"].hwm,
+            Some(128)
+        );
 
         // Omitted optional fields default: block_size 16, no replay, no model.
         let sources: PdKvEventSources =
@@ -1171,6 +1187,8 @@ mod tests {
         assert_eq!(sources.block_size, 16);
         assert!(sources.replay_endpoints.is_none());
         assert!(sources.model.is_none());
+        assert!(sources.topic.is_empty());
+        assert_eq!(sources.hwm, None);
 
         let bare = RouterConfig::new(
             RoutingMode::Regular {
