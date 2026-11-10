@@ -731,9 +731,6 @@ mod kv_input_tests {
             } else {
                 HashMap::new()
             };
-            let mut state = PdKvState::new_with_statics(reqwest::Client::new(), sources);
-            state.api_key = Some("pd-test-key".to_owned());
-            state.supervisor.set_api_key(state.api_key.clone());
             let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(KvAwarePolicy::default());
             let ops = kv_aware_ops(policy.as_ref()).unwrap();
             let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(BasicWorker::new(
@@ -742,7 +739,17 @@ mod kv_input_tests {
             ))];
             let tokens: Vec<u32> = (0..33).collect();
             let request = json!({"model":"m", "prompt":tokens});
-            state.bind(&workers, ops).await;
+            // Exercise the production startup/input path. The seq0 positive
+            // below proves startup credit, not a strict/default distinction.
+            let state = PdKvState::start(
+                reqwest::Client::new(),
+                Some("pd-test-key".to_owned()),
+                sources,
+                workers.clone(),
+                policy.clone(),
+                true,
+            )
+            .await;
             assert_eq!(
                 probes.load(Ordering::Relaxed),
                 if static_source { 0 } else { 2 }
