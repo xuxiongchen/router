@@ -908,6 +908,25 @@ mod tests {
         assert_eq!(enrolled.namespace, "m");
         assert_eq!(enrolled.publisher_snapshot.endpoint, "tcp://127.0.0.1:5557");
         assert!(config.validate().is_ok());
+        let igw_args = CliArgs::try_parse_from([
+            "vllm-router",
+            "--enable-igw",
+            "--policy",
+            "kv_aware",
+            "--kv-event-strict-recovery",
+            "--kv-snapshot-sources-file",
+            file.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let mut igw_config = igw_args.to_router_config(Vec::new()).unwrap();
+        assert!(igw_config.enable_igw);
+        assert!(matches!(
+            &igw_config.mode,
+            RoutingMode::Regular { worker_urls } if worker_urls.is_empty()
+        ));
+        assert!(igw_config.validate().is_err());
+        igw_config.kv_snapshot_sources.clear();
+        assert!(igw_config.validate().is_ok());
         let mut unsupported = config.clone();
         unsupported.intra_node_data_parallel_size = 2;
         assert!(unsupported.validate().is_err());

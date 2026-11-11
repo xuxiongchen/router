@@ -72,8 +72,8 @@ already-incomplete local index is not an authoritative source snapshot.
 An explicitly enrolled publisher can supply a bounded full-attention snapshot
 without resetting a warm worker. This is a proposed extension to
 vllm-project/vllm#57789, not a capability of an unmodified upstream endpoint.
-Only strict `kv_aware` HTTP Regular routing with independently addressable DP1
-workers is supported. P/D, shared-pool proof, adapters, offload, Hybrid layouts
+Only strict `kv_aware` non-IGW HTTP Regular routing with independently addressable DP1
+workers is supported. IGW, P/D, shared-pool proof, adapters, offload, Hybrid layouts
 and unknown warm-cache provenance are outside this profile.
 
 The native Rust CLI accepts `--kv-snapshot-sources-file enrollment.json`:

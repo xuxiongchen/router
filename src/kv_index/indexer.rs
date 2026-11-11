@@ -815,7 +815,7 @@ impl KvBlockIndexer {
                 SourceRecoveryState::WorkerExact,
                 SourceRecoveryReason::ReplayApplied,
             );
-            // The control task continues this exact attempt through live ACKs.
+            // The publisher task continues this exact attempt through live batches.
             // Generic state transitions allocate new tokens; retain this one only
             // for this successful fenced publication, under the same mutation lock.
             self.source_states

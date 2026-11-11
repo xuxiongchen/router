@@ -667,7 +667,7 @@ impl KvIndexSupervisor {
         ));
         let mut enrollment = enrollment.clone();
         enrollment.bound_source = Some(remote_source);
-        // Engine rank selects the remote utility target; BasicWorker/PD use
+        // Enrollment rank scopes the publisher batches; BasicWorker/PD use
         // worker-local DP rank zero for this independently addressable engine.
         let rank = 0;
         let mut workers = self.workers.lock();
