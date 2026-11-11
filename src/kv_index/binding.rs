@@ -11,6 +11,8 @@ use parking_lot::Mutex;
 /// rank decision and index mutation together, never holding this lock over await.
 #[derive(Clone)]
 pub(super) struct SourceLease {
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    pub(super) snapshot_only: Arc<AtomicBool>,
     pub(super) strict_rank: Arc<Mutex<bool>>,
     pub(super) active: Arc<AtomicBool>,
 }

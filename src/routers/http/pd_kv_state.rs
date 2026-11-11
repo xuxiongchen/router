@@ -2,7 +2,7 @@
 
 use super::pd_types::PdPrefillInput;
 use crate::backend::preprocess::{prepare_http_token_inputs, router_token_inputs};
-use crate::core::Worker;
+use crate::core::{Worker, WorkerRegistry};
 use crate::kv_index::discovery::{worker_get, WorkerDiscovery};
 use crate::kv_index::{HashMode, KvIndexSupervisor, WorkerKvInfo};
 use crate::policies::{kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy};
@@ -37,6 +37,7 @@ struct Discovery {
     signature: String,
     base_models: HashSet<String>,
     worker: WorkerDiscovery,
+    observed: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// The most recent P pool and effective policy seen on the request path.
@@ -66,17 +67,23 @@ enum ProbeOutcome {
     Evict,
 }
 
-fn probe_outcome(existing: Option<&Binding>, signature: Option<&str>) -> ProbeOutcome {
+fn probe_outcome(
+    existing: Option<&Binding>,
+    signature: Option<&str>,
+    consumer_finished: bool,
+) -> ProbeOutcome {
     match (existing, signature) {
         (Some(binding), Some(signature))
-            if binding.info.is_some() && binding.signature == signature =>
+            if binding.info.is_some() && binding.signature == signature && !consumer_finished =>
         {
             ProbeOutcome::Unchanged
         }
         // A failed probe never evicts a healthy binding or wipes its index;
         // retry after the normal refresh interval instead.
         (Some(binding), None) => {
-            if binding.info.is_some() && binding.probe_failures + 1 >= MAX_PROBE_FAILURES {
+            if binding.info.is_some()
+                && binding.probe_failures.saturating_add(1) >= MAX_PROBE_FAILURES
+            {
                 ProbeOutcome::Evict
             } else {
                 ProbeOutcome::Keep
@@ -103,6 +110,7 @@ pub(super) struct PdKvState {
     // The background refresh loop's latest view of the P pool and policy.
     refresh_inputs: Mutex<RefreshInputs>,
     signals: tokio::task::JoinHandle<()>,
+    registry: Option<std::sync::Weak<WorkerRegistry>>,
 }
 
 impl std::fmt::Debug for PdKvState {
@@ -118,14 +126,18 @@ impl PdKvState {
         client: reqwest::Client,
         api_key: Option<String>,
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
-        workers: Vec<Arc<dyn Worker>>,
         policy: Arc<dyn LoadBalancingPolicy>,
         strict_recovery: bool,
-    ) -> Arc<Self> {
+        snapshots: HashMap<String, crate::config::types::KvSnapshotSource>,
+        registry: &Arc<WorkerRegistry>,
+    ) -> Result<Arc<Self>, String> {
+        let workers = registry.get_prefill_workers();
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
         state.supervisor.set_api_key(state.api_key.clone());
         state.supervisor.set_strict_recovery(strict_recovery);
+        state.supervisor.set_snapshot_sources(snapshots)?;
+        state.registry = Some(Arc::downgrade(registry));
         state.refresh_inputs = Mutex::new(RefreshInputs {
             workers: workers.iter().cloned().collect(),
             policy: Some(policy.clone()),
@@ -144,7 +156,7 @@ impl PdKvState {
             }
         }
         state.spawn_refresh();
-        state
+        Ok(state)
     }
 
     /// Test-only constructor; production always passes the configured
@@ -170,6 +182,7 @@ impl PdKvState {
             refresh_inputs: Mutex::new(RefreshInputs::default()),
             // Subscribers enforce trust by suspending/clearing affected sources.
             signals: tokio::spawn(async move { while signals.recv().await.is_some() {} }),
+            registry: None,
         }
     }
 
@@ -205,6 +218,20 @@ impl PdKvState {
     /// admission load lock.
     async fn bind(&self, workers: &[Arc<dyn Worker>], policy: &dyn KvAwareOps) {
         let _bind_guard = self.bind_lock.lock().await;
+        let registered = self.registry.as_ref().and_then(std::sync::Weak::upgrade);
+        let current: Vec<_> = workers
+            .iter()
+            .filter(|worker| {
+                self.registry.is_none()
+                    || registered.as_ref().is_some_and(|registry| {
+                        registry
+                            .get_by_url(worker.url())
+                            .is_some_and(|active| Arc::ptr_eq(&active, worker))
+                    })
+            })
+            .cloned()
+            .collect();
+        let workers = current.as_slice();
         let bases: HashSet<_> = workers
             .iter()
             .map(|worker| worker.base_url().to_owned())
@@ -223,7 +250,14 @@ impl PdKvState {
                 .filter(|base| {
                     bindings.get(*base).is_none_or(|binding| {
                         binding.checked.elapsed()
-                            >= if binding.info.is_some() {
+                            >= if self.supervisor.snapshot_enrolled(base)
+                                && (self.supervisor.snapshot_consumer_finished(base)
+                                    || binding.info.is_none())
+                            {
+                                crate::kv_index::discovery::snapshot_retry_delay(
+                                    binding.probe_failures,
+                                )
+                            } else if binding.info.is_some() {
                                 REFRESH_INTERVAL
                             } else {
                                 CONTROL_TIMEOUT
@@ -269,6 +303,7 @@ impl PdKvState {
                 discovery
                     .as_ref()
                     .map(|snapshot| snapshot.signature.as_str()),
+                self.supervisor.snapshot_consumer_finished(&base),
             );
             match outcome {
                 ProbeOutcome::Unchanged => {
@@ -283,7 +318,7 @@ impl PdKvState {
                 }
                 ProbeOutcome::Keep | ProbeOutcome::Evict => {
                     let mut bindings = self.bindings.lock().await;
-                    if outcome == ProbeOutcome::Evict {
+                    if outcome == ProbeOutcome::Evict && !self.supervisor.snapshot_enrolled(&base) {
                         bindings.remove(&base);
                     }
                     bindings
@@ -313,11 +348,39 @@ impl PdKvState {
                     // concurrent prepare() sees no binding and denies credit
                     // until the rebuild completes.
                     let snapshot = discovery.expect("successful discovery probe");
-                    let info = self
-                        .supervisor
-                        .install_worker(&base, snapshot.worker)
-                        .ok()
-                        .filter(|info| info.cache_key.is_some() && !info.ranks.is_empty());
+                    let operation = || {
+                        self.supervisor.install_observed_worker(
+                            &base,
+                            snapshot.worker,
+                            snapshot.observed,
+                        )
+                    };
+                    let info = if let Some(registry) = &registered {
+                        workers
+                            .iter()
+                            .find(|worker| worker.base_url() == base)
+                            .and_then(|worker| registry.with_current(worker, operation))
+                    } else if self.registry.is_none() {
+                        Some(operation())
+                    } else {
+                        None
+                    }
+                    .and_then(Result::ok)
+                    .filter(|info| info.cache_key.is_some() && !info.ranks.is_empty());
+                    let failures = if self.supervisor.snapshot_enrolled(&base) {
+                        existing
+                            .as_ref()
+                            .map_or(0, |binding| binding.probe_failures.saturating_add(1))
+                    } else {
+                        0
+                    };
+                    // A replacement may have the same metadata but a new
+                    // provider/index Arc; do not reuse the prior target binding.
+                    let mut targets = self.targets.lock().await;
+                    for worker in workers.iter().filter(|worker| worker.base_url() == base) {
+                        targets.remove(worker.url());
+                    }
+                    drop(targets);
                     let mut bindings = self.bindings.lock().await;
                     bindings.insert(
                         base,
@@ -326,7 +389,7 @@ impl PdKvState {
                             checked: Instant::now(),
                             info,
                             base_models: snapshot.base_models,
-                            probe_failures: 0,
+                            probe_failures: failures,
                         },
                     );
                 }
@@ -342,7 +405,6 @@ impl PdKvState {
             if targets.get(worker.url()) == Some(&signature) {
                 continue;
             }
-            policy.unregister_worker(worker.url());
             let info = binding.and_then(|binding| binding.info.as_ref());
             // Keep a load-only registration when discovery has no info: the
             // occupancy fallback (affinity off, cache_salt/tools, health
@@ -355,7 +417,19 @@ impl PdKvState {
                     .then(|| self.supervisor.match_provider_for_worker(worker.base_url()))
                     .flatten()
             });
-            policy.register_worker(worker.as_ref(), info, matches);
+            let rebind = || {
+                policy.unregister_worker(worker.url());
+                policy.register_worker(worker.as_ref(), info, matches);
+            };
+            if let Some(registry) = &registered {
+                if registry.with_current(worker, rebind).is_none() {
+                    continue;
+                }
+            } else if self.registry.is_none() {
+                rebind();
+            } else {
+                continue;
+            }
             targets.insert(worker.url().to_owned(), signature);
         }
     }
@@ -365,6 +439,7 @@ impl PdKvState {
     /// Statically configured workers skip the control-plane queries and
     /// derive the signature from their configuration.
     async fn probe_base(&self, base: &str) -> Result<Discovery, String> {
+        let observed = self.supervisor.observe_worker(base);
         let worker = self.supervisor.discover(base).await;
         let info = worker.server_info.as_ref().map_err(Clone::clone)?;
         let sources = worker.sources.as_ref().map_err(Clone::clone)?;
@@ -385,6 +460,7 @@ impl PdKvState {
                 signature,
                 base_models,
                 worker,
+                observed,
             });
         }
         let models_request = worker_get(
@@ -409,6 +485,7 @@ impl PdKvState {
             signature,
             base_models,
             worker,
+            observed,
         })
     }
 
@@ -837,21 +914,29 @@ mod kv_input_tests {
             info: None,
             ..failing.clone()
         };
-        for (binding, signature, expected) in [
-            (Some(&healthy), Some("sig"), ProbeOutcome::Unchanged),
-            (Some(&healthy), Some("other"), ProbeOutcome::Rebuild),
-            (Some(&unverified), Some("sig"), ProbeOutcome::Rebuild),
-            (Some(&failing), None, ProbeOutcome::Evict),
-            (Some(&unverified), None, ProbeOutcome::Keep),
-            (None, Some("sig"), ProbeOutcome::Rebuild),
-            (None, None, ProbeOutcome::Keep),
+        for (binding, signature, finished, expected) in [
+            (Some(&healthy), Some("sig"), false, ProbeOutcome::Unchanged),
+            (Some(&healthy), Some("sig"), true, ProbeOutcome::Rebuild),
+            (Some(&healthy), Some("other"), false, ProbeOutcome::Rebuild),
+            (Some(&unverified), Some("sig"), false, ProbeOutcome::Rebuild),
+            (Some(&failing), None, false, ProbeOutcome::Evict),
+            (Some(&unverified), None, true, ProbeOutcome::Keep),
+            (None, Some("sig"), true, ProbeOutcome::Rebuild),
+            (None, None, true, ProbeOutcome::Keep),
         ] {
-            assert_eq!(probe_outcome(binding, signature), expected);
+            assert_eq!(probe_outcome(binding, signature, finished), expected);
         }
         for failures in 0..MAX_PROBE_FAILURES - 1 {
             let binding = healthy_binding("sig", failures);
-            assert_eq!(probe_outcome(Some(&binding), None), ProbeOutcome::Keep);
+            assert_eq!(
+                probe_outcome(Some(&binding), None, false),
+                ProbeOutcome::Keep
+            );
         }
+        assert_eq!(
+            probe_outcome(Some(&healthy_binding("sig", u8::MAX)), None, true),
+            ProbeOutcome::Evict
+        );
     }
 
     #[tokio::test]

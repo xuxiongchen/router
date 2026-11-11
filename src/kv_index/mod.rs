@@ -3,6 +3,9 @@
 mod admit;
 mod binding;
 mod decode;
+mod snapshot;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+pub(crate) mod snapshot_proof;
 
 use std::sync::Arc;
 

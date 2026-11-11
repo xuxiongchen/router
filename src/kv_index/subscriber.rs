@@ -45,10 +45,14 @@ pub struct EventSource {
 
 /// A handle to a running subscriber task; drop it (or call `shutdown`) to stop.
 pub struct SubscriberHandle {
-    shutdown_tx: broadcast::Sender<()>,
+    pub(super) shutdown_tx: broadcast::Sender<()>,
 }
 
 impl SubscriberHandle {
+    pub(super) fn is_finished(&self) -> bool {
+        self.shutdown_tx.receiver_count() == 0
+    }
+
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
     }
@@ -107,6 +111,20 @@ fn with_binding<T>(
     operation: impl FnOnce(bool) -> T,
 ) -> Option<T> {
     if let Some(binding) = binding {
+        #[cfg(all(test, feature = "cpu", feature = "ready"))]
+        {
+            binding
+                .lease
+                .with_active(|strict| {
+                    (!binding
+                        .lease
+                        .snapshot_only
+                        .load(std::sync::atomic::Ordering::Acquire))
+                    .then(|| operation(strict))
+                })
+                .flatten()
+        }
+        #[cfg(not(all(test, feature = "cpu", feature = "ready")))]
         binding.lease.with_active(operation)
     } else {
         Some(operation(false))
@@ -652,7 +670,7 @@ fn report_full_attention_rejection(
     }
 }
 
-fn apply_batch(
+pub(super) fn apply_batch(
     indexer: &KvBlockIndexer,
     source_id: &SourceId,
     dp_rank: u32,
@@ -1485,6 +1503,7 @@ mod tests {
             ctx.clone(),
             Some(4),
             SourceLease {
+                snapshot_only: Arc::new(AtomicBool::new(false)),
                 strict_rank: strict_rank.clone(),
                 active: Arc::new(AtomicBool::new(true)),
             },
@@ -1571,6 +1590,7 @@ mod tests {
             Some(4),
             Some(SubscriberBinding {
                 lease: SourceLease {
+                    snapshot_only: Arc::new(AtomicBool::new(false)),
                     strict_rank: strict_rank.clone(),
                     active: Arc::new(AtomicBool::new(true)),
                 },
@@ -1669,6 +1689,7 @@ mod tests {
                 Some(4),
                 Some(SubscriberBinding {
                     lease: SourceLease {
+                        snapshot_only: Arc::new(AtomicBool::new(false)),
                         strict_rank: Arc::new(Mutex::new(true)),
                         active: Arc::new(AtomicBool::new(true)),
                     },
@@ -1750,6 +1771,7 @@ mod tests {
             Some(4),
             Some(SubscriberBinding {
                 lease: SourceLease {
+                    snapshot_only: Arc::new(AtomicBool::new(false)),
                     strict_rank: strict_rank.clone(),
                     active: active.clone(),
                 },
@@ -1837,6 +1859,7 @@ mod tests {
             f._ctx.clone(),
             Some(4),
             SourceLease {
+                snapshot_only: Arc::new(AtomicBool::new(false)),
                 strict_rank,
                 active: Arc::new(AtomicBool::new(true)),
             },
@@ -2538,8 +2561,8 @@ mod tests {
             .map(|(seq, token_ids)| batch_payload(&[store_event(100 + seq as u64, token_ids)], 0))
             .collect();
 
-        for seq in 0..=1 {
-            let events = [store_event(100 + seq as u64, &tokens[seq])];
+        for (seq, token_ids) in tokens.iter().take(2).enumerate() {
+            let events = [store_event(100 + seq as u64, token_ids)];
             publish_until_advanced(
                 &fixture.publisher,
                 &mut fixture.signals,
@@ -2599,6 +2622,7 @@ mod tests {
             Some(4),
             Some(SubscriberBinding {
                 lease: SourceLease {
+                    snapshot_only: Arc::new(AtomicBool::new(false)),
                     strict_rank: strict_rank.clone(),
                     active: Arc::new(AtomicBool::new(true)),
                 },
@@ -2681,6 +2705,7 @@ mod tests {
             Some(4),
             Some(SubscriberBinding {
                 lease: SourceLease {
+                    snapshot_only: Arc::new(AtomicBool::new(false)),
                     strict_rank: strict_rank.clone(),
                     active: Arc::new(AtomicBool::new(true)),
                 },

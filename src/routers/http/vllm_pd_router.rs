@@ -3157,6 +3157,330 @@ impl WorkerManagement for VllmPDRouter {
 
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
+    // Thin snapshot integration proof with real provider/admission/HTTP
+    // ownership; this does not exercise PdKvState startup/preparation.
+    #[tokio::test]
+    async fn pd_cold_snapshot_restores_prefill_credit_and_releases_both_stages() {
+        use super::super::pd_types::{PdPrefillInput, PdRequestContext, Stage};
+        use crate::kv_index::snapshot_proof::fixture as producer;
+        use crate::kv_index::{HashMode, KvIndexSupervisor};
+        use crate::policies::{kv_aware_ops, KvAwarePolicy};
+        use axum::{
+            routing::{get, post},
+            Json,
+        };
+        use std::time::Duration;
+        use tokio::sync::{mpsc, Semaphore};
+
+        struct Cleanup(Vec<tokio::task::JoinHandle<()>>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for server in &self.0 {
+                    server.abort();
+                }
+            }
+        }
+        let other: Vec<u32> = (500..533).collect();
+        let context = zmq::Context::new();
+        let (mut supervisor, _signals) =
+            KvIndexSupervisor::new_http_full_attention(reqwest::Client::new(), HashMode::Sha256);
+        supervisor.set_strict_recovery(true);
+        let supervisor = Arc::new(supervisor);
+        let router = test_vllm_pd_router().await;
+        let policy = Arc::new(KvAwarePolicy::default());
+        router.policy_registry.set_prefill_policy(policy.clone());
+        let (entered, mut requests) = mpsc::unbounded_channel();
+        let p_gate = Arc::new(Semaphore::new(0));
+        let d_gate = Arc::new(Semaphore::new(0));
+        let mut cleanup = Cleanup(Vec::new());
+        let mut publishers = Vec::new();
+        let mut prefill = Vec::new();
+        for index in 0..2 {
+            let publisher = context.socket(zmq::XPUB).unwrap();
+            publisher.bind("tcp://127.0.0.1:*").unwrap();
+            let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let instance = url.clone();
+            let (entered, gate, target) = (entered.clone(), p_gate.clone(), url.clone());
+            let app = axum::Router::new()
+                .route("/get_server_info", get(move || { let instance = instance.clone(); async move { Json(json!({"model_id":"qwen3", "instance_id":instance, "kv_block_size":16})) } }))
+                .route("/kv_event_sources", get(move || { let endpoint = endpoint.clone(); async move { Json(json!({"0":{"endpoint":endpoint, "publisher":"zmq", "encoding":"msgpack", "schema_version":1, "enable_kv_cache_events":true}})) } }))
+                .route("/v1/completions", post(move |body: Bytes| { let (entered, gate, target) = (entered.clone(), gate.clone(), target.clone()); async move {
+                    entered.send((index, target, body)).unwrap(); gate.acquire().await.unwrap().forget();
+                    Json(json!({"kv_transfer_params":{"remote_engine_id":"P"}}))
+                } }));
+            cleanup.0.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+                url,
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            ));
+            let info = supervisor.on_worker_added(worker.url()).await.unwrap();
+            kv_aware_ops(policy.as_ref()).unwrap().register_worker(
+                worker.as_ref(),
+                Some(&info),
+                supervisor.match_provider_for_worker(worker.url()),
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match publisher.recv_bytes(zmq::DONTWAIT) {
+                        Ok(subscription) => {
+                            assert_eq!(subscription, [1]);
+                            break;
+                        }
+                        Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                        Err(error) => panic!("subscription: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            prefill.push(worker);
+            publishers.push(publisher);
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decode: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            WorkerType::Decode,
+        ));
+        let (d_entered, gate, d_target) =
+            (entered.clone(), d_gate.clone(), decode.url().to_owned());
+        cleanup.0.push(tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/v1/completions",
+                    post(move |body: Bytes| {
+                        let (entered, gate, target) =
+                            (d_entered.clone(), gate.clone(), d_target.clone());
+                        async move {
+                            entered.send((2, target, body)).unwrap();
+                            gate.acquire().await.unwrap().forget();
+                            Json(json!({"choices":[{"text":"ok", "finish_reason":"stop"}]}))
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        }));
+        let transcript = producer("regular_snapshot.json");
+        let healthy = producer("healthy_b_snapshot.json");
+        let installation =
+            supervisor.begin_snapshot_proof(prefill[0].url(), transcript.identity.clone());
+        assert!(supervisor
+            .begin_snapshot_proof(prefill[1].url(), healthy.identity.clone())
+            .install(&healthy)
+            .unwrap());
+        let router = Arc::new(router);
+        let mut actual_costs = Vec::new();
+        for (phase, first, expected) in [("cold", 100, 33), ("snapshot", 100, 1)] {
+            if phase == "snapshot" {
+                assert!(installation.install(&transcript).unwrap());
+            }
+            let tokens: Vec<u32> = (first..first + 33).collect();
+            // Actual provider evidence is scoped to the source, rank and tier.
+            let mut a_visible = false;
+            for (index, input) in [(1, &other), (0, &tokens)] {
+                use crate::kv_index::{MatchQuery, StorageTier};
+                let target = policy.target_for_worker(prefill[index].as_ref());
+                let hits = supervisor
+                    .match_provider_for_worker(prefill[index].url())
+                    .unwrap()
+                    .find_tiered_matches(&MatchQuery {
+                        group_idx: 0,
+                        local_hashes: KvAwarePolicy::local_hashes(input, 16),
+                        tiers_of_interest: vec![StorageTier::Device],
+                    });
+                let own: Vec<_> = hits.iter().filter(|hit| hit.target == target).collect();
+                if index == 0 {
+                    a_visible = !own.is_empty();
+                }
+                if index == 1 || phase == "snapshot" {
+                    assert_eq!(own.len(), 1);
+                    assert_eq!(own[0].target.dp_rank, 0);
+                    assert_eq!(own[0].tier, StorageTier::Device);
+                    assert_eq!(own[0].segments, [(0, 2)]);
+                }
+            }
+            let ops = kv_aware_ops(policy.as_ref()).unwrap();
+            assert_eq!(
+                ops.estimate_prefill_work(&[(
+                    prefill[1].as_ref(),
+                    std::slice::from_ref(&other),
+                    true
+                )])[0]
+                    .new_prefill_tokens,
+                1,
+                "B credit survives A recovery failure"
+            );
+            let work = ops.estimate_prefill_work(&[(
+                prefill[0].as_ref(),
+                std::slice::from_ref(&tokens),
+                true,
+            )])[0];
+            let input = HashMap::from([(
+                prefill[0].base_url().to_owned(),
+                PdPrefillInput {
+                    prompts: Some(Arc::from(vec![tokens.clone()])),
+                    work_by_rank: HashMap::from([(prefill[0].dp_rank(), work)]),
+                    allow_credit: true,
+                    fallback_reason: None,
+                },
+            )]);
+            let request_context = PdRequestContext {
+                prefill_inputs: Some(&input),
+                model_id: Some("qwen3"),
+                legacy_policy_input: None,
+                prefill_cache: None,
+                decode_cache: None,
+                headers: None,
+                affinity_key: None,
+                cache_salt: None,
+                route: "/v1/completions",
+            };
+            // Limit this thin witness to A, proving credit withdrawal does not
+            // remove it from dispatch. B remains registered and independently queried.
+            let (selection, attempt) = router
+                .pd_router
+                .select_and_admit(
+                    &prefill[..1],
+                    std::slice::from_ref(&decode),
+                    &request_context,
+                )
+                .unwrap();
+            let selected_cost = selection.prefill.new_prefill_tokens;
+            let selected_credit = selection.prefill.credited_prefix_tokens;
+            let task_router = router.clone();
+            let (p, d, body) = (
+                prefill[0].clone(),
+                decode.clone(),
+                json!({"model":"qwen3", "prompt":tokens, "stream":false}),
+            );
+            let task = tokio::spawn(async move {
+                let response = task_router
+                    .process_vllm_two_stage_request(
+                        body,
+                        p,
+                        d,
+                        "/v1/completions",
+                        None,
+                        attempt.clone(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                attempt.track_response(response)
+            });
+            let p_request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+                .expect("actual P entry");
+            let snapshot = router.pd_router.pd_load.snapshot();
+            let p = snapshot
+                .iter()
+                .find(|((stage, _), _)| *stage == Stage::Prefill)
+                .unwrap()
+                .1;
+            let d = snapshot
+                .iter()
+                .find(|((stage, _), _)| *stage == Stage::Decode)
+                .unwrap()
+                .1;
+            let p_held = (p.active_prefill_tokens, p.prefill_requests);
+            let d_pending = (d.pending_decode_requests, d.active_decode_requests);
+            eprintln!(
+                "PD {phase}: actual P={}, tokens={}, D pending=1",
+                prefill[0].url(),
+                p.active_prefill_tokens
+            );
+            p_gate.add_permits(1);
+            let d_request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                .await
+                .unwrap()
+                .expect("actual D entry");
+            let snapshot = router.pd_router.pd_load.snapshot();
+            let p_released = snapshot.iter().all(|((stage, _), sample)| {
+                *stage != Stage::Prefill
+                    || (sample.prefill_requests == 0 && sample.active_prefill_tokens == 0)
+            });
+            let d_active = snapshot
+                .iter()
+                .find(|((stage, _), _)| *stage == Stage::Decode)
+                .unwrap()
+                .1
+                .active_decode_requests;
+            d_gate.add_permits(1);
+            let response = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            let status = response.status();
+            let response_body = axum::body::to_bytes(response.into_body(), 1024).await;
+            // Finish the real response/attempt ownership before reporting any
+            // credit failure, so a RED still includes cleanup evidence.
+            assert!(router.pd_router.pd_load.snapshot().is_empty());
+            assert_eq!((prefill[0].load(), decode.load()), (0, 0));
+            eprintln!("PD {phase}: P held={p_held:?}, D pending={d_pending:?}, P released at D={p_released}, D active={d_active}, final load empty; P raw={:?}, D raw={:?}", p_request.2, d_request.2);
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&response_body.unwrap()).unwrap(),
+                json!({"choices":[{"text":"ok", "finish_reason":"stop"}]})
+            );
+            assert_eq!((p_request.0, p_request.1.as_str()), (0, prefill[0].url()));
+            assert_eq!((d_request.0, d_request.1.as_str()), (2, decode.url()));
+            // Two-stage dispatch intentionally rewrites P generation fields and
+            // adds transfer metadata; the original prompt must survive both.
+            let p_body: Value = serde_json::from_slice(&p_request.2).unwrap();
+            let d_body: Value = serde_json::from_slice(&d_request.2).unwrap();
+            assert_eq!(
+                p_body,
+                json!({
+                    "model":"qwen3", "prompt":tokens, "stream":false,
+                    "max_tokens":1, "min_tokens":1,
+                    "kv_transfer_params":{
+                        "do_remote_decode":true, "do_remote_prefill":false,
+                        "remote_engine_id":null, "remote_block_ids":null,
+                        "remote_host":null, "remote_port":null
+                    }
+                })
+            );
+            assert_eq!(
+                d_body,
+                json!({"model":"qwen3", "prompt":tokens, "stream":false, "kv_transfer_params":{"remote_engine_id":"P"}})
+            );
+            assert_eq!(d_pending, (1, 0));
+            assert!(p_released);
+            assert_eq!(d_active, 1);
+            actual_costs.push((
+                phase,
+                selected_cost,
+                selected_credit,
+                p_held,
+                expected,
+                a_visible,
+            ));
+        }
+        supervisor.shutdown();
+        for (phase, selected_cost, selected_credit, p_held, expected, a_visible) in actual_costs {
+            assert_eq!(
+                a_visible,
+                phase == "snapshot",
+                "{phase} strict provider visibility"
+            );
+            assert_eq!(selected_cost, Some(expected), "{phase} actual admission");
+            assert_eq!(
+                selected_credit,
+                Some(33 - expected),
+                "{phase} actual credit"
+            );
+            assert_eq!(p_held, (expected, 1), "{phase} actual P reservation");
+        }
+    }
     async fn finalize_decode_response(
         response: reqwest::Response,
         prefill: Option<&Value>,

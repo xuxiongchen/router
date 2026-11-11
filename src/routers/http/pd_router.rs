@@ -1151,11 +1151,12 @@ impl PdRouterBase {
                     ctx.client.clone(),
                     ctx.router_config.api_key.clone(),
                     ctx.router_config.pd_kv_event_sources.clone(),
-                    ctx.worker_registry.get_prefill_workers(),
                     prefill_policy.clone(),
                     ctx.router_config.kv_event_strict_recovery,
+                    ctx.router_config.kv_snapshot_sources.clone(),
+                    &ctx.worker_registry,
                 )
-                .await,
+                .await?,
             )
         } else {
             None
