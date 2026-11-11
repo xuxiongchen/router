@@ -3712,6 +3712,7 @@ mod tests {
                         rank: 0,
                         block_size: 16,
                         control_key_file: key.path().to_owned(),
+                        publisher_snapshot: None,
                     },
                 );
                 urls.push(url);

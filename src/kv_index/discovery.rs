@@ -3409,6 +3409,7 @@ vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",e
                                 rank: 3,
                                 block_size: 16,
                                 control_key_file: key.path().to_owned(),
+                                publisher_snapshot: None,
                             },
                         )
                     })

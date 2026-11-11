@@ -3,6 +3,7 @@
 mod admit;
 mod binding;
 mod decode;
+mod publisher_snapshot;
 mod snapshot;
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 pub(crate) mod snapshot_proof;

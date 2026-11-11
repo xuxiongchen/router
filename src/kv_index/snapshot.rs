@@ -61,7 +61,7 @@ pub(crate) struct Attempt {
     lease: SourceLease,
     attempt: u64,
     expected: Identity,
-    index_rank: u32,
+    pub(super) index_rank: u32,
     deadline: Instant,
 }
 
@@ -101,7 +101,7 @@ impl Attempt {
         )
     }
 
-    fn install_batches(
+    pub(super) fn install_batches(
         &self,
         mut batches: Vec<KVEventBatch>,
         before_publish: impl FnOnce(),
@@ -396,6 +396,14 @@ impl Enrollment {
         if config.namespace.is_empty() || config.namespace.len() > 256 || config.block_size == 0 {
             return Err("invalid snapshot enrollment".into());
         }
+        if let Some(publisher) = &config.publisher_snapshot {
+            super::publisher_snapshot::validate_config(publisher)?;
+            return Ok(Self {
+                config,
+                control_key: reqwest::header::HeaderValue::from_static(""),
+                bound_source: None,
+            });
+        }
         let mut key = String::new();
         std::fs::File::open(&config.control_key_file)
             .and_then(|file| file.take(4097).read_to_string(&mut key))
@@ -456,6 +464,9 @@ pub(super) async fn discover_identity(
     enrollment: Enrollment,
     api_key: Option<String>,
 ) -> Result<Identity, &'static str> {
+    if let Some(config) = enrollment.config.publisher_snapshot.clone() {
+        return super::publisher_snapshot::discover(config, enrollment.config).await;
+    }
     let control = Control::new(worker, enrollment, api_key)?;
     let caps: Capabilities = control.call("capabilities", None, None, None).await?;
     validate_capabilities(&caps, &control.enrollment)?;
@@ -649,6 +660,9 @@ pub(super) fn spawn(
     lease: SourceLease,
     signals: tokio::sync::mpsc::Sender<super::IngestionSignal>,
 ) -> super::subscriber::SubscriberHandle {
+    if enrollment.config.publisher_snapshot.is_some() {
+        return super::publisher_snapshot::spawn(enrollment, indexer, source, lease);
+    }
     let (shutdown_tx, mut shutdown) = tokio::sync::broadcast::channel(1);
     tokio::spawn(async move {
         let mut consecutive_failures = 0;
@@ -877,6 +891,7 @@ mod tests {
             rank: 0,
             block_size: 16,
             control_key_file: key.path().to_owned(),
+            publisher_snapshot: None,
         };
         for (input, accepted) in [
             ("test-key", true),
@@ -1107,6 +1122,7 @@ mod tests {
                 rank: 0,
                 block_size: 16,
                 control_key_file: "unused".into(),
+                publisher_snapshot: None,
             },
             control_key: reqwest::header::HeaderValue::from_static("control-secret"),
             bound_source: None,

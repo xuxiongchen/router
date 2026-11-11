@@ -1099,7 +1099,20 @@ pub struct KvSnapshotSource {
     pub namespace: String,
     pub rank: u32,
     pub block_size: u32,
+    #[serde(default)]
     pub control_key_file: std::path::PathBuf,
+    /// Experimental, operator-enrolled loopback publisher protocol. The default
+    /// continues to use the authenticated HTTP reference transport.
+    #[serde(default)]
+    pub publisher_snapshot: Option<PublisherSnapshotSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublisherSnapshotSource {
+    pub endpoint: String,
+    pub snapshot_endpoint: String,
+    #[serde(default)]
+    pub topic: String,
 }
 
 impl PolicyConfig {

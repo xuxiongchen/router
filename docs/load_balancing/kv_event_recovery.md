@@ -74,6 +74,53 @@ stored token IDs to 1 MiB (four bytes per ID). The reference producer defaults t
 a producer-complete snapshot may still exceed the Router's limits. It earns no credit, but the Worker remains routable.
 A deployment needs to satisfy both sides; a software version number is not a capability.
 
+### Experimental upstream publisher interoperation
+
+An independent experimental branch can use the publisher snapshot protocol from
+vLLM #57789 with a **proposed**, versioned strict full-attention proof extension.
+The unmodified upstream `snapshot` response is best effort; it is not treated as
+an exact inventory. This experiment does not replace the HTTP reference, and is
+not a claim that the extension has been accepted upstream.
+
+The native Router source file can instead contain:
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "namespace": "model-input-b16",
+    "rank": 0,
+    "block_size": 16,
+    "publisher_snapshot": {
+      "endpoint": "tcp://127.0.0.1:5557",
+      "snapshot_endpoint": "tcp://127.0.0.1:5559",
+      "topic": "kv"
+    }
+  }
+}
+```
+
+Only explicitly configured literal-loopback TCP sockets are accepted by this
+unauthenticated experimental transport; do not expose or forward them. Ordinary
+inference authentication is unchanged. The operator binds the served model and
+input/block-size namespace. A publisher UUID binds the snapshot and live stream;
+the Router's registration and replay attempt still fence the installation.
+
+The proposed `snapshot-full-attention-v1` response supplies a complete
+worker-local group-0 GPU inventory, incremental reporting, zero lookahead and no
+adapters. The Router rejects a missing or inconsistent proof. Reference-count
+teaching Stores are interpreted only in this protocol, without loosening common
+event admission. A live repeated data-bearing Store is ambiguous with full
+reporting and revokes credit rather than fabricating another residency reference.
+
+SUB is established before requesting the cut. The Router checks a continuous
+finite post-watermark suffix before publication, then requires continuing
+identified events/heartbeats. Missing sequences, conflicting repeats, changed
+UUIDs, a three-second receive deadline or capacity refusal revoke credit. The
+worker remains routable. Each message/snapshot and staging suffix is bounded to
+1 MiB/4,096 frames; semantic descriptions and references have separate 4,096
+entry limits. This is not a hard process RSS bound. No Hybrid, offload, LoRA,
+multi-engine HTTP endpoint, device-residency or hardware-performance claim.
+
 ### Legacy protocol assumptions
 
 Strict recovery is conservative within the existing event contract, not an
