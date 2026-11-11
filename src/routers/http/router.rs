@@ -341,18 +341,32 @@ async fn reconcile_snapshot_worker(
         return;
     };
     registry.with_current(worker, || {
-        if let Ok(info) = supervisor.install_observed_worker(worker.base_url(), discovery, observed)
+        if supervisor
+            .install_observed_worker(worker.base_url(), discovery, observed)
+            .is_ok()
         {
-            let policy = policy_registry.get_default_policy();
-            if let Some(ops) = kv_aware_ops(policy.as_ref()) {
-                ops.register_worker(
-                    worker.as_ref(),
-                    Some(&info),
-                    supervisor.match_provider_for_worker(worker.base_url()),
-                );
-            }
+            bind_current_kv_target(Some(supervisor), policy_registry, worker.as_ref(), None);
         }
     });
+}
+
+fn bind_current_kv_target(
+    supervisor: Option<&crate::kv_index::KvIndexSupervisor>,
+    policies: &PolicyRegistry,
+    worker: &dyn Worker,
+    metadata: Option<&crate::kv_index::WorkerKvInfo>,
+) {
+    let policy = policies.get_default_policy();
+    let Some(ops) = kv_aware_ops(policy.as_ref()) else {
+        return;
+    };
+    if let Some(supervisor) = supervisor {
+        supervisor.with_current_worker_binding(worker.base_url(), metadata, |info, provider| {
+            ops.register_worker(worker, info, provider);
+        });
+    } else {
+        ops.register_worker(worker, metadata, None);
+    }
 }
 
 const PROGRAM_MODEL_POOL_ALL: &str = "program:all";
@@ -569,16 +583,14 @@ impl Router {
             };
             ctx.worker_registry.register(worker_arc.clone());
 
-            if let Some(kv_aware) = kv_aware_ops(default_policy.as_ref()) {
-                let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
-                    supervisor.match_provider_for_worker(worker_arc.base_url())
-                });
-                kv_aware.register_worker(
+            ctx.worker_registry.with_current(&worker_arc, || {
+                bind_current_kv_target(
+                    kv_index_supervisor.as_deref(),
+                    &ctx.policy_registry,
                     worker_arc.as_ref(),
                     kv_worker_info.get(worker_arc.base_url()),
-                    provider,
                 );
-            }
+            });
 
             // Notify PolicyRegistry about the new worker
             let model_id = worker_arc.model_id();
@@ -783,15 +795,20 @@ impl Router {
         worker: &dyn Worker,
         info: Option<&crate::kv_index::WorkerKvInfo>,
     ) {
-        let policy = self.policy_registry.get_default_policy();
-        let Some(kv_aware) = kv_aware_ops(policy.as_ref()) else {
+        let Some(current) = self.worker_registry.get_by_url(worker.url()) else {
             return;
         };
-        let provider = self
-            .kv_index_supervisor
-            .as_ref()
-            .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        kv_aware.register_worker(worker, info, provider);
+        if !std::ptr::addr_eq(worker, current.as_ref()) {
+            return;
+        }
+        self.worker_registry.with_current(&current, || {
+            bind_current_kv_target(
+                self.kv_index_supervisor.as_deref(),
+                &self.policy_registry,
+                worker,
+                info,
+            );
+        });
     }
 
     fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
@@ -3942,6 +3959,28 @@ mod tests {
             .await
             .is_ok()
         }
+    }
+
+    #[tokio::test]
+    async fn completion_late_foreground_binding_preserves_recovered_source() {
+        let (mut fixture, peers) = SnapshotCompletionFixture::control(true).await;
+        fixture.request_a(100, 33).await;
+        peers[0].state.lock().denied = false;
+        assert!(
+            peers[0].wait(|state| state.polls >= 2).await,
+            "background installed and acknowledged the recovered source"
+        );
+        assert!(peers[1].wait(|state| state.polls >= 2).await);
+        fixture.request_a(100, 1).await;
+
+        // The Worker is already visible to the background owner. Resume the
+        // foreground publication step with its earlier failed discovery.
+        fixture
+            .router
+            .register_kv_target(fixture.workers[0].as_ref(), None);
+        fixture.request_a(100, 1).await;
+        fixture.assert_prefix(0, 100, true);
+        fixture.assert_prefix(1, 500, true);
     }
 
     #[tokio::test]

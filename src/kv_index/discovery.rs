@@ -804,6 +804,31 @@ impl KvIndexSupervisor {
         info!("kv_index supervisor shut down");
     }
 
+    /// Resolve policy inputs from the current registration and publish them before
+    /// retirement or replacement can change it. The callback must not await or
+    /// re-enter the supervisor.
+    pub(crate) fn with_current_worker_binding(
+        &self,
+        worker_url: &str,
+        metadata: Option<&WorkerKvInfo>,
+        bind: impl FnOnce(Option<&WorkerKvInfo>, Option<Arc<dyn crate::policies::TieredMatchProvider>>),
+    ) {
+        let workers = self.workers.lock();
+        if let Some(worker) = workers.get(worker_url) {
+            let info = WorkerKvInfo {
+                instance_id: worker.source_id.to_string(),
+                block_size: Some(worker.key.block_size),
+                ranks: worker.ranks.clone(),
+                cache_key: Some(worker.key.clone()),
+            };
+            bind(Some(&info), Some(worker.indexer.clone()));
+        } else {
+            // Preserve metadata-only Generic targets, never an index/provider
+            // from a registration that has since been retired.
+            bind(metadata.filter(|info| info.cache_key.is_none()), None);
+        }
+    }
+
     /// Expose the discovered worker's live index through the policy's read-only port.
     pub fn match_provider_for_worker(
         &self,
