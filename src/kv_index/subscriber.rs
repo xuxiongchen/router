@@ -45,10 +45,14 @@ pub struct EventSource {
 
 /// A handle to a running subscriber task; drop it (or call `shutdown`) to stop.
 pub struct SubscriberHandle {
-    shutdown_tx: broadcast::Sender<()>,
+    pub(super) shutdown_tx: broadcast::Sender<()>,
 }
 
 impl SubscriberHandle {
+    pub(super) fn is_finished(&self) -> bool {
+        self.shutdown_tx.receiver_count() == 0
+    }
+
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
     }
@@ -652,7 +656,7 @@ fn report_full_attention_rejection(
     }
 }
 
-fn apply_batch(
+pub(super) fn apply_batch(
     indexer: &KvBlockIndexer,
     source_id: &SourceId,
     dp_rank: u32,
@@ -2538,8 +2542,8 @@ mod tests {
             .map(|(seq, token_ids)| batch_payload(&[store_event(100 + seq as u64, token_ids)], 0))
             .collect();
 
-        for seq in 0..=1 {
-            let events = [store_event(100 + seq as u64, &tokens[seq])];
+        for (seq, token_ids) in tokens.iter().enumerate().take(2) {
+            let events = [store_event(100 + seq as u64, token_ids)];
             publish_until_advanced(
                 &fixture.publisher,
                 &mut fixture.signals,

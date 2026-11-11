@@ -791,6 +791,83 @@ impl KvBlockIndexer {
         .is_some()
     }
 
+    /// Publish one staged worker-local snapshot under the existing replay fence.
+    pub(super) fn install_snapshot_if_current(
+        &self,
+        source: &SourceId,
+        rank: u32,
+        attempt: u64,
+        apply_validated_plan: impl FnOnce() -> bool,
+    ) -> bool {
+        self.with_current_replay(source, rank, attempt, |_| {
+            for shard in self.shards.iter() {
+                shard.clear_source(source, rank);
+            }
+            if !apply_validated_plan() {
+                for shard in self.shards.iter() {
+                    shard.clear_source(source, rank);
+                }
+                return false;
+            }
+            self.resume_source_locked(
+                source,
+                rank,
+                SourceRecoveryState::WorkerExact,
+                SourceRecoveryReason::ReplayApplied,
+            );
+            // The publisher task continues this exact attempt through live batches.
+            // Generic state transitions allocate new tokens; retain this one only
+            // for this successful fenced publication, under the same mutation lock.
+            self.source_states
+                .get_mut(&(source.clone(), rank))
+                .expect("published source")
+                .attempt = attempt;
+            true
+        })
+        .unwrap_or(false)
+    }
+
+    /// Continue the same authoritative control attempt without manufacturing a
+    /// new recovery generation per poll. Retirement/replay supersedes this token.
+    pub(super) fn with_current_snapshot<T>(
+        &self,
+        source: &SourceId,
+        rank: u32,
+        attempt: u64,
+        valid_until: std::time::Instant,
+        operation: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _guard = self.source_mutations.lock();
+        {
+            let record = self.source_states.get(&(source.clone(), rank))?;
+            if record.attempt != attempt || record.status.state != SourceRecoveryState::WorkerExact
+            {
+                return None;
+            }
+        }
+        if std::time::Instant::now() >= valid_until {
+            self.invalidate_source_locked(source, rank, SourceRecoveryReason::ReplayFailed);
+            return None;
+        }
+        let result = operation();
+        if std::time::Instant::now() >= valid_until {
+            self.invalidate_source_locked(source, rank, SourceRecoveryReason::ReplayFailed);
+            return None;
+        }
+        Some(result)
+    }
+
+    pub(super) fn fail_snapshot_if_current(&self, source: &SourceId, rank: u32, attempt: u64) {
+        let _guard = self.source_mutations.lock();
+        let current = self
+            .source_states
+            .get(&(source.clone(), rank))
+            .is_some_and(|record| record.attempt == attempt);
+        if current {
+            self.invalidate_source_locked(source, rank, SourceRecoveryReason::ReplayFailed);
+        }
+    }
+
     fn visible_state(state: SourceRecoveryState) -> bool {
         matches!(
             state,
@@ -1011,6 +1088,55 @@ mod tests {
 
     fn h(s: &str) -> Arc<str> {
         Arc::<str>::from(s)
+    }
+
+    #[test]
+    fn local_snapshot_publication_does_not_authorize_shared_pool_claims() {
+        let indexer = KvBlockIndexer::new();
+        let source = SourceId::from("snapshot-worker");
+        indexer.register_source(&source, 0);
+        let (_, attempt) = indexer.begin_replay(&source, 0, -1, true);
+        assert!(
+            indexer.install_snapshot_if_current(&source, 0, attempt, || {
+                for (owner, tier) in [
+                    (worker("snapshot-worker"), StorageTier::Device),
+                    (
+                        pool("shared-pool", "snapshot-worker"),
+                        StorageTier::External,
+                    ),
+                ] {
+                    indexer.store(0, owner, tier, None, &[(h("engine-x"), h("local-x"))]);
+                }
+                // Positive seed in both tiers; neither is visible before publication.
+                let raw = indexer.shard(0).find_matches(&query(
+                    &["local-x"],
+                    &[StorageTier::Device, StorageTier::External],
+                ));
+                assert_eq!(raw.len(), 2);
+                assert!(indexer
+                    .find_matches(&query(
+                        &["local-x"],
+                        &[StorageTier::Device, StorageTier::External]
+                    ))
+                    .is_empty());
+                true
+            })
+        );
+        let hits = indexer.find_matches(&query(
+            &["local-x"],
+            &[StorageTier::Device, StorageTier::External],
+        ));
+        assert_eq!(
+            hits.len(),
+            1,
+            "local snapshot must not authorize External credit"
+        );
+        assert_eq!(hits[0].tier, StorageTier::Device);
+        assert_eq!(hits[0].segments, [(0, 1)]);
+        assert_eq!(
+            indexer.source_recovery_status(&source, 0).unwrap().state,
+            SourceRecoveryState::WorkerExact
+        );
     }
 
     #[test]
