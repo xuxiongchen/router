@@ -121,11 +121,13 @@ impl PdKvState {
         workers: Vec<Arc<dyn Worker>>,
         policy: Arc<dyn LoadBalancingPolicy>,
         strict_recovery: bool,
-    ) -> Arc<Self> {
+        snapshots: HashMap<String, crate::config::types::KvSnapshotSource>,
+    ) -> Result<Arc<Self>, String> {
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
         state.supervisor.set_api_key(state.api_key.clone());
         state.supervisor.set_strict_recovery(strict_recovery);
+        state.supervisor.set_snapshot_sources(snapshots)?;
         state.refresh_inputs = Mutex::new(RefreshInputs {
             workers: workers.iter().cloned().collect(),
             policy: Some(policy.clone()),
@@ -144,7 +146,7 @@ impl PdKvState {
             }
         }
         state.spawn_refresh();
-        state
+        Ok(state)
     }
 
     /// Test-only constructor; production always passes the configured

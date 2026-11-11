@@ -340,6 +340,7 @@ impl Router {
                 );
             supervisor.set_api_key(ctx.router_config.api_key.clone());
             supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
+            supervisor.set_snapshot_sources(ctx.router_config.kv_snapshot_sources.clone())?;
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
                     static_kv_event_sources,
@@ -3421,6 +3422,334 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    struct SnapshotCompletionFixture {
+        router: Arc<Router>,
+        workers: Vec<Arc<dyn Worker>>,
+        publishers: Vec<zmq::Socket>,
+        requests: tokio::sync::mpsc::UnboundedReceiver<(
+            usize,
+            bytes::Bytes,
+            tokio::sync::oneshot::Sender<()>,
+        )>,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Drop for SnapshotCompletionFixture {
+        fn drop(&mut self) {
+            self.router.kv_index_supervisor.as_ref().unwrap().shutdown();
+            for server in &self.servers {
+                server.abort();
+            }
+        }
+    }
+
+    impl SnapshotCompletionFixture {
+        async fn new() -> Self {
+            let mut router = create_test_kv_router();
+            router.retry_config.max_retries = 0;
+            let (mut supervisor, _) = crate::kv_index::KvIndexSupervisor::new_http_full_attention(
+                Client::new(),
+                crate::kv_index::HashMode::Sha256,
+            );
+            supervisor.set_strict_recovery(true);
+            let supervisor = Arc::new(supervisor);
+            let context = zmq::Context::new();
+            let (captured, requests) = tokio::sync::mpsc::unbounded_channel();
+            let mut workers = Vec::new();
+            let mut publishers = Vec::new();
+            let mut servers = Vec::new();
+            for index in 0..2 {
+                let publisher = context.socket(zmq::XPUB).unwrap();
+                publisher.bind("tcp://127.0.0.1:*").unwrap();
+                let endpoint = publisher.get_last_endpoint().unwrap().unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let source = url.clone();
+                let captured = captured.clone();
+                let app = axum::Router::new()
+                    .route("/get_server_info", axum::routing::get(move || {
+                        let source = source.clone();
+                        async move { Json(serde_json::json!({"model_id":"qwen3","instance_id":source,"kv_block_size":16})) }
+                    }))
+                    .route("/kv_event_sources", axum::routing::get(move || {
+                        let endpoint = endpoint.clone();
+                        async move { Json(serde_json::json!({"0":{"endpoint":endpoint,"publisher":"zmq","encoding":"msgpack","schema_version":1,"enable_kv_cache_events":true}})) }
+                    }))
+                    .route("/v1/completions", axum::routing::post(move |body: bytes::Bytes| {
+                        let captured = captured.clone();
+                        async move {
+                            let (release, wait) = tokio::sync::oneshot::channel();
+                            captured.send((index, body, release)).unwrap();
+                            wait.await.unwrap();
+                            Json(serde_json::json!({"choices":[{"text":"ok","finish_reason":"stop"}]}))
+                        }
+                    }));
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap()
+                }));
+                let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(url, WorkerType::Regular));
+                router.worker_registry.register(worker.clone());
+                let info = supervisor.on_worker_added(worker.url()).await.unwrap();
+                let policy = router.policy_registry.get_default_policy();
+                kv_aware_ops(policy.as_ref()).unwrap().register_worker(
+                    worker.as_ref(),
+                    Some(&info),
+                    supervisor.match_provider_for_worker(worker.url()),
+                );
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        match publisher.recv_bytes(zmq::DONTWAIT) {
+                            Ok(subscription) => {
+                                assert_eq!(subscription, [1]);
+                                break;
+                            }
+                            Err(zmq::Error::EAGAIN) => tokio::task::yield_now().await,
+                            Err(error) => panic!("subscription handshake: {error}"),
+                        }
+                    }
+                })
+                .await
+                .expect("real ZMQ subscriber handshake");
+                workers.push(worker);
+                publishers.push(publisher);
+            }
+            router.kv_index_supervisor = Some(supervisor);
+            Self {
+                router: Arc::new(router),
+                workers,
+                publishers,
+                requests,
+                servers,
+            }
+        }
+
+        fn begin(
+            &self,
+            index: usize,
+            transcript: &crate::kv_index::snapshot_proof::Transcript,
+        ) -> crate::kv_index::snapshot_proof::Attempt {
+            self.router
+                .kv_index_supervisor
+                .as_ref()
+                .unwrap()
+                .begin_snapshot_proof(self.workers[index].url(), transcript.identity.clone())
+        }
+
+        fn assert_prefix(&self, index: usize, first: u32, present: bool) {
+            use crate::kv_index::{MatchQuery, StorageTier};
+            let policy = self.router.policy_registry.get_default_policy();
+            let kv = kv_aware_policy(policy.as_ref()).unwrap();
+            let target = kv.target_for_worker(self.workers[index].as_ref());
+            let hits = self
+                .router
+                .kv_index_supervisor
+                .as_ref()
+                .unwrap()
+                .match_provider_for_worker(self.workers[index].url())
+                .unwrap()
+                .find_tiered_matches(&MatchQuery {
+                    group_idx: 0,
+                    local_hashes: crate::policies::KvAwarePolicy::local_hashes(
+                        &(first..first + 33).collect::<Vec<_>>(),
+                        16,
+                    ),
+                    tiers_of_interest: vec![StorageTier::Device],
+                });
+            let own: Vec<_> = hits.iter().filter(|hit| hit.target == target).collect();
+            if present {
+                assert_eq!(own.len(), 1);
+                assert_eq!(own[0].target.dp_rank, 0);
+                assert_eq!(own[0].tier, StorageTier::Device);
+                assert_eq!(own[0].segments, [(0, 2)]);
+            } else {
+                assert!(own.is_empty(), "unexpected prefix: {own:?}");
+            }
+        }
+
+        async fn request_a(&mut self, first: u32, expected: u64) {
+            let policy = self.router.policy_registry.get_default_policy();
+            let kv = kv_aware_policy(policy.as_ref()).unwrap();
+            let manager = kv.slot_manager().unwrap();
+            let a = kv.target_for_worker(self.workers[0].as_ref());
+            let b = kv.target_for_worker(self.workers[1].as_ref());
+            manager.begin_prefill(&b, 100);
+            self.workers[1].increment_load();
+            let raw = bytes::Bytes::from(format!(
+                " {{ \"model\":\"qwen3\", \"prompt\":{} }} ",
+                serde_json::to_string(&(first..first + 33).collect::<Vec<_>>()).unwrap()
+            ));
+            let request = Arc::new(serde_json::from_slice(&raw).unwrap());
+            let router = self.router.clone();
+            let task = tokio::spawn({
+                let raw = raw.clone();
+                async move { router.route_completion_raw(None, request, raw, None).await }
+            });
+            let (backend, body, release) =
+                tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let held = manager.sample(&a);
+            let held_loads = (self.workers[0].load(), self.workers[1].load());
+            release.send(()).unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            let status = response.status();
+            let response_body = to_bytes(response.into_body(), usize::MAX).await;
+            let a_after = manager.sample(&a);
+            let b_after = manager.sample(&b);
+            manager.begin_decode(&b, &b, 100);
+            manager.free(&b);
+            self.workers[1].decrement_load();
+            eprintln!("snapshot HTTP source=A first={first} backend={backend} held={held:?} expected={expected}; both reservations released before assertions");
+            assert_eq!(backend, 0);
+            assert_eq!(body, raw);
+            assert_eq!(status, StatusCode::OK);
+            response_body.unwrap();
+            assert_eq!(held.active_prefill_tokens, expected);
+            assert_eq!(held.active_requests, 1);
+            assert_eq!(held_loads, (1, 1));
+            assert_eq!(a_after, crate::policies::LoadSample::default());
+            assert_eq!(b_after.active_prefill_tokens, 100);
+            assert_eq!(manager.sample(&b), crate::policies::LoadSample::default());
+            assert_eq!((self.workers[0].load(), self.workers[1].load()), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_cold_snapshot_restores_credit_without_initial_history() {
+        let transcript = crate::kv_index::snapshot_proof::fixture("regular_snapshot.json");
+        assert!(
+            transcript.watermark >= 1,
+            "seq0 already outside retained history"
+        );
+        assert!(transcript.retained_from > 0);
+        let mut fixture = SnapshotCompletionFixture::new().await;
+        let attempt = fixture.begin(0, &transcript);
+        fixture.request_a(100, 33).await;
+        let mut corrupt = transcript.clone();
+        corrupt.descriptor_count += 1;
+        assert_eq!(attempt.install(&corrupt), Err("incomplete/range"));
+        fixture.assert_prefix(0, 100, false);
+        // Even a seq0 store cannot bypass snapshot-required activation.
+        fixture.publishers[0]
+            .send_multipart(
+                [
+                    b"".as_slice(),
+                    0i64.to_be_bytes().as_slice(),
+                    transcript.descriptors[0].payload.as_slice(),
+                ],
+                0,
+            )
+            .unwrap();
+        let (staged, staging) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let transcript_for_install = transcript.clone();
+        let installation = tokio::task::spawn_blocking(move || {
+            let result = attempt.install_before_publish(&transcript_for_install, || {
+                staged.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            (attempt, result)
+        });
+        tokio::time::timeout(Duration::from_secs(5), staging)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture.assert_prefix(0, 100, false);
+        fixture.request_a(100, 33).await;
+        release.send(()).unwrap();
+        let (attempt, result) = installation.await.unwrap();
+        assert!(result.unwrap());
+        fixture.request_a(100, 1).await;
+        fixture.assert_prefix(0, 100, true);
+        assert!(
+            !attempt.install(&transcript).unwrap(),
+            "single attempt publishes once"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_snapshot_suffix_remove_cannot_restore_stale_prefix() {
+        let transcript = crate::kv_index::snapshot_proof::fixture("removed_snapshot.json");
+        assert!(transcript.high_watermark > transcript.watermark);
+        assert!(transcript
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.resident));
+        let mut fixture = SnapshotCompletionFixture::new().await;
+        let attempt = fixture.begin(0, &transcript);
+        fixture.request_a(100, 33).await;
+        assert!(attempt.install(&transcript).unwrap());
+        fixture.request_a(100, 33).await;
+        fixture.assert_prefix(0, 100, false);
+        let structural = crate::kv_index::snapshot_proof::fixture("structure_snapshot.json");
+        assert!(structural.descriptors.iter().any(|entry| !entry.resident));
+        assert!(fixture.begin(0, &structural).install(&structural).unwrap());
+        fixture.request_a(100, 33).await;
+        use crate::kv_index::{MatchQuery, StorageTier};
+        let policy = fixture.router.policy_registry.get_default_policy();
+        let target = kv_aware_policy(policy.as_ref())
+            .unwrap()
+            .target_for_worker(fixture.workers[0].as_ref());
+        let hits = fixture
+            .router
+            .kv_index_supervisor
+            .as_ref()
+            .unwrap()
+            .match_provider_for_worker(fixture.workers[0].url())
+            .unwrap()
+            .find_tiered_matches(&MatchQuery {
+                group_idx: 0,
+                local_hashes: crate::policies::KvAwarePolicy::local_hashes(
+                    &(100..133).collect::<Vec<_>>(),
+                    16,
+                ),
+                tiers_of_interest: vec![StorageTier::Device],
+            });
+        let own: Vec<_> = hits.iter().filter(|hit| hit.target == target).collect();
+        assert_eq!(own.len(), 1, "resident descendant remains indexed");
+        assert_eq!(
+            own[0].segments,
+            [(1, 2)],
+            "structural parent gives no residency"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_late_snapshot_cannot_replace_new_identity_or_other_source() {
+        use crate::kv_index::snapshot_proof::fixture as producer;
+        let old = producer("regular_snapshot.json");
+        let new = producer("replacement_snapshot.json");
+        let healthy = producer("healthy_b_snapshot.json");
+        assert_ne!(old.identity.cache_id, new.identity.cache_id);
+        let mut fixture = SnapshotCompletionFixture::new().await;
+        assert!(fixture.begin(1, &healthy).install(&healthy).unwrap());
+        fixture.assert_prefix(1, 500, true);
+        let late = fixture.begin(0, &old);
+        let supervisor = fixture.router.kv_index_supervisor.as_ref().unwrap();
+        supervisor.on_worker_removed(fixture.workers[0].url());
+        let info = supervisor
+            .on_worker_added(fixture.workers[0].url())
+            .await
+            .unwrap();
+        let policy = fixture.router.policy_registry.get_default_policy();
+        kv_aware_ops(policy.as_ref()).unwrap().register_worker(
+            fixture.workers[0].as_ref(),
+            Some(&info),
+            supervisor.match_provider_for_worker(fixture.workers[0].url()),
+        );
+        assert!(fixture.begin(0, &new).install(&new).unwrap());
+        assert!(!late.install(&old).unwrap());
+        fixture.request_a(100, 33).await;
+        fixture.request_a(300, 1).await;
+        fixture.assert_prefix(0, 100, false);
+        fixture.assert_prefix(0, 300, true);
+        fixture.assert_prefix(1, 500, true);
+    }
 
     struct CompletionResponseFixture {
         router: Arc<Router>,

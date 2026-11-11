@@ -7,6 +7,20 @@ pub struct ConfigValidator;
 impl ConfigValidator {
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        if !config.kv_snapshot_sources.is_empty()
+            && (!config.kv_event_strict_recovery
+                || config.connection_mode != ConnectionMode::Http
+                || config.intra_node_data_parallel_size != 1
+                || config.program_scheduling.is_some()
+                || !matches!(
+                    config.mode,
+                    RoutingMode::Regular { .. } | RoutingMode::VllmPrefillDecode { .. }
+                ))
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "snapshot enrollment requires strict HTTP Regular or sequential PD with independently addressable DP1 workers".into(),
+            });
+        }
         if let Some(ttl_secs) = config.kv_aware_session_affinity_ttl_secs {
             if !(1..=31_536_000).contains(&ttl_secs) {
                 return Err(ConfigError::InvalidValue {
