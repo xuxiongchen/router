@@ -49,6 +49,10 @@ pub struct SubscriberHandle {
 }
 
 impl SubscriberHandle {
+    pub(super) fn is_finished(&self) -> bool {
+        self.shutdown_tx.receiver_count() == 0
+    }
+
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
     }

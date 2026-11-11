@@ -308,6 +308,53 @@ struct ProgramTargetCacheEntry {
     targets: Arc<[ProgramTarget]>,
 }
 
+impl Drop for Router {
+    fn drop(&mut self) {
+        if let Some(supervisor) = &self.kv_index_supervisor {
+            supervisor.shutdown();
+        }
+        if let Some(owner) = &self._kv_signal_handle {
+            owner.abort();
+        }
+    }
+}
+
+struct SnapshotRetry {
+    worker: std::sync::Weak<dyn Worker>,
+    next_probe: Instant,
+    failures: u8,
+}
+
+async fn reconcile_snapshot_worker(
+    supervisor: &crate::kv_index::KvIndexSupervisor,
+    registry: &WorkerRegistry,
+    policy_registry: &PolicyRegistry,
+    worker: &Arc<dyn Worker>,
+) {
+    let observed = supervisor.observe_worker(worker.base_url());
+    let Ok(discovery) = tokio::time::timeout(
+        Duration::from_secs(6),
+        supervisor.discover(worker.base_url()),
+    )
+    .await
+    else {
+        return;
+    };
+    registry.with_current(worker, || {
+        if let Ok(info) = supervisor.install_observed_worker(worker.base_url(), discovery, observed)
+        {
+            let policy = policy_registry.get_default_policy();
+            if let Some(ops) = kv_aware_ops(policy.as_ref()) {
+                ops.register_worker(
+                    worker.as_ref(),
+                    Some(&info),
+                    supervisor.match_provider_for_worker(worker.base_url()),
+                );
+            }
+        }
+    });
+}
+
 const PROGRAM_MODEL_POOL_ALL: &str = "program:all";
 const PROGRAM_MODEL_POOL_FALLBACK: &str = "program:fallback:unlabeled";
 const PROGRAM_MODEL_POOL_NAMED_PREFIX: &str = "program:model:";
@@ -407,28 +454,97 @@ impl Router {
             success_threshold: ctx.router_config.health_check.success_threshold,
         };
         let mut kv_worker_info = HashMap::new();
-        let (kv_index_supervisor, kv_signal_handle) =
-            if let Some((supervisor, mut signals)) = pending_kv_supervisor {
-                let supervisor = Arc::new(supervisor);
-                for worker_url in &kv_discovery_urls {
-                    match supervisor.on_worker_added(worker_url).await {
-                        Ok(info) => {
-                            kv_worker_info.insert(worker_url.clone(), info);
-                        }
-                        Err(error) => warn!(
-                            worker_url,
-                            %error,
-                            "kv_aware discovery failed; worker will use load-only scoring"
-                        ),
+        let (kv_index_supervisor, kv_signal_handle) = if let Some((supervisor, mut signals)) =
+            pending_kv_supervisor
+        {
+            let supervisor = Arc::new(supervisor);
+            for worker_url in &kv_discovery_urls {
+                match supervisor.on_worker_added(worker_url).await {
+                    Ok(info) => {
+                        kv_worker_info.insert(worker_url.clone(), info);
                     }
+                    Err(error) => warn!(
+                        worker_url,
+                        %error,
+                        "kv_aware discovery failed; worker will use load-only scoring"
+                    ),
                 }
-                let signal_handle = Arc::new(tokio::spawn(async move {
-                    while signals.recv().await.is_some() {}
-                }));
-                (Some(supervisor), Some(signal_handle))
-            } else {
-                (None, None)
-            };
+            }
+            let owner = Arc::downgrade(&supervisor);
+            let registry = Arc::downgrade(&ctx.worker_registry);
+            let policies = Arc::downgrade(&ctx.policy_registry);
+            let has_enrollments = !ctx.router_config.kv_snapshot_sources.is_empty();
+            let signal_handle = Arc::new(tokio::spawn(async move {
+                let mut timer = tokio::time::interval(Duration::from_secs(1));
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut retries = HashMap::<String, SnapshotRetry>::new();
+                loop {
+                    tokio::select! {
+                        signal = signals.recv() => {
+                            if signal.is_none() { break; }
+                            continue;
+                        }
+                        _ = timer.tick(), if has_enrollments => {}
+                    }
+                    let (Some(owner), Some(registry), Some(policies)) =
+                        (owner.upgrade(), registry.upgrade(), policies.upgrade())
+                    else {
+                        break;
+                    };
+                    let workers = registry.get_all();
+                    retries.retain(|url, _| workers.iter().any(|worker| worker.url() == url));
+                    let mut probes = Vec::new();
+                    for worker in workers {
+                        if !owner.snapshot_consumer_finished(worker.base_url()) {
+                            if retries.get(worker.url()).is_some_and(|retry| {
+                                Instant::now() >= retry.next_probe + Duration::from_secs(30)
+                            }) {
+                                retries.remove(worker.url());
+                            }
+                            continue;
+                        }
+                        let retry = retries.entry(worker.url().to_owned()).or_insert_with(|| {
+                            SnapshotRetry {
+                                worker: Arc::downgrade(&worker),
+                                next_probe: Instant::now(),
+                                failures: 0,
+                            }
+                        });
+                        if !retry
+                            .worker
+                            .upgrade()
+                            .is_some_and(|prior| Arc::ptr_eq(&prior, &worker))
+                        {
+                            *retry = SnapshotRetry {
+                                worker: Arc::downgrade(&worker),
+                                next_probe: Instant::now(),
+                                failures: 0,
+                            };
+                        }
+                        if Instant::now() < retry.next_probe {
+                            continue;
+                        }
+                        retry.next_probe = Instant::now()
+                            + crate::kv_index::discovery::snapshot_retry_delay(retry.failures);
+                        retry.failures = retry.failures.saturating_add(1);
+                        probes.push(worker);
+                    }
+                    let mut pending = futures_util::stream::FuturesUnordered::new();
+                    for worker in &probes {
+                        pending.push(reconcile_snapshot_worker(
+                            &owner, &registry, &policies, worker,
+                        ));
+                        if pending.len() == 8 {
+                            pending.next().await;
+                        }
+                    }
+                    while pending.next().await.is_some() {}
+                }
+            }));
+            (Some(supervisor), Some(signal_handle))
+        } else {
+            (None, None)
+        };
         for url in &worker_urls {
             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
             // For now, create worker without model_id
@@ -3433,6 +3549,7 @@ mod tests {
             tokio::sync::oneshot::Sender<()>,
         )>,
         servers: Vec<tokio::task::JoinHandle<()>>,
+        _control_key: Option<tempfile::NamedTempFile>,
     }
 
     impl Drop for SnapshotCompletionFixture {
@@ -3521,7 +3638,101 @@ mod tests {
                 publishers,
                 requests,
                 servers,
+                _control_key: None,
             }
+        }
+
+        // A protocol peer for the Rust HTTP consumer, not a claim about a stock
+        // vLLM deployment. Descriptor bytes come from the existing CPU captures.
+        async fn control(denied: bool) -> (Self, Vec<Arc<SnapshotControlPeer>>) {
+            use crate::config::{PolicyConfig, RouterConfig};
+            use std::io::Write;
+
+            let mut key = tempfile::NamedTempFile::new().unwrap();
+            writeln!(key, "fixture-control-key").unwrap();
+            let (captured, requests) = tokio::sync::mpsc::unbounded_channel();
+            let mut urls = Vec::new();
+            let mut sources = HashMap::new();
+            let mut peers = Vec::new();
+            let mut servers = Vec::new();
+            for (index, fixture) in ["regular_snapshot.json", "healthy_b_snapshot.json"]
+                .into_iter()
+                .enumerate()
+            {
+                let peer = Arc::new(SnapshotControlPeer::new(fixture, denied && index == 0));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let control = peer.clone();
+                let captured = captured.clone();
+                let app = axum::Router::new()
+                    .route("/health", axum::routing::get(|| async { "ok" }))
+                    .route("/v1/models", axum::routing::get(|| async {
+                        Json(serde_json::json!({"data":[{"id":"qwen3"}]}))
+                    }))
+                    .route("/v1/kv_snapshot", axum::routing::post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                        let control = control.clone();
+                        async move { control.call(headers, body) }
+                    }))
+                    .route("/v1/completions", axum::routing::post(move |body: bytes::Bytes| {
+                        let captured = captured.clone();
+                        async move {
+                            let (release, wait) = tokio::sync::oneshot::channel();
+                            captured.send((index, body, release)).unwrap();
+                            wait.await.unwrap();
+                            Json(serde_json::json!({"choices":[{"text":"ok","finish_reason":"stop"}]}))
+                        }
+                    }));
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap()
+                }));
+                sources.insert(
+                    url.clone(),
+                    crate::config::types::KvSnapshotSource {
+                        namespace: peer.state.lock().document["identity"]["namespace"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                        rank: 0,
+                        block_size: 16,
+                        control_key_file: key.path().to_owned(),
+                    },
+                );
+                urls.push(url);
+                peers.push(peer);
+            }
+            let config = RouterConfig {
+                policy: PolicyConfig::KvAware {
+                    router_temperature: 0.0,
+                    kv_penalty_host: 0.8,
+                    kv_penalty_external: 0.6,
+                    kv_penalty_disk: 0.3,
+                    static_kv_event_sources: Default::default(),
+                },
+                kv_event_strict_recovery: true,
+                kv_snapshot_sources: sources,
+                worker_startup_timeout_secs: 5,
+                ..Default::default()
+            };
+            let ctx = Arc::new(
+                crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
+            );
+            let mut router = Router::new(urls.clone(), &ctx).await.unwrap();
+            router.retry_config.max_retries = 0;
+            let workers = urls
+                .iter()
+                .map(|url| ctx.worker_registry.get_by_url(url).unwrap())
+                .collect();
+            (
+                Self {
+                    router: Arc::new(router),
+                    workers,
+                    publishers: Vec::new(),
+                    requests,
+                    servers,
+                    _control_key: Some(key),
+                },
+                peers,
+            )
         }
 
         fn begin(
@@ -3617,6 +3828,211 @@ mod tests {
             assert_eq!(manager.sample(&b), crate::policies::LoadSample::default());
             assert_eq!((self.workers[0].load(), self.workers[1].load()), (0, 0));
         }
+    }
+
+    struct SnapshotControlState {
+        document: serde_json::Value,
+        records: Vec<serde_json::Value>,
+        denied: bool,
+        failed_capabilities: usize,
+        polls: usize,
+        acknowledged: i64,
+        leases: std::collections::HashSet<String>,
+        releases: usize,
+    }
+
+    struct SnapshotControlPeer {
+        state: Mutex<SnapshotControlState>,
+        changed: tokio::sync::Notify,
+    }
+
+    impl SnapshotControlPeer {
+        fn document(fixture: &str) -> serde_json::Value {
+            let transcript = crate::kv_index::snapshot_proof::fixture(fixture);
+            serde_json::json!({
+                "status":"complete", "schema":1, "capability":"kv-snapshot-v1", "snapshot_required":true,
+                "identity":transcript.identity, "snapshot_id":transcript.snapshot_id,
+                "watermark":transcript.watermark, "high_watermark":transcript.watermark,
+                "retained_from":transcript.retained_from, "descriptor_count":transcript.descriptor_count,
+                "digest":transcript.digest, "replay":[],
+                "descriptors":transcript.descriptors.iter().map(|entry| serde_json::json!({"payload":entry.payload,"resident":entry.resident})).collect::<Vec<_>>()
+            })
+        }
+
+        fn new(fixture: &str, denied: bool) -> Self {
+            Self {
+                state: Mutex::new(SnapshotControlState {
+                    document: Self::document(fixture),
+                    records: Vec::new(),
+                    denied,
+                    failed_capabilities: 0,
+                    polls: 0,
+                    acknowledged: -1,
+                    leases: Default::default(),
+                    releases: 0,
+                }),
+                changed: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn call(&self, headers: HeaderMap, body: serde_json::Value) -> Response {
+            assert_eq!(headers["x-kv-snapshot-control"], "fixture-control-key");
+            let operation = body["operation"].as_str().unwrap();
+            let mut state = self.state.lock();
+            let lease = body["lease_id"].as_str().unwrap_or_default().to_owned();
+            let response = if operation == "release" {
+                state.leases.remove(&lease);
+                state.releases += 1;
+                Json(serde_json::json!({"status":"complete"})).into_response()
+            } else if state.denied {
+                if operation == "capabilities" {
+                    state.failed_capabilities += 1;
+                }
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            } else if operation == "capabilities" {
+                Json(serde_json::json!({"status":"complete","schema":1,"capability":"kv-snapshot-v1","identity":state.document["identity"],"limits":{"lease_seconds":4.0}})).into_response()
+            } else if body["identity"] != state.document["identity"] {
+                StatusCode::CONFLICT.into_response()
+            } else if operation == "open" {
+                state.leases.insert(lease.clone());
+                state.polls = 0;
+                state.acknowledged = -1;
+                let mut document = state.document.clone();
+                document["lease_id"] = lease.into();
+                Json(document).into_response()
+            } else if state.leases.contains(&lease) && matches!(operation, "catch_up" | "live") {
+                let after = body["after"]
+                    .as_i64()
+                    .unwrap_or_else(|| state.document["watermark"].as_i64().unwrap());
+                let high = state
+                    .records
+                    .last()
+                    .map_or(state.document["watermark"].as_i64().unwrap(), |record| {
+                        record["seq"].as_i64().unwrap()
+                    });
+                let replay: Vec<_> = state
+                    .records
+                    .iter()
+                    .filter(|record| record["seq"].as_i64().unwrap() > after)
+                    .cloned()
+                    .collect();
+                if operation == "live" {
+                    state.polls += 1;
+                    state.acknowledged = after;
+                }
+                Json(serde_json::json!({"status":"complete","identity":state.document["identity"],"lease_id":lease,"high_watermark":high,"retained_from":state.document["retained_from"],"replay":replay})).into_response()
+            } else {
+                StatusCode::BAD_REQUEST.into_response()
+            };
+            drop(state);
+            self.changed.notify_waiters();
+            response
+        }
+
+        async fn wait(&self, condition: impl Fn(&SnapshotControlState) -> bool) -> bool {
+            tokio::time::timeout(Duration::from_secs(12), async {
+                loop {
+                    let changed = self.changed.notified();
+                    if condition(&self.state.lock()) {
+                        break;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_control_live_remove_changes_actual_reservation() {
+        let (mut fixture, peers) = SnapshotCompletionFixture::control(true).await;
+        fixture.request_a(100, 33).await;
+        peers[0].state.lock().denied = false;
+        let installed = peers[0].wait(|state| state.polls >= 2).await;
+        eprintln!("initial-denial automatic recovery observed={installed}");
+        fixture.request_a(100, 1).await;
+        assert!(
+            peers[0].wait(|state| state.polls >= 2).await,
+            "actual install and following live poll"
+        );
+        assert!(peers[1].wait(|state| state.polls >= 2).await);
+        fixture.assert_prefix(0, 100, true);
+        let removed = crate::kv_index::snapshot_proof::fixture("removed_snapshot.json");
+        peers[0]
+            .state
+            .lock()
+            .records
+            .push(serde_json::json!({"seq":3,"payload":removed.replay[0].payload}));
+        assert!(
+            peers[0].wait(|state| state.acknowledged == 3).await,
+            "Remove was followed by its actual consumer ACK"
+        );
+        fixture.request_a(100, 33).await;
+        fixture.assert_prefix(0, 100, false);
+        fixture.assert_prefix(1, 500, true);
+    }
+
+    #[tokio::test]
+    async fn completion_control_exhausted_source_recovers_without_worker_readd() {
+        let (mut fixture, peers) = SnapshotCompletionFixture::control(false).await;
+        assert!(peers[0].wait(|state| state.polls >= 2).await);
+        assert!(peers[1].wait(|state| state.polls >= 2).await);
+        fixture.request_a(100, 1).await;
+        peers[0].state.lock().denied = true;
+        assert!(
+            peers[0]
+                .wait(|state| state.failed_capabilities >= 2 && state.releases >= 1)
+                .await,
+            "actual consumer exhausted its three-attempt budget"
+        );
+        fixture.request_a(100, 33).await;
+        fixture.assert_prefix(1, 500, true);
+        peers[0].state.lock().denied = false;
+        // A bounded failed recovery still reaches the actual cost assertion on
+        // the old implementation, rather than failing merely on a timeout.
+        let recovered = peers[0]
+            .wait(|state| {
+                state.polls >= 2 && state.failed_capabilities >= 2 && state.leases.len() == 1
+            })
+            .await;
+        eprintln!("same-identity automatic recovery observed={recovered}");
+        fixture.request_a(100, 1).await;
+        assert!(Arc::ptr_eq(
+            &fixture.workers[0],
+            &fixture
+                .router
+                .worker_registry
+                .get_by_url(fixture.workers[0].url())
+                .unwrap()
+        ));
+        fixture.assert_prefix(1, 500, true);
+    }
+
+    #[tokio::test]
+    async fn completion_control_same_url_replacement_recovers() {
+        let (mut fixture, peers) = SnapshotCompletionFixture::control(false).await;
+        assert!(peers[0].wait(|state| state.polls >= 2).await);
+        fixture.request_a(100, 1).await;
+        {
+            let mut state = peers[0].state.lock();
+            state.document = SnapshotControlPeer::document("replacement_snapshot.json");
+            state.polls = 0;
+            state.acknowledged = -1;
+        }
+        assert!(
+            peers[0].wait(|state| state.polls >= 2).await,
+            "same URL new source/cache/stream was rediscovered"
+        );
+        fixture.request_a(100, 33).await;
+        fixture.request_a(300, 1).await;
+        fixture.assert_prefix(0, 100, false);
+        fixture.assert_prefix(1, 500, true);
+        assert_eq!(
+            peers[0].state.lock().leases.len(),
+            1,
+            "old release did not remove the replacement lease"
+        );
     }
 
     #[tokio::test]

@@ -84,25 +84,32 @@ impl Attempt {
         }
     }
 
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     pub(crate) fn install(&self, transcript: &Transcript) -> Result<bool, &'static str> {
         self.install_before_publish(transcript, || {})
     }
 
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     pub(crate) fn install_before_publish(
         &self,
         transcript: &Transcript,
         before_publish: impl FnOnce(),
     ) -> Result<bool, &'static str> {
-        let (mut stores, mut structural_removals, mut suffix) =
-            validate(transcript, &self.expected)?;
+        self.install_batches(
+            validate(transcript, &self.expected)?.batches,
+            before_publish,
+        )
+    }
+
+    fn install_batches(
+        &self,
+        mut batches: Vec<KVEventBatch>,
+        before_publish: impl FnOnce(),
+    ) -> Result<bool, &'static str> {
         // Wire rank is the global Engine rank; the independently addressable
         // DP1 HTTP target has local rank zero. Validate first, then translate
         // only the index target, never the remote identity or journal cursor.
-        for batch in stores
-            .iter_mut()
-            .chain(&mut structural_removals)
-            .chain(&mut suffix)
-        {
+        for batch in &mut batches {
             batch.data_parallel_rank = Some(self.index_rank);
         }
         if Instant::now() >= self.deadline {
@@ -123,7 +130,7 @@ impl Attempt {
                         if Instant::now() >= self.deadline {
                             return false;
                         }
-                        for batch in stores.iter().chain(&structural_removals).chain(&suffix) {
+                        for batch in &batches {
                             apply_batch(
                                 &self.indexer,
                                 &self.source,
@@ -175,7 +182,46 @@ fn batch(payload: &[u8], expected: &Identity) -> Result<KVEventBatch, &'static s
     Ok(batch)
 }
 
-type Plan = (Vec<KVEventBatch>, Vec<KVEventBatch>, Vec<KVEventBatch>);
+const MAX_RECORDS: usize = 4096;
+const MAX_BYTES: usize = 1024 * 1024;
+
+pub(super) struct Plan {
+    batches: Vec<KVEventBatch>,
+    history: DescriptionHistory,
+    payload_bytes: usize,
+    suffix_frames: usize,
+}
+
+impl Plan {
+    fn append_range(
+        &mut self,
+        range: &Range,
+        identity: &Identity,
+        lease: &str,
+        after: i64,
+    ) -> Result<(), &'static str> {
+        let bytes = self.payload_bytes
+            + range
+                .replay
+                .iter()
+                .map(|record| record.payload.len())
+                .sum::<usize>();
+        let frames = self.suffix_frames + range.replay.len();
+        if bytes > MAX_BYTES || frames > MAX_RECORDS {
+            return Err("capacity");
+        }
+        self.batches.extend(range_batches(
+            range,
+            identity,
+            lease,
+            after,
+            &mut self.history,
+        )?);
+        self.payload_bytes = bytes;
+        self.suffix_frames = frames;
+        Ok(())
+    }
+}
 
 #[derive(Default)]
 struct DescriptionHistory {
@@ -213,8 +259,8 @@ impl DescriptionHistory {
                                 return Err("conflicting descriptor");
                             }
                         } else {
-                            if self.blocks.len() >= 4096
-                                || self.token_bytes + tokens.len() * 4 > 1024 * 1024
+                            if self.blocks.len() >= MAX_RECORDS
+                                || self.token_bytes + tokens.len() * 4 > MAX_BYTES
                             {
                                 return Err("descriptor capacity");
                             }
@@ -255,8 +301,6 @@ pub(super) fn validate(transcript: &Transcript, expected: &Identity) -> Result<P
         || transcript.high_watermark < transcript.watermark
         || transcript.high_watermark == i64::MAX
         || transcript.retained_from > transcript.watermark + 1
-        || transcript.descriptors.len() > 4096
-        || transcript.replay.len() > 4096
         || transcript.descriptor_count != transcript.descriptors.len()
         || transcript.high_watermark - transcript.watermark != transcript.replay.len() as i64
     {
@@ -268,7 +312,10 @@ pub(super) fn validate(transcript: &Transcript, expected: &Identity) -> Result<P
         .map(|entry| entry.payload.len())
         .chain(transcript.replay.iter().map(|entry| entry.payload.len()))
         .sum();
-    if bytes > 1024 * 1024 {
+    if bytes > MAX_BYTES
+        || transcript.descriptors.len() > MAX_RECORDS
+        || transcript.replay.len() > MAX_RECORDS
+    {
         return Err("capacity");
     }
     let mut digest = Sha256::new();
@@ -312,23 +359,28 @@ pub(super) fn validate(transcript: &Transcript, expected: &Identity) -> Result<P
     if actual_digest != transcript.digest {
         return Err("digest");
     }
-    let mut suffix = Vec::new();
+    stores.extend(removals);
     for (offset, record) in transcript.replay.iter().enumerate() {
         if record.seq != transcript.watermark + 1 + offset as i64 {
             return Err("gap/conflict");
         }
         let decoded = batch(&record.payload, expected)?;
         seen.check(&decoded, expected)?;
-        suffix.push(decoded);
+        stores.push(decoded);
     }
-    Ok((stores, removals, suffix))
+    Ok(Plan {
+        batches: stores,
+        history: seen,
+        payload_bytes: bytes,
+        suffix_frames: transcript.replay.len(),
+    })
 }
 
-fn validate_open(transcript: &Transcript, expected: &Identity) -> Result<(), &'static str> {
+fn validate_open(transcript: &Transcript, expected: &Identity) -> Result<Plan, &'static str> {
     if transcript.high_watermark != transcript.watermark || !transcript.replay.is_empty() {
         return Err("open cut");
     }
-    validate(transcript, expected).map(|_| ())
+    validate(transcript, expected)
 }
 
 #[derive(Clone)]
@@ -348,10 +400,17 @@ impl Enrollment {
         std::fs::File::open(&config.control_key_file)
             .and_then(|file| file.take(4097).read_to_string(&mut key))
             .map_err(|_| "cannot read snapshot control credential")?;
-        if key.len() > 4096 || key.trim().is_empty() {
+        if key.len() > 4096 {
             return Err("invalid snapshot control credential".into());
         }
-        let mut control_key = reqwest::header::HeaderValue::from_str(key.trim())
+        let key = key
+            .strip_suffix("\r\n")
+            .or_else(|| key.strip_suffix('\n'))
+            .unwrap_or(&key);
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err("invalid snapshot control credential".into());
+        }
+        let mut control_key = reqwest::header::HeaderValue::from_str(key)
             .map_err(|_| "invalid snapshot control credential")?;
         control_key.set_sensitive(true);
         Ok(Self {
@@ -490,7 +549,30 @@ impl Control {
             }
             bytes.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&bytes).map_err(|_| "control schema")
+        serde_json::from_slice(&bytes).map_err(|_| {
+            #[derive(Deserialize)]
+            struct Refusal<'a> {
+                status: &'a str,
+                reason: &'a str,
+            }
+            match serde_json::from_slice::<Refusal>(&bytes) {
+                Ok(
+                    Refusal {
+                        status: "capacity",
+                        reason: "snapshot_bytes_full",
+                    }
+                    | Refusal {
+                        status: "unavailable",
+                        reason: "catalogue_capacity",
+                    },
+                ) => "capacity",
+                Ok(Refusal {
+                    status: "unsupported",
+                    ..
+                }) => "unsupported capability",
+                _ => "control schema",
+            }
+        })
     }
 }
 
@@ -537,11 +619,14 @@ fn range_batches(
         || range.high_watermark < after
         || range.high_watermark == i64::MAX
         || range.retained_from > after + 1
-        || range.replay.len() > 4096
         || range.high_watermark - after != range.replay.len() as i64
-        || range.replay.iter().map(|r| r.payload.len()).sum::<usize>() > 1024 * 1024
     {
         return Err("control range");
+    }
+    if range.replay.len() > MAX_RECORDS
+        || range.replay.iter().map(|r| r.payload.len()).sum::<usize>() > MAX_BYTES
+    {
+        return Err("capacity");
     }
     let mut batches = Vec::with_capacity(range.replay.len());
     for (offset, record) in range.replay.iter().enumerate() {
@@ -599,49 +684,31 @@ pub(super) fn spawn(
                 }
                 identity = Some(expected.clone());
                 let ttl = Duration::from_secs_f64(caps.limits.lease_seconds);
-                let mut snapshot: Transcript = control
+                let snapshot: Transcript = control
                     .call("open", Some(expected), Some(&remote_lease), None)
                     .await?;
                 if snapshot.lease_id != remote_lease {
                     return Err("open lease");
                 }
-                validate_open(&snapshot, expected)?;
-                let mut history = DescriptionHistory::default();
-                for d in &snapshot.descriptors {
-                    history.check(&batch(&d.payload, expected)?, expected)?;
-                }
+                let mut plan = validate_open(&snapshot, expected)?;
+                let watermark = snapshot.watermark;
+                drop(snapshot);
                 let catchup: Range = control
                     .call("catch_up", Some(expected), Some(&remote_lease), None)
                     .await?;
-                range_batches(
-                    &catchup,
-                    expected,
-                    &remote_lease,
-                    snapshot.watermark,
-                    &mut history,
-                )?;
+                plan.append_range(&catchup, expected, &remote_lease, watermark)?;
+                let high = catchup.high_watermark;
+                drop(catchup);
                 // This is a real same-journal live poll, not a legacy ZMQ sequence.
                 // Already-received post-H Remove/Clear is folded before first visibility.
                 let live_start = tokio::time::Instant::now();
                 let first_live: Range = control
-                    .call(
-                        "live",
-                        Some(expected),
-                        Some(&remote_lease),
-                        Some(catchup.high_watermark),
-                    )
+                    .call("live", Some(expected), Some(&remote_lease), Some(high))
                     .await?;
                 let mut expires = live_start + ttl;
-                range_batches(
-                    &first_live,
-                    expected,
-                    &remote_lease,
-                    catchup.high_watermark,
-                    &mut history,
-                )?;
-                snapshot.replay = catchup.replay;
-                snapshot.replay.extend(first_live.replay);
-                snapshot.high_watermark = first_live.high_watermark;
+                plan.append_range(&first_live, expected, &remote_lease, high)?;
+                let mut cursor = first_live.high_watermark;
+                drop(first_live);
                 let mut install = Attempt::new(
                     owned.indexer.clone(),
                     owned.source.clone(),
@@ -655,10 +722,10 @@ pub(super) fn spawn(
                 }
                 install.deadline =
                     Instant::now() + expires.saturating_duration_since(tokio::time::Instant::now());
-                if !install.install(&snapshot)? {
+                if !install.install_batches(plan.batches, || {})? {
                     return Err("stale install");
                 }
-                let mut cursor = snapshot.high_watermark;
+                let mut history = plan.history;
                 let period = Duration::from_secs_f64((caps.limits.lease_seconds / 4.0).min(0.25));
                 loop {
                     let _ = signals.try_send(super::IngestionSignal::Advance {
@@ -732,7 +799,17 @@ pub(super) fn spawn(
             if let Err(reason) = result {
                 tracing::debug!(reason, "KV snapshot source stopped");
             }
-            if canceled || !lease.is_active() {
+            // A new transport attempt cannot make this cut fit a fixed local
+            // or producer limit. Leave a later discovery to the lifecycle owner.
+            let needs_rediscovery = matches!(
+                result,
+                Err("capacity"
+                    | "control size"
+                    | "capability identity"
+                    | "unsupported capability"
+                    | "source replacement requires rediscovery")
+            ) || (!made_progress && result == Err("descriptor capacity"));
+            if canceled || !lease.is_active() || needs_rediscovery {
                 return;
             }
             // A bounded semantic history is renewed by a new snapshot, never by
@@ -789,6 +866,37 @@ mod tests {
             ("http://localhost:8000", false),
         ] {
             assert_eq!(control_origin(worker).is_ok(), expected, "{worker}");
+        }
+    }
+
+    #[test]
+    fn snapshot_credentials_accept_one_line_ending_not_padding() {
+        let key = tempfile::NamedTempFile::new().unwrap();
+        let config = crate::config::types::KvSnapshotSource {
+            namespace: "test".into(),
+            rank: 0,
+            block_size: 16,
+            control_key_file: key.path().to_owned(),
+        };
+        for (input, accepted) in [
+            ("test-key", true),
+            ("test-key\n", true),
+            ("test-key\r\n", true),
+            (" test-key", false),
+            ("test-key ", false),
+            ("test-key\n\n", false),
+            ("test-key\r", false),
+            ("test\tkey", false),
+            ("té", false),
+            ("", false),
+        ] {
+            std::fs::write(key.path(), input).unwrap();
+            let result = Enrollment::load(config.clone());
+            assert_eq!(result.is_ok(), accepted);
+            if let Ok(enrolled) = result {
+                assert!(enrolled.control_key.is_sensitive());
+                assert_eq!(enrolled.control_key.as_bytes(), b"test-key");
+            }
         }
     }
 
@@ -920,6 +1028,40 @@ mod tests {
             }
             assert!(validate_open(&changed, &valid.identity).is_err(), "{case}");
         }
+    }
+
+    #[test]
+    fn snapshot_install_limit_covers_the_combined_suffix() {
+        let mut open = super::super::snapshot_proof::fixture("regular_snapshot.json");
+        let payload = open.replay[0].payload.clone();
+        open.replay.clear();
+        open.high_watermark = open.watermark;
+        let mut plan = validate_open(&open, &open.identity).unwrap();
+        // Each reply fits by itself. The accepted cut and catch-up leave too
+        // little room for the first live reply; it must never be installed.
+        let room = ((MAX_BYTES - plan.payload_bytes) / payload.len()).min(MAX_RECORDS);
+        assert!(room >= 2);
+        let range = |after, count: usize| Range {
+            status: "complete".into(),
+            identity: open.identity.clone(),
+            lease_id: open.lease_id.clone(),
+            high_watermark: after + count as i64,
+            retained_from: open.watermark + 1,
+            replay: (1..=count)
+                .map(|i| Record {
+                    seq: after + i as i64,
+                    payload: payload.clone(),
+                })
+                .collect(),
+        };
+        let cut = range(open.watermark, room - 1);
+        plan.append_range(&cut, &open.identity, &open.lease_id, open.watermark)
+            .unwrap();
+        let live = range(cut.high_watermark, 2);
+        assert_eq!(
+            plan.append_range(&live, &open.identity, &open.lease_id, cut.high_watermark),
+            Err("capacity")
+        );
     }
 
     #[tokio::test]

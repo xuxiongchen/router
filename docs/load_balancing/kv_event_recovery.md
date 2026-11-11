@@ -44,6 +44,36 @@ worker's KV automatically just to make the Router exact; a clear must be an
 explicit operational action against the publisher. Snapshot/anchor support is
 follow-up work under #426, not implemented by this flag.
 
+### Worker-local snapshot enrollment (native Router CLI)
+
+For an independently addressable full-attention HTTP engine, enable strict recovery and pass
+`--kv-snapshot-sources-file <file.json>` to the native Router. Example enrollment:
+
+```json
+{
+  "https://worker.example:8443": {
+    "namespace": "pool-a",
+    "rank": 3,
+    "block_size": 16,
+    "control_key_file": "/run/secrets/router-kv-control"
+  }
+}
+```
+
+The producer must support the control capability and match this namespace, block size and global engine rank.
+One engine may have a nonzero global rank; this is not a multi-engine load-balanced endpoint or multi-rank inference contract.
+The profile grants worker-local credit only, with no lookahead, adapters, shared-pool or Hybrid credit.
+Use verified HTTPS, except for literal loopback HTTP in development. The control credential is distinct from normal
+inference authorization. Both endpoints read visible ASCII without whitespace; a single terminating LF or CRLF is allowed.
+Do not include a key in the enrollment JSON or log control payloads.
+
+The initial install allows at most 4,096 descriptors, 4,096 suffix records and 1 MiB of wire payload **across**
+the snapshot, catch-up and first live response. Semantic history separately limits distinct blocks to 4,096 and
+stored token IDs to 1 MiB (four bytes per ID). The reference producer defaults to 16,384 retained descriptors,
+4 MiB of catalogue descriptions and an 8 MiB snapshot response bound. These measure different things;
+a producer-complete snapshot may still exceed the Router's limits. It earns no credit, but the Worker remains routable.
+A deployment needs to satisfy both sides; a software version number is not a capability.
+
 ### Legacy protocol assumptions
 
 Strict recovery is conservative within the existing event contract, not an

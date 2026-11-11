@@ -18,6 +18,10 @@ use crate::kv_index::subscriber::{EventSource, SubscriberHandle};
 use crate::kv_index::{HashMode, IngestionSignal, SourceId, SourceRecoveryReason};
 use crate::protocols::worker_spec::ServerInfo;
 
+pub(crate) fn snapshot_retry_delay(failures: u8) -> Duration {
+    Duration::from_secs((1u64 << failures.min(5)).min(30))
+}
+
 /// The worker-stable core of a cache identity. One indexer per key.
 ///
 /// ponytail: full per-block identity isolation needs `lora_name`/`extra_keys`
@@ -231,10 +235,32 @@ impl KvIndexSupervisor {
         Ok(())
     }
 
-    fn snapshot_source(&self, worker: &str) -> Option<&super::snapshot::Enrollment> {
+    pub(super) fn snapshot_source(&self, worker: &str) -> Option<&super::snapshot::Enrollment> {
         super::endpoints::canonical_worker(worker)
             .ok()
             .and_then(|(origin, _)| self.snapshot_sources.get(&origin))
+    }
+
+    /// Completion is owned by the consumer task, not inferred from metadata.
+    pub(crate) fn snapshot_consumer_finished(&self, worker: &str) -> bool {
+        self.snapshot_source(worker).is_some()
+            && self.workers.lock().get(worker).is_none_or(|registration| {
+                registration
+                    .handles
+                    .iter()
+                    .any(SubscriberHandle::is_finished)
+            })
+    }
+
+    pub(crate) fn snapshot_enrolled(&self, worker: &str) -> bool {
+        self.snapshot_source(worker).is_some()
+    }
+
+    pub(crate) fn observe_worker(&self, worker: &str) -> Option<Arc<AtomicBool>> {
+        self.workers
+            .lock()
+            .get(worker)
+            .map(|entry| entry.active.clone())
     }
 
     pub fn with_static_sources(
@@ -251,11 +277,7 @@ impl KvIndexSupervisor {
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
         // Discovery awaits without the owner lock. A failed/stale re-add must
         // leave the prior registration and its observed placement intact.
-        let observed = self
-            .workers
-            .lock()
-            .get(worker_url)
-            .map(|worker| worker.active.clone());
+        let observed = self.observe_worker(worker_url);
         let discovery = self.discover(worker_url).await;
         self.install_observed_worker(worker_url, discovery, observed)
     }
@@ -328,20 +350,16 @@ impl KvIndexSupervisor {
         }
     }
 
-    pub(crate) fn install_worker(
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    fn install_worker(
         &self,
         worker_url: &str,
         discovery: WorkerDiscovery,
     ) -> Result<WorkerKvInfo, String> {
-        let observed = self
-            .workers
-            .lock()
-            .get(worker_url)
-            .map(|worker| worker.active.clone());
-        self.install_observed_worker(worker_url, discovery, observed)
+        self.install_observed_worker(worker_url, discovery, self.observe_worker(worker_url))
     }
 
-    fn install_observed_worker(
+    pub(crate) fn install_observed_worker(
         &self,
         worker_url: &str,
         discovery: WorkerDiscovery,
@@ -3373,6 +3391,8 @@ vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",e
             )
             .unwrap();
         let info = supervisor.on_worker_added(&worker).await.unwrap();
+        assert!(!supervisor.snapshot_consumer_finished(&worker));
+        let original_registration = supervisor.observe_worker(&worker).unwrap();
         assert_eq!(info.ranks, [0]);
         assert_eq!(info.block_size, Some(16));
         assert_eq!(&*info.cache_key.unwrap().model, "mock-model");
@@ -3392,6 +3412,22 @@ vllm:cache_config_info{block_size=\"16\",effective_attention_block_size=\"16\",e
                 .ranks,
             [0]
         );
+        // This peer supplies capabilities but cannot serve open: its real
+        // control task must finish, and the same metadata can then enroll a
+        // new physical consumer instead of remaining permanently unchanged.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !supervisor.snapshot_consumer_finished(&worker) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed control consumer must expose completion");
+        supervisor.on_worker_added(&worker).await.unwrap();
+        assert!(!Arc::ptr_eq(
+            &original_registration,
+            &supervisor.observe_worker(&worker).unwrap()
+        ));
+        assert!(!supervisor.snapshot_consumer_finished(&worker));
         supervisor.shutdown();
         server.abort();
         alias_server.abort();
