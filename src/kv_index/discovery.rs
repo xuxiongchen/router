@@ -18,6 +18,10 @@ use crate::kv_index::subscriber::{EventSource, SubscriberHandle};
 use crate::kv_index::{HashMode, IngestionSignal, SourceId, SourceRecoveryReason};
 use crate::protocols::worker_spec::ServerInfo;
 
+pub(crate) fn snapshot_retry_delay(failures: u8) -> Duration {
+    Duration::from_secs((1u64 << failures.min(5)).min(30))
+}
+
 /// The worker-stable core of a cache identity. One indexer per key.
 ///
 /// ponytail: full per-block identity isolation needs `lora_name`/`extra_keys`
@@ -106,6 +110,7 @@ pub struct KvIndexSupervisor {
     hash_mode: HashMode,
     full_attention_http: bool,
     strict_recovery: bool,
+    snapshot_sources: HashMap<String, super::snapshot::Enrollment>,
     http_pd: bool,
     /// Explicit event sources override discovery for configured regular workers.
     static_sources: HashMap<String, StaticKvEventSources>,
@@ -150,6 +155,7 @@ impl KvIndexSupervisor {
             hash_mode,
             full_attention_http: false,
             strict_recovery: false,
+            snapshot_sources: HashMap::new(),
             http_pd: false,
             static_sources: HashMap::new(),
             static_pd_sources: HashMap::new(),
@@ -207,6 +213,55 @@ impl KvIndexSupervisor {
         self.api_key = api_key;
     }
 
+    pub(crate) fn set_snapshot_sources(
+        &mut self,
+        sources: HashMap<String, crate::config::types::KvSnapshotSource>,
+    ) -> Result<(), String> {
+        let mut enrolled = HashMap::new();
+        for (worker, config) in sources {
+            let url = reqwest::Url::parse(&worker).map_err(|_| "invalid snapshot worker")?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err("snapshot worker must use HTTP".into());
+            }
+            let origin = super::endpoints::canonical_worker(&worker)?.0;
+            if enrolled
+                .insert(origin, super::snapshot::Enrollment::load(config)?)
+                .is_some()
+            {
+                return Err("duplicate snapshot worker origin".into());
+            }
+        }
+        if !enrolled.is_empty() && !self.strict_recovery {
+            return Err("snapshot control requires strict recovery".into());
+        }
+        self.snapshot_sources = enrolled;
+        Ok(())
+    }
+
+    pub(super) fn snapshot_source(&self, worker: &str) -> Option<&super::snapshot::Enrollment> {
+        super::endpoints::canonical_worker(worker)
+            .ok()
+            .and_then(|(origin, _)| self.snapshot_sources.get(&origin))
+    }
+
+    /// Completion is owned by the consumer task, not inferred from metadata.
+    pub(crate) fn snapshot_consumer_finished(&self, worker: &str) -> bool {
+        self.snapshot_source(worker).is_some()
+            && self.workers.lock().get(worker).is_none_or(|registration| {
+                registration
+                    .handles
+                    .iter()
+                    .any(SubscriberHandle::is_finished)
+            })
+    }
+
+    pub(crate) fn observe_worker(&self, worker: &str) -> Option<Arc<AtomicBool>> {
+        self.workers
+            .lock()
+            .get(worker)
+            .map(|entry| entry.active.clone())
+    }
+
     pub fn with_static_sources(
         mut self,
         static_sources: HashMap<String, StaticKvEventSources>,
@@ -221,17 +276,44 @@ impl KvIndexSupervisor {
     pub async fn on_worker_added(&self, worker_url: &str) -> Result<WorkerKvInfo, String> {
         // Discovery awaits without the owner lock. A failed/stale re-add must
         // leave the prior registration and its observed placement intact.
-        let observed = self
-            .workers
-            .lock()
-            .get(worker_url)
-            .map(|worker| worker.active.clone());
+        let observed = self.observe_worker(worker_url);
         let discovery = self.discover(worker_url).await;
         self.install_observed_worker(worker_url, discovery, observed)
     }
 
     /// Prepare metadata once; P/D refresh fingerprints and installs this same snapshot.
     pub(crate) async fn discover(&self, worker_url: &str) -> WorkerDiscovery {
+        if let Some(enrolled) = self.snapshot_source(worker_url) {
+            // /v1/models is ordinary authenticated model metadata; snapshot-only
+            // deployments do not need legacy ZMQ metadata or a dev endpoint.
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(2))
+                .build();
+            let model_id = match client {
+                Ok(client) => {
+                    query_served_model_id(&client, worker_url, self.api_key.as_deref()).await
+                }
+                Err(_) => None,
+            };
+            let capability = super::publisher_snapshot::discover(
+                enrolled.config.publisher_snapshot.clone(),
+                enrolled.config.clone(),
+            )
+            .await;
+            return WorkerDiscovery {
+                server_info: capability
+                    .map(|identity| ServerInfo {
+                        instance_id: Some(identity.source_id),
+                        model_id: model_id.clone(),
+                        kv_block_size: Some(enrolled.config.block_size),
+                        ..Default::default()
+                    })
+                    .map_err(str::to_owned),
+                sources: Ok(HashMap::new()),
+                model_id: Ok(model_id),
+            };
+        }
         if self.http_pd {
             return match self.static_pd_sources.get(worker_url) {
                 Some(config) => static_pd_discovery(worker_url, config),
@@ -271,20 +353,18 @@ impl KvIndexSupervisor {
         worker_url: &str,
         discovery: WorkerDiscovery,
     ) -> Result<WorkerKvInfo, String> {
-        let observed = self
-            .workers
-            .lock()
-            .get(worker_url)
-            .map(|worker| worker.active.clone());
-        self.install_observed_worker(worker_url, discovery, observed)
+        self.install_observed_worker(worker_url, discovery, self.observe_worker(worker_url))
     }
 
-    fn install_observed_worker(
+    pub(crate) fn install_observed_worker(
         &self,
         worker_url: &str,
         discovery: WorkerDiscovery,
         observed: Option<Arc<AtomicBool>>,
     ) -> Result<WorkerKvInfo, String> {
+        if let Some(enrollment) = self.snapshot_source(worker_url) {
+            return self.install_snapshot_worker(worker_url, discovery, observed, enrollment);
+        }
         let grpc = crate::backend::is_grpc_url(worker_url);
         let full_attention_http =
             !grpc && self.full_attention_http && !self.static_sources.contains_key(worker_url);
@@ -558,6 +638,95 @@ impl KvIndexSupervisor {
         })
     }
 
+    fn install_snapshot_worker(
+        &self,
+        worker_url: &str,
+        discovery: WorkerDiscovery,
+        observed: Option<Arc<AtomicBool>>,
+        enrollment: &super::snapshot::Enrollment,
+    ) -> Result<WorkerKvInfo, String> {
+        let model = discovery
+            .model_id?
+            .filter(|model| !model.is_empty())
+            .ok_or("snapshot worker model metadata unavailable")?;
+        let origin = super::endpoints::canonical_worker(worker_url)?.0;
+        let key = CacheKey {
+            model: Arc::from(model),
+            hash_mode: self.hash_mode,
+            block_size: enrollment.config.block_size,
+        };
+        let remote_source = discovery
+            .server_info?
+            .instance_id
+            .ok_or("snapshot source identity unavailable")?;
+        // Operator-enrolled loopback discovery binds the publisher before the
+        // recovery attempt. The same publisher/rank cannot claim two HTTP targets.
+        let source: SourceId = Arc::from(format!(
+            "snapshot:{remote_source}:{}",
+            enrollment.config.rank
+        ));
+        let mut enrollment = enrollment.clone();
+        enrollment.bound_source = Some(remote_source);
+        // Engine rank selects the remote utility target; BasicWorker/PD use
+        // worker-local DP rank zero for this independently addressable engine.
+        let rank = 0;
+        let mut workers = self.workers.lock();
+        if !match (&observed, workers.get(worker_url)) {
+            (Some(active), Some(current)) => Arc::ptr_eq(active, &current.active),
+            (None, None) => true,
+            _ => false,
+        } {
+            return Err("KV worker changed while discovery was pending".into());
+        }
+        if workers.iter().any(|(url, worker)| {
+            url != worker_url
+                && (worker.worker_origin.as_ref() == Some(&origin) || worker.source_id == source)
+        }) {
+            return Err("KV worker origins must be independent".into());
+        }
+        if let Some(previous) = workers.remove(worker_url) {
+            self.retire_worker(previous);
+        }
+        let indexer = self.acquire_identity(&key);
+        indexer.register_source(&source, rank);
+        let active = Arc::new(AtomicBool::new(true));
+        let lease = super::binding::SourceLease {
+            strict_rank: Arc::new(Mutex::new(true)),
+            active: active.clone(),
+        };
+        let handle = super::publisher_snapshot::spawn(
+            enrollment,
+            indexer.clone(),
+            source.clone(),
+            lease.clone(),
+        );
+        workers.insert(
+            worker_url.to_owned(),
+            WorkerSubs {
+                active,
+                key: key.clone(),
+                source_id: source.clone(),
+                worker_origin: Some(origin.clone()),
+                replay_endpoints: Vec::new(),
+                live_sources: vec![LiveSource {
+                    publisher: origin,
+                    topic: String::new(),
+                    rank,
+                    lease,
+                }],
+                ranks: vec![rank],
+                indexer,
+                handles: vec![handle],
+            },
+        );
+        Ok(WorkerKvInfo {
+            instance_id: source.to_string(),
+            block_size: Some(key.block_size),
+            ranks: vec![rank],
+            cache_key: Some(key),
+        })
+    }
+
     /// Shut down this worker's subscribers, clear its residency, release its
     /// identity ref.
     pub fn on_worker_removed(&self, worker_url: &str) {
@@ -588,6 +757,31 @@ impl KvIndexSupervisor {
         }
         drop(workers);
         info!("kv_index supervisor shut down");
+    }
+
+    /// Resolve policy inputs from the current registration and publish them before
+    /// retirement or replacement can change it. The callback must not await or
+    /// re-enter the supervisor.
+    pub(crate) fn with_current_worker_binding(
+        &self,
+        worker_url: &str,
+        metadata: Option<&WorkerKvInfo>,
+        bind: impl FnOnce(Option<&WorkerKvInfo>, Option<Arc<dyn crate::policies::TieredMatchProvider>>),
+    ) {
+        let workers = self.workers.lock();
+        if let Some(worker) = workers.get(worker_url) {
+            let info = WorkerKvInfo {
+                instance_id: worker.source_id.to_string(),
+                block_size: Some(worker.key.block_size),
+                ranks: worker.ranks.clone(),
+                cache_key: Some(worker.key.clone()),
+            };
+            bind(Some(&info), Some(worker.indexer.clone()));
+        } else {
+            // Preserve metadata-only Generic targets, never an index/provider
+            // from a registration that has since been retired.
+            bind(metadata.filter(|info| info.cache_key.is_none()), None);
+        }
     }
 
     /// Expose the discovered worker's live index through the policy's read-only port.

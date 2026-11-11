@@ -34,15 +34,16 @@ pool clear followed by contiguous updates, could establish one. None of these
 is implied by a worker clear or sequence zero. Compatibility mode retains its
 existing fresh-observation and sequence-zero behavior.
 
-The current wire protocol has no snapshot/watermark or producer-issued boot ID.
+The legacy wire protocol has no snapshot/watermark or producer-issued boot ID.
 After Router restart, worker re-add, or replay-buffer rollover, sequence zero
 may no longer be retained. Full reconstruction then cannot succeed, including
 when it exceeds the fixed five-second replay deadline. A healthy contiguous
 stream alone does not repair this strict-mode fallback. Keep strict recovery
 disabled unless that availability trade-off is acceptable. Do not clear a live
 worker's KV automatically just to make the Router exact; a clear must be an
-explicit operational action against the publisher. Snapshot/anchor support is
-follow-up work under #426, not implemented by this flag.
+explicit operational action against the publisher. This flag alone does not
+enable snapshot/anchor support; the enrolled experimental extension below is
+follow-up work under #426.
 
 ### Legacy protocol assumptions
 
@@ -65,6 +66,64 @@ the required changes after W, and publish recovered credit only after contiguous
 catch-up. Snapshot data must include enough prefix structure to reconstruct the
 index without mistaking structural ancestors for resident blocks. A Router's
 already-incomplete local index is not an authoritative source snapshot.
+
+## Experimental publisher snapshots
+
+An explicitly enrolled publisher can supply a bounded full-attention snapshot
+without resetting a warm worker. This is a proposed extension to
+vllm-project/vllm#57789, not a capability of an unmodified upstream endpoint.
+Only strict `kv_aware` HTTP Regular routing with independently addressable DP1
+workers is supported. P/D, shared-pool proof, adapters, offload, Hybrid layouts
+and unknown warm-cache provenance are outside this profile.
+
+The native Rust CLI accepts `--kv-snapshot-sources-file enrollment.json`:
+
+```json
+{
+  "http://127.0.0.1:8000": {
+    "namespace": "operator-enrolled-model-b32",
+    "rank": 0,
+    "block_size": 32,
+    "publisher_snapshot": {
+      "endpoint": "tcp://127.0.0.1:5557",
+      "snapshot_endpoint": "tcp://127.0.0.1:5558",
+      "topic": "kv"
+    }
+  }
+}
+```
+
+Endpoints must be literal IPv4 or IPv6 loopback TCP addresses. Both SUB and REQ
+enable IPv6 before connecting; IPv4 remains supported. Enrollment is an operator
+trust decision, not authentication or automatic metadata discovery. The producer
+must actually bind its endpoint; replacing a bind address with a loopback address
+can instead select connect behavior in some publisher versions. Inference
+credentials are not sent to the publisher.
+
+SUB precedes the strict `snapshot-full-attention-v1` request. A complete
+`full-attention-v1`, incremental-reporting manifest binds inclusive watermark W
+and live reference counts to the same 16-byte publisher UUID as the live stream.
+Teaching Store/Remove describes prefix structure without granting residency.
+Only positive live reference counts establish residency; the last Remove revokes
+it. The staged cut and a contiguous W+1 suffix are installed atomically under the
+existing registration and recovery-attempt fences. UUID change, gaps, conflicts,
+unsupported data and capacity/timeout failures revoke credit; ordinary dispatch
+remains available at full cost. Background rediscovery is bounded and rebinds only
+the current routing worker. Fixed enrolled endpoints do not imply automatic
+support for arbitrary Pod-IP or port changes.
+
+The reference limit is 4096 and **includes teaching intermediate references**.
+N single-reference live blocks can require a 2N staging peak, so more than 2048
+such live blocks can already hit this limit. The 1 MiB multipart, token-history
+and live-buffer limits impose additional independent bounds; socket queue depth
+is not an RSS bound. Exceeding a bound safely rejects recovery rather than
+granting partial credit. Scaling these limits requires separate measurement.
+The three-second live timeout requires producer heartbeat traffic. Query credit
+describes consumed event evidence, not instantaneous device residency.
+
+The in-tree captured-wire socket/HTTP regression does not require Python or a
+vLLM installation. Real Worker acceptance is a separate, explicitly provisioned
+integration exercise; fixture success alone does not establish stock support.
 
 ## Retry and lifecycle rules
 

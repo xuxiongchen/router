@@ -10,6 +10,10 @@ use sha2::{Digest, Sha256};
 pub mod discovery;
 mod endpoints;
 pub mod indexer;
+mod publisher_snapshot;
+mod snapshot;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+pub(crate) use publisher_snapshot::tests::CapturedPublisher;
 pub mod subscriber;
 pub mod types;
 pub mod wire;

@@ -206,6 +206,20 @@ impl WorkerRegistry {
         self.url_to_id.get(url).and_then(|id| self.get(&id))
     }
 
+    /// Fence a short registration update against removal/replacement of this
+    /// exact routing Worker. The callback must not access the registry or await.
+    pub(crate) fn with_current<T>(
+        &self,
+        worker: &Arc<dyn Worker>,
+        operation: impl FnOnce() -> T,
+    ) -> Option<T> {
+        // remove_by_url removes the URL mapping before it removes the ID.
+        // Pin both entries until the callback completes.
+        let id = self.url_to_id.get(worker.url())?;
+        let current = self.workers.get(id.value())?;
+        Arc::ptr_eq(current.value(), worker).then(operation)
+    }
+
     /// Get all workers for a model
     pub fn get_by_model(&self, model_id: &str) -> Vec<Arc<dyn Worker>> {
         self.model_workers
@@ -522,6 +536,32 @@ mod tests {
         // Remove worker
         registry.remove(&worker_id);
         assert!(registry.get(&worker_id).is_none());
+    }
+
+    #[test]
+    fn registration_update_rejects_removed_or_replaced_worker_arc() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            "http://worker:8080".to_owned(),
+            WorkerType::Regular,
+        ));
+        let id = registry.register(worker.clone());
+        assert_eq!(registry.with_current(&worker, || 1), Some(1));
+        registry.remove(&id);
+        assert_eq!(
+            registry.with_current(&worker, || -> () { panic!("removed worker") }),
+            None
+        );
+        let replacement: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            worker.url().to_owned(),
+            WorkerType::Regular,
+        ));
+        registry.register(replacement.clone());
+        assert_eq!(
+            registry.with_current(&worker, || -> () { panic!("stale worker") }),
+            None
+        );
+        assert_eq!(registry.with_current(&replacement, || 2), Some(2));
     }
 
     #[test]

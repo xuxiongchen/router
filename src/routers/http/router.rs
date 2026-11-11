@@ -308,6 +308,67 @@ struct ProgramTargetCacheEntry {
     targets: Arc<[ProgramTarget]>,
 }
 
+impl Drop for Router {
+    fn drop(&mut self) {
+        if let Some(supervisor) = &self.kv_index_supervisor {
+            supervisor.shutdown();
+        }
+        if let Some(owner) = &self._kv_signal_handle {
+            owner.abort();
+        }
+    }
+}
+
+struct SnapshotRetry {
+    worker: std::sync::Weak<dyn Worker>,
+    next_probe: Instant,
+    failures: u8,
+}
+
+async fn reconcile_snapshot_worker(
+    supervisor: &crate::kv_index::KvIndexSupervisor,
+    registry: &WorkerRegistry,
+    policy_registry: &PolicyRegistry,
+    worker: &Arc<dyn Worker>,
+) {
+    let observed = supervisor.observe_worker(worker.base_url());
+    let Ok(discovery) = tokio::time::timeout(
+        Duration::from_secs(6),
+        supervisor.discover(worker.base_url()),
+    )
+    .await
+    else {
+        return;
+    };
+    registry.with_current(worker, || {
+        if supervisor
+            .install_observed_worker(worker.base_url(), discovery, observed)
+            .is_ok()
+        {
+            bind_current_kv_target(Some(supervisor), policy_registry, worker.as_ref(), None);
+        }
+    });
+}
+
+fn bind_current_kv_target(
+    supervisor: Option<&crate::kv_index::KvIndexSupervisor>,
+    policies: &PolicyRegistry,
+    worker: &dyn Worker,
+    metadata: Option<&crate::kv_index::WorkerKvInfo>,
+) {
+    let policy = policies.get_default_policy();
+    let Some(ops) = kv_aware_ops(policy.as_ref()) else {
+        return;
+    };
+    if let Some(supervisor) = supervisor {
+        supervisor.with_current_worker_binding(worker.base_url(), metadata, |info, provider| {
+            ops.register_worker(worker, info, provider);
+        });
+    } else {
+        ops.register_worker(worker, metadata, None);
+    }
+}
+
 const PROGRAM_MODEL_POOL_ALL: &str = "program:all";
 const PROGRAM_MODEL_POOL_FALLBACK: &str = "program:fallback:unlabeled";
 const PROGRAM_MODEL_POOL_NAMED_PREFIX: &str = "program:model:";
@@ -340,6 +401,7 @@ impl Router {
                 );
             supervisor.set_api_key(ctx.router_config.api_key.clone());
             supervisor.set_strict_recovery(ctx.router_config.kv_event_strict_recovery);
+            supervisor.set_snapshot_sources(ctx.router_config.kv_snapshot_sources.clone())?;
             let static_sources = match &ctx.router_config.policy {
                 crate::config::PolicyConfig::KvAware {
                     static_kv_event_sources,
@@ -406,28 +468,97 @@ impl Router {
             success_threshold: ctx.router_config.health_check.success_threshold,
         };
         let mut kv_worker_info = HashMap::new();
-        let (kv_index_supervisor, kv_signal_handle) =
-            if let Some((supervisor, mut signals)) = pending_kv_supervisor {
-                let supervisor = Arc::new(supervisor);
-                for worker_url in &kv_discovery_urls {
-                    match supervisor.on_worker_added(worker_url).await {
-                        Ok(info) => {
-                            kv_worker_info.insert(worker_url.clone(), info);
-                        }
-                        Err(error) => warn!(
-                            worker_url,
-                            %error,
-                            "kv_aware discovery failed; worker will use load-only scoring"
-                        ),
+        let (kv_index_supervisor, kv_signal_handle) = if let Some((supervisor, mut signals)) =
+            pending_kv_supervisor
+        {
+            let supervisor = Arc::new(supervisor);
+            for worker_url in &kv_discovery_urls {
+                match supervisor.on_worker_added(worker_url).await {
+                    Ok(info) => {
+                        kv_worker_info.insert(worker_url.clone(), info);
                     }
+                    Err(error) => warn!(
+                        worker_url,
+                        %error,
+                        "kv_aware discovery failed; worker will use load-only scoring"
+                    ),
                 }
-                let signal_handle = Arc::new(tokio::spawn(async move {
-                    while signals.recv().await.is_some() {}
-                }));
-                (Some(supervisor), Some(signal_handle))
-            } else {
-                (None, None)
-            };
+            }
+            let owner = Arc::downgrade(&supervisor);
+            let registry = Arc::downgrade(&ctx.worker_registry);
+            let policies = Arc::downgrade(&ctx.policy_registry);
+            let has_enrollments = !ctx.router_config.kv_snapshot_sources.is_empty();
+            let signal_handle = Arc::new(tokio::spawn(async move {
+                let mut timer = tokio::time::interval(Duration::from_secs(1));
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut retries = HashMap::<String, SnapshotRetry>::new();
+                loop {
+                    tokio::select! {
+                        signal = signals.recv() => {
+                            if signal.is_none() { break; }
+                            continue;
+                        }
+                        _ = timer.tick(), if has_enrollments => {}
+                    }
+                    let (Some(owner), Some(registry), Some(policies)) =
+                        (owner.upgrade(), registry.upgrade(), policies.upgrade())
+                    else {
+                        break;
+                    };
+                    let workers = registry.get_all();
+                    retries.retain(|url, _| workers.iter().any(|worker| worker.url() == url));
+                    let mut probes = Vec::new();
+                    for worker in workers {
+                        if !owner.snapshot_consumer_finished(worker.base_url()) {
+                            if retries.get(worker.url()).is_some_and(|retry| {
+                                Instant::now() >= retry.next_probe + Duration::from_secs(30)
+                            }) {
+                                retries.remove(worker.url());
+                            }
+                            continue;
+                        }
+                        let retry = retries.entry(worker.url().to_owned()).or_insert_with(|| {
+                            SnapshotRetry {
+                                worker: Arc::downgrade(&worker),
+                                next_probe: Instant::now(),
+                                failures: 0,
+                            }
+                        });
+                        if !retry
+                            .worker
+                            .upgrade()
+                            .is_some_and(|prior| Arc::ptr_eq(&prior, &worker))
+                        {
+                            *retry = SnapshotRetry {
+                                worker: Arc::downgrade(&worker),
+                                next_probe: Instant::now(),
+                                failures: 0,
+                            };
+                        }
+                        if Instant::now() < retry.next_probe {
+                            continue;
+                        }
+                        retry.next_probe = Instant::now()
+                            + crate::kv_index::discovery::snapshot_retry_delay(retry.failures);
+                        retry.failures = retry.failures.saturating_add(1);
+                        probes.push(worker);
+                    }
+                    let mut pending = futures_util::stream::FuturesUnordered::new();
+                    for worker in &probes {
+                        pending.push(reconcile_snapshot_worker(
+                            &owner, &registry, &policies, worker,
+                        ));
+                        if pending.len() == 8 {
+                            pending.next().await;
+                        }
+                    }
+                    while pending.next().await.is_some() {}
+                }
+            }));
+            (Some(supervisor), Some(signal_handle))
+        } else {
+            (None, None)
+        };
         for url in &worker_urls {
             // TODO: In IGW mode, fetch model_id from worker's /get_model_info endpoint
             // For now, create worker without model_id
@@ -452,16 +583,14 @@ impl Router {
             };
             ctx.worker_registry.register(worker_arc.clone());
 
-            if let Some(kv_aware) = kv_aware_ops(default_policy.as_ref()) {
-                let provider = kv_index_supervisor.as_ref().and_then(|supervisor| {
-                    supervisor.match_provider_for_worker(worker_arc.base_url())
-                });
-                kv_aware.register_worker(
+            ctx.worker_registry.with_current(&worker_arc, || {
+                bind_current_kv_target(
+                    kv_index_supervisor.as_deref(),
+                    &ctx.policy_registry,
                     worker_arc.as_ref(),
                     kv_worker_info.get(worker_arc.base_url()),
-                    provider,
                 );
-            }
+            });
 
             // Notify PolicyRegistry about the new worker
             let model_id = worker_arc.model_id();
@@ -666,15 +795,20 @@ impl Router {
         worker: &dyn Worker,
         info: Option<&crate::kv_index::WorkerKvInfo>,
     ) {
-        let policy = self.policy_registry.get_default_policy();
-        let Some(kv_aware) = kv_aware_ops(policy.as_ref()) else {
+        let Some(current) = self.worker_registry.get_by_url(worker.url()) else {
             return;
         };
-        let provider = self
-            .kv_index_supervisor
-            .as_ref()
-            .and_then(|supervisor| supervisor.match_provider_for_worker(worker.base_url()));
-        kv_aware.register_worker(worker, info, provider);
+        if !std::ptr::addr_eq(worker, current.as_ref()) {
+            return;
+        }
+        self.worker_registry.with_current(&current, || {
+            bind_current_kv_target(
+                self.kv_index_supervisor.as_deref(),
+                &self.policy_registry,
+                worker,
+                info,
+            );
+        });
     }
 
     fn remove_kv_worker(&self, worker_url: &str, target_urls: &[String]) {
@@ -3446,6 +3580,11 @@ mod tests {
         let (responses, pending) = tokio::sync::mpsc::unbounded_channel::<Response>();
         let pending = Arc::new(tokio::sync::Mutex::new(pending));
         let app = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async { Json(serde_json::json!({"data":[{"id":"qwen3"}]})) }),
+            )
             .route(
                 "/v1/completions/render",
                 axum::routing::post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
@@ -3470,6 +3609,133 @@ mod tests {
             requests,
             responses,
             server,
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_captured_publisher_snapshot_references_control_actual_cost() {
+        use crate::config::{PolicyConfig, RouterConfig};
+        let peer = crate::kv_index::CapturedPublisher::new(false);
+        let mut fixture = completion_response_fixture().await;
+        let url = fixture.worker.url().to_owned();
+        let config = RouterConfig {
+            policy: PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+            kv_event_strict_recovery: true,
+            kv_snapshot_sources: HashMap::from([(
+                url.clone(),
+                crate::config::types::KvSnapshotSource {
+                    namespace: "captured-upstream-b16".into(),
+                    rank: 0,
+                    block_size: 16,
+                    publisher_snapshot: peer.config.clone(),
+                },
+            )]),
+            worker_startup_timeout_secs: 5,
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, Client::new(), 10, None, vec![]).unwrap(),
+        );
+        fixture.router = Arc::new(Router::new(vec![url.clone()], &ctx).await.unwrap());
+        fixture.worker = ctx.worker_registry.get_by_url(&url).unwrap();
+        let policy = fixture.router.policy_registry.get_default_policy();
+        let kv = kv_aware_policy(policy.as_ref()).unwrap();
+        let target = kv.target_for_worker(fixture.worker.as_ref());
+        let manager = kv.slot_manager().unwrap();
+        let provider = fixture
+            .router
+            .kv_index_supervisor
+            .as_ref()
+            .unwrap()
+            .match_provider_for_worker(&url)
+            .unwrap();
+        // Positive prefixes fence snapshot publication and both Remove batches;
+        // a miss alone could merely be a timeout/fallback.
+        for (marker, first, cost) in [(100, 100, 1), (500, 100, 1), (600, 100, 33)] {
+            if marker != 100 {
+                peer.remove_and_marker(marker);
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let hits = provider.find_tiered_matches(&crate::kv_index::MatchQuery {
+                        group_idx: 0,
+                        local_hashes: crate::policies::KvAwarePolicy::local_hashes(
+                            &(marker..marker + 33).collect::<Vec<_>>(),
+                            16,
+                        ),
+                        tiers_of_interest: vec![crate::kv_index::StorageTier::Device],
+                    });
+                    if hits
+                        .iter()
+                        .any(|hit| hit.target == target && hit.segments == [(0, 2)])
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("positive applied-prefix barrier");
+            // A late foreground add may still carry failed discovery metadata;
+            // publishing it must preserve the now-current recovered binding.
+            fixture
+                .router
+                .register_kv_target(fixture.worker.as_ref(), None);
+            for (prompt, expected) in [(marker, 1), (first, cost)] {
+                let raw = bytes::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "model":"qwen3", "prompt":(prompt..prompt+33).collect::<Vec<_>>()
+                    }))
+                    .unwrap(),
+                );
+                let router = fixture.router.clone();
+                let request = Arc::new(serde_json::from_slice(&raw).unwrap());
+                let dispatch = tokio::spawn({
+                    let raw = raw.clone();
+                    async move { router.route_completion_raw(None, request, raw, None).await }
+                });
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(5), fixture.requests.recv())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    raw
+                );
+                assert_eq!(fixture.worker.load(), 1);
+                assert_eq!(
+                    manager.sample(&target),
+                    crate::policies::LoadSample {
+                        active_prefill_tokens: expected,
+                        active_requests: 1,
+                    }
+                );
+                fixture
+                    .responses
+                    .send(
+                        Json(serde_json::json!({
+                            "choices":[{"text":"ok","finish_reason":"stop"}]
+                        }))
+                        .into_response(),
+                    )
+                    .unwrap();
+                let response = tokio::time::timeout(Duration::from_secs(5), dispatch)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(fixture.worker.load(), 0);
+                assert_eq!(
+                    manager.sample(&target),
+                    crate::policies::LoadSample::default()
+                );
+            }
         }
     }
 
