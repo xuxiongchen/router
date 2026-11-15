@@ -85,6 +85,9 @@ pub struct RouterConfig {
     /// This heuristic is separate from worker-reported KV events and session affinity.
     #[serde(default)]
     pub kv_aware_completion_history: bool,
+    /// Advisory history for plain static sequential NIXL pull Prefill, after a valid handoff.
+    #[serde(default)]
+    pub kv_aware_prefill_history: bool,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
     /// Enable Inference Gateway mode (false = proxy mode, true = IGW mode)
@@ -1332,6 +1335,7 @@ impl Default for RouterConfig {
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
             kv_aware_completion_history: false,
+            kv_aware_prefill_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             connection_mode: ConnectionMode::Http,
@@ -1363,6 +1367,31 @@ impl RouterConfig {
             } if *router_temperature == 0.0 => Ok(()),
             PolicyConfig::KvAware { .. } => Err("nonzero_router_temperature"),
             _ => Err("not_kv_aware"),
+        }
+    }
+
+    /// Static facts only; the request and completed handoff still need evidence.
+    pub(crate) fn prefill_history_support(&self) -> Result<(), &'static str> {
+        self.history_policy_support(self.mode.get_prefill_policy(&self.policy))?;
+        if self.epd.is_some() {
+            return Err("encoder_disaggregation");
+        }
+        if !matches!(self.kv_connector, KvConnector::Nixl) {
+            return Err("unsupported_connector");
+        }
+        match &self.mode {
+            RoutingMode::VllmPrefillDecode {
+                prefill_urls,
+                discovery_address: None,
+                ..
+            } if prefill_urls
+                .iter()
+                .all(|(url, _)| !crate::backend::is_grpc_url(url)) =>
+            {
+                Ok(())
+            }
+            RoutingMode::VllmPrefillDecode { .. } => Err("discovery_or_grpc"),
+            _ => Err("not_prefill_decode"),
         }
     }
 
@@ -1480,6 +1509,41 @@ mod tests {
             serde_json::to_value(enabled).unwrap()["kv_aware_completion_history"],
             true
         );
+    }
+
+    #[test]
+    fn prefill_history_static_support_does_not_assume_runtime_evidence() {
+        let config = RouterConfig {
+            policy: serde_json::from_value(serde_json::json!({"type":"kv_aware"})).unwrap(),
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: vec![("http://127.0.0.1:8000".into(), None)],
+                decode_urls: vec!["http://127.0.0.1:8001".into()],
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            kv_connector: KvConnector::Nixl,
+            ..Default::default()
+        };
+        assert_eq!(config.prefill_history_support(), Ok(()));
+        let mut altered = config.clone();
+        altered.mode = RoutingMode::Regular {
+            worker_urls: vec![],
+        };
+        assert_eq!(altered.prefill_history_support(), Err("not_prefill_decode"));
+        altered = config.clone();
+        if let RoutingMode::VllmPrefillDecode {
+            discovery_address, ..
+        } = &mut altered.mode
+        {
+            *discovery_address = Some("127.0.0.1:9000".into());
+        }
+        assert_eq!(altered.prefill_history_support(), Err("discovery_or_grpc"));
+        altered = config;
+        if let RoutingMode::VllmPrefillDecode { prefill_urls, .. } = &mut altered.mode {
+            prefill_urls[0].0 = "grpc://127.0.0.1:8000".into();
+        }
+        assert_eq!(altered.prefill_history_support(), Err("discovery_or_grpc"));
     }
 
     #[test]
@@ -2172,6 +2236,7 @@ mod tests {
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
             kv_aware_completion_history: false,
+            kv_aware_prefill_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2243,6 +2308,7 @@ mod tests {
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
             kv_aware_completion_history: false,
+            kv_aware_prefill_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,
@@ -2310,6 +2376,7 @@ mod tests {
             disable_circuit_breaker: false,
             kv_aware_session_affinity_ttl_secs: None,
             kv_aware_completion_history: false,
+            kv_aware_prefill_history: false,
             health_check: HealthCheckConfig::default(),
             enable_igw: false,
             queue_size: 100,

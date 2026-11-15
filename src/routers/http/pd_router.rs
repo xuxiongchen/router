@@ -208,6 +208,153 @@ pub(super) fn select_decode_stage(
     )
 }
 
+/// Refine only an existing equal-work P choice. Token-prefix scans have already
+/// finished; this checks the live admission snapshot and hint registration.
+fn prefer_prefill_history(
+    loads: &Loads,
+    workers: &[Arc<dyn Worker>],
+    endpoints: &[PdEndpoint],
+    indices: &[usize],
+    policy: &dyn crate::policies::KvAwareOps,
+    context: &PdRequestContext<'_>,
+    ordinary: usize,
+) -> usize {
+    let record = |outcome| {
+        crate::metrics::RouterMetrics::record_history_decision("prefill_history", outcome);
+    };
+    let Some(history) = context.prefill_history else {
+        return ordinary;
+    };
+    // Revalidate every feasible registration, not just members of the cost tie.
+    // Each result combines the same snapshot's credit proof and prefix hit.
+    let overlaps: Result<Vec<_>, _> = indices
+        .iter()
+        .map(|&index| {
+            let hint = history
+                .get(index)
+                .and_then(Option::as_ref)
+                .ok_or("missing_evidence")?;
+            policy
+                .prefill_history_evidence(workers[index].as_ref(), hint)
+                .map_err(|reason| {
+                    if reason == "positive_credit" {
+                        "positive_credit"
+                    } else {
+                        "missing_evidence"
+                    }
+                })
+        })
+        .collect();
+    let overlaps = match overlaps {
+        Ok(overlaps) => overlaps,
+        Err(reason) => {
+            record(reason);
+            return ordinary;
+        }
+    };
+    let work = |position: usize| {
+        let index = indices[position];
+        let input = context
+            .prefill_inputs
+            .and_then(|inputs| inputs.get(workers[index].base_url()))
+            .ok_or("missing_evidence")?;
+        let estimate = input
+            .work_by_rank
+            .get(&workers[index].dp_rank())
+            .ok_or("missing_evidence")?;
+        input.prompts.as_ref().ok_or("unknown_work")?;
+        // The old integer contract remains useful for ordinary scoring, not
+        // as a zero-credit witness.
+        if estimate.new_prefill_tokens
+            < input
+                .prompts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|ids| ids.len() as u64)
+                .sum()
+        {
+            return Err("positive_credit");
+        }
+        let load = loads
+            .get(&(Stage::Prefill, endpoints[index].clone()))
+            .copied()
+            .unwrap_or_default();
+        if load.unknown_prefill_requests != 0 {
+            return Err("unknown_work");
+        }
+        Ok((
+            u128::from(load.active_prefill_tokens) + u128::from(estimate.new_prefill_tokens),
+            load,
+        ))
+    };
+    let (minimum, original_load) = match work(ordinary) {
+        Ok(work) => work,
+        Err(reason) => {
+            record(reason);
+            return ordinary;
+        }
+    };
+    let overlap = |position: usize| overlaps[position];
+    let ordinary_match = overlap(ordinary);
+    let mut longest = ordinary_match;
+    let mut tied = Vec::new();
+    let mut equal_work_candidates = 0;
+    for position in 0..indices.len() {
+        let (cost, load) = match work(position) {
+            Ok(work) => work,
+            Err(reason) => {
+                record(reason);
+                return ordinary;
+            }
+        };
+        if cost < minimum {
+            record("no_tie");
+            return ordinary;
+        }
+        if cost != minimum
+            || load.occupancy(Stage::Prefill) != original_load.occupancy(Stage::Prefill)
+            || load.active_prefill_tokens > original_load.active_prefill_tokens
+        {
+            continue;
+        }
+        equal_work_candidates += 1;
+        let length = overlap(position);
+        // Keep the ordinary choice if it already ties for the longest match.
+        if length <= ordinary_match || length < longest {
+            continue;
+        }
+        if length > longest {
+            longest = length;
+            tied.clear();
+        }
+        tied.push(position);
+    }
+    if equal_work_candidates < 2 {
+        record("no_tie");
+        return ordinary;
+    }
+    let picked = match tied.as_slice() {
+        [] => ordinary,
+        [only] => *only,
+        positions => policy
+            .pick_prefill(
+                &vec![minimum as f64; positions.len()],
+                &vec![original_load.occupancy(Stage::Prefill); positions.len()],
+            )
+            .and_then(|index| positions.get(index).copied())
+            .unwrap_or(ordinary),
+    };
+    record(if picked != ordinary {
+        "override"
+    } else if longest > 0 {
+        "eligible_ordinary"
+    } else {
+        "no_overlap"
+    });
+    picked
+}
+
 fn select_stage(
     loads: &Loads,
     stage: Stage,
@@ -242,6 +389,7 @@ fn select_stage(
                 .get(&(stage, endpoints[index].clone()))
                 .is_some_and(|load| load.unknown_prefill_requests > 0)
         });
+    let mut history_fallback = "missing_evidence";
     if let (Stage::Prefill, Some(kv), false) = (stage, kv_aware_ops(policy), unknown_backlog) {
         let inputs: Option<Vec<_>> = projected
             .iter()
@@ -276,11 +424,23 @@ fn select_stage(
                 remaining_work = ?work, "P/D token-cost candidates");
             // P follows actual token work across the full eligible pool;
             // decode session affinity must never filter or pin prefill.
-            if let Some(picked) = kv.pick_prefill(&costs, &occupancy) {
+            if let Some(mut picked) = kv.pick_prefill(&costs, &occupancy) {
+                let ordinary = picked;
+                picked = prefer_prefill_history(
+                    loads,
+                    workers,
+                    endpoints,
+                    &selected_indices,
+                    kv,
+                    context,
+                    ordinary,
+                );
                 let (input, tokens, _) = inputs[picked];
                 let estimate = work[picked];
                 let new_tokens = estimate.new_prefill_tokens;
-                let outcome = if !estimate.placement_verified {
+                let outcome = if picked != ordinary {
+                    "history_hint"
+                } else if !estimate.placement_verified {
                     "unverified_identity"
                 } else {
                     "prefix_cost"
@@ -309,11 +469,22 @@ fn select_stage(
             }
             // pick_prefill refused the candidates (non-finite or misaligned
             // costs): degrade to policy selection, never fail the request.
+            history_fallback = "refused_cost";
             debug!(
                 stage = "prefill",
                 "pick_prefill refused candidates; using policy selection"
             );
         }
+    }
+    if stage == Stage::Prefill && kv_aware && context.prefill_history.is_some() {
+        crate::metrics::RouterMetrics::record_history_decision(
+            "prefill_history",
+            if unknown_backlog {
+                "unknown_work"
+            } else {
+                history_fallback
+            },
+        );
     }
     let (picked, affinity_outcome, affinity_binding) = if stage == Stage::Decode && kv_aware {
         // Decode never queries placement or applies the P temperature:
@@ -554,6 +725,12 @@ fn build_dp_workers(
 }
 
 impl PdRouterBase {
+    pub(super) fn prefill_history_enabled(&self) -> bool {
+        self.kv_state
+            .as_ref()
+            .is_some_and(|state| state.history_enabled)
+    }
+
     /// `router_prompts` are the router's token ids for `grpc://` pools. HTTP
     /// pools pass `None` and each backend renders the request itself.
     pub(super) async fn prepare_prefill_inputs(
@@ -563,13 +740,22 @@ impl PdRouterBase {
         route: &str,
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
-    ) -> Option<HashMap<String, super::pd_types::PdPrefillInput>> {
+        capture: Option<&crate::policies::CompletionHistoryRequest>,
+    ) -> Option<super::pd_types::PdPreparedInputs> {
         let policy = self.policy_registry.get_prefill_policy();
         if kv_aware_ops(policy.as_ref()).is_some() {
             return Some(
                 self.kv_state
                     .as_ref()?
-                    .prepare(workers, &policy, request, route, headers, router_prompts)
+                    .prepare_with_history(
+                        workers,
+                        &policy,
+                        request,
+                        route,
+                        headers,
+                        router_prompts,
+                        capture,
+                    )
                     .await,
             );
         }
@@ -579,8 +765,8 @@ impl PdRouterBase {
         let results = self
             .token_inputs(workers, request, route, headers, router_prompts)
             .await;
-        Some(
-            results
+        Some(super::pd_types::PdPreparedInputs {
+            inputs: results
                 .into_iter()
                 .map(|(base, result)| {
                     let (prompts, reason) = match result {
@@ -598,7 +784,8 @@ impl PdRouterBase {
                     )
                 })
                 .collect(),
-        )
+            history: HashMap::new(),
+        })
     }
 
     pub(super) async fn prepare_decode_inputs(
@@ -1288,6 +1475,8 @@ impl PdRouterBase {
                     ctx.router_config.pd_kv_event_sources.clone(),
                     ctx.worker_registry.get_prefill_workers(),
                     prefill_policy.clone(),
+                    ctx.router_config.kv_aware_prefill_history
+                        && ctx.router_config.prefill_history_support().is_ok(),
                 )
                 .await,
             )
@@ -1489,6 +1678,7 @@ impl PdRouterBase {
     ) -> Response {
         let context = PdRequestContext {
             prefill_inputs: None,
+            prefill_history: None,
             model_id: None,
             legacy_policy_input: None,
             prefill_cache: None,
@@ -2019,6 +2209,7 @@ mod tests {
         let decode_workers = router.worker_registry.get_decode_workers();
         let context = PdRequestContext {
             prefill_inputs: None,
+            prefill_history: None,
             model_id: None,
             legacy_policy_input: None,
             prefill_cache: None,
@@ -2048,6 +2239,7 @@ mod tests {
         let empty: Vec<Arc<dyn Worker>> = Vec::new();
         let context = PdRequestContext {
             prefill_inputs: None,
+            prefill_history: None,
             model_id: None,
             legacy_policy_input: None,
             prefill_cache: None,
@@ -2813,6 +3005,7 @@ mod admission_tests {
     fn context() -> PdRequestContext<'static> {
         PdRequestContext {
             prefill_inputs: None,
+            prefill_history: None,
             model_id: None,
             legacy_policy_input: Some("original request"),
             prefill_cache: None,
@@ -2878,6 +3071,7 @@ mod admission_tests {
     fn context_with_session(session: &str) -> PdRequestContext<'static> {
         PdRequestContext {
             prefill_inputs: None,
+            prefill_history: None,
             model_id: None,
             legacy_policy_input: Some("original request"),
             prefill_cache: None,
@@ -3311,6 +3505,557 @@ mod admission_tests {
         assert!(manager.snapshot().is_empty());
     }
 
+    struct HistoryPrefillPool {
+        policy: KvAwarePolicy,
+        workers: Vec<Arc<dyn Worker>>,
+        index: Arc<crate::kv_index::KvBlockIndexer>,
+        info: Vec<crate::kv_index::WorkerKvInfo>,
+    }
+
+    fn history_prefill_pool(count: usize) -> HistoryPrefillPool {
+        history_prefill_pool_with_params(count, CostParams::default())
+    }
+
+    fn history_prefill_pool_with_params(count: usize, params: CostParams) -> HistoryPrefillPool {
+        use crate::kv_index::{CacheKey, HashMode, KvBlockIndexer, WorkerKvInfo};
+        use crate::policies::KvAwareOps;
+        let policy = KvAwarePolicy::new(params);
+        let p: Vec<Arc<dyn Worker>> = (0..count)
+            .map(|index| {
+                Arc::new(BasicWorker::new(
+                    format!("http://p{index}"),
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                )) as Arc<dyn Worker>
+            })
+            .collect();
+        let index = Arc::new(KvBlockIndexer::new());
+        let info: Vec<_> = p
+            .iter()
+            .map(|worker| WorkerKvInfo {
+                instance_id: worker.url().to_owned(),
+                ranks: vec![0],
+                cache_key: Some(CacheKey {
+                    model: Arc::from("model"),
+                    hash_mode: HashMode::Sha256,
+                    block_size: 16,
+                }),
+                ..Default::default()
+            })
+            .collect();
+        for (worker, info) in p.iter().zip(&info) {
+            policy.register_history_worker(worker, Some(info), Some(index.clone()));
+        }
+        HistoryPrefillPool {
+            policy,
+            workers: p,
+            index,
+            info,
+        }
+    }
+
+    #[test]
+    fn prefill_history_respects_distinct_providers_with_the_same_cache_identity() {
+        use crate::kv_index::{KvBlockIndexer, MatchQuery, ResidencyOwner, StorageTier, TierMatch};
+        use crate::policies::{KvAwareOps, TieredMatchProvider};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted(Arc<KvBlockIndexer>, Arc<AtomicUsize>);
+        impl TieredMatchProvider for Counted {
+            fn find_tiered_matches(&self, q: &MatchQuery) -> Vec<TierMatch> {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0.find_tiered_matches(q)
+            }
+        }
+        let mut params = CostParams::default();
+        params.transfer_credits.disk = 0.01;
+        let HistoryPrefillPool {
+            policy,
+            workers: p,
+            index,
+            info,
+        } = history_prefill_pool_with_params(2, params);
+        let calls = Arc::new(AtomicUsize::new(0));
+        policy.register_history_worker(
+            &p[0],
+            Some(&info[0]),
+            Some(Arc::new(Counted(
+                Arc::new(KvBlockIndexer::new()),
+                calls.clone(),
+            ))),
+        );
+        policy.register_history_worker(
+            &p[1],
+            Some(&info[1]),
+            Some(Arc::new(Counted(index.clone(), calls.clone()))),
+        );
+        let ids: Vec<_> = (0..33).collect();
+        let capture = policy.capture_prefill_history(&p, "model").unwrap();
+        let seed = policy
+            .prepare_prefill_history(&capture, p[1].as_ref(), &ids)
+            .unwrap();
+        policy.observe_completion_headers(p[1].as_ref(), seed.observation(&ids));
+        index.store(
+            0,
+            ResidencyOwner::Worker {
+                source: Arc::from(p[1].base_url()),
+                dp_rank: 0,
+                incarnation: 0,
+            },
+            StorageTier::Disk,
+            None,
+            &[(
+                Arc::from("fractional"),
+                KvAwarePolicy::local_hashes(&ids, 16)[0].clone(),
+            )],
+        );
+        calls.store(0, Ordering::Relaxed);
+        let prompts = [ids.clone()];
+        let result = policy.estimate_prefill_work_with_history(
+            &capture,
+            &p.iter()
+                .map(|w| (w.as_ref(), prompts.as_slice(), true))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "distinct bound providers cannot share a cached result"
+        );
+        assert_eq!(result[1].0.new_prefill_tokens, 33);
+        assert_eq!(
+            policy.prefill_history_evidence(p[0].as_ref(), result[0].1.as_ref().unwrap()),
+            Ok(0)
+        );
+        assert_eq!(
+            policy.prefill_history_evidence(p[1].as_ref(), result[1].1.as_ref().unwrap()),
+            Err("positive_credit")
+        );
+    }
+
+    #[test]
+    fn prefill_history_does_not_infer_zero_credit_from_integer_charge() {
+        use crate::kv_index::{MatchQuery, ResidencyOwner, StorageTier, TierMatch};
+        use crate::policies::{KvAwareOps, TieredMatchProvider};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted(Arc<crate::kv_index::KvBlockIndexer>, AtomicUsize);
+        impl TieredMatchProvider for Counted {
+            fn find_tiered_matches(&self, query: &MatchQuery) -> Vec<TierMatch> {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0.find_tiered_matches(query)
+            }
+        }
+        for (name, coefficient, source, outside, known, expected) in [
+            ("zero", 0.0, 0, false, true, 1),
+            ("fractional-in-tie", 0.01, 0, false, true, 0),
+            ("fractional-outside-tie", 0.01, 2, true, true, 0),
+            ("integer", 1.0, 0, false, true, 0),
+            ("unknown-in-tie", 0.0, 0, false, false, 0),
+            ("unknown-outside-tie", 0.0, 2, true, false, 0),
+        ] {
+            let mut params = CostParams::default();
+            params.transfer_credits.disk = coefficient;
+            let HistoryPrefillPool {
+                policy,
+                workers: p,
+                index,
+                info,
+            } = history_prefill_pool_with_params(3, params);
+            let counted = Arc::new(Counted(index.clone(), AtomicUsize::new(0)));
+            for (worker, info) in p.iter().zip(&info) {
+                policy.register_history_worker(worker, Some(info), Some(counted.clone()));
+            }
+            let ids: Vec<u32> = (0..33).collect();
+            let capture = policy.capture_prefill_history(&p, "model").unwrap();
+            let seed = policy
+                .prepare_prefill_history(&capture, p[1].as_ref(), &ids)
+                .unwrap();
+            policy.observe_completion_headers(p[1].as_ref(), seed.observation(&ids));
+            let hash = KvAwarePolicy::local_hashes(&ids, 16)[0].clone();
+            index.store(
+                0,
+                ResidencyOwner::Worker {
+                    source: Arc::from(p[source].base_url()),
+                    dp_rank: 0,
+                    incarnation: 0,
+                },
+                StorageTier::Disk,
+                None,
+                &[(Arc::from("stored"), hash)],
+            );
+            let prompts = [ids.clone()];
+            let estimates: Vec<_> = p
+                .iter()
+                .enumerate()
+                .map(|(i, w)| (w.as_ref(), prompts.as_slice(), known || i != source))
+                .collect();
+            counted.1.store(0, Ordering::Relaxed);
+            let snapshot = policy.estimate_prefill_work_with_history(&capture, &estimates);
+            assert_eq!(
+                counted.1.load(Ordering::Relaxed),
+                1,
+                "{name}: shared identity must query once"
+            );
+            let mut inputs = HashMap::new();
+            let mut hints = Vec::new();
+            for (worker, (work, hint)) in p.iter().zip(snapshot) {
+                inputs.insert(
+                    worker.base_url().to_owned(),
+                    super::super::pd_types::PdPrefillInput {
+                        prompts: Some(Arc::from(vec![ids.clone()])),
+                        work_by_rank: HashMap::from([(None, work)]),
+                        allow_credit: true,
+                        fallback_reason: None,
+                    },
+                );
+                hints.push(hint);
+            }
+            let charge = if coefficient == 1.0 { 17 } else { 33 };
+            assert_eq!(
+                inputs[p[source].base_url()].work_by_rank[&None].new_prefill_tokens,
+                charge,
+                "{name}"
+            );
+            let endpoints: Vec<_> = p
+                .iter()
+                .map(|w| PdEndpoint::for_worker(w.as_ref()))
+                .collect();
+            let loads = if outside {
+                Loads::from([(
+                    (Stage::Prefill, endpoints[2].clone()),
+                    PdLoadSample {
+                        active_prefill_tokens: 100,
+                        prefill_requests: 1,
+                        ..Default::default()
+                    },
+                )])
+            } else {
+                Loads::new()
+            };
+            let ctx = PdRequestContext {
+                prefill_inputs: Some(&inputs),
+                prefill_history: Some(&hints),
+                ..context()
+            };
+            assert_eq!(
+                prefer_prefill_history(&loads, &p, &endpoints, &[0, 1, 2], &policy, &ctx, 0),
+                expected,
+                "{name}"
+            );
+            // Only the actual estimator's evidence is accepted. Re-registration
+            // invalidates its old proof even when the Worker Arc is unchanged.
+            policy.register_history_worker(&p[0], Some(&info[0]), Some(counted.clone()));
+            assert_eq!(
+                prefer_prefill_history(&loads, &p, &endpoints, &[0, 1, 2], &policy, &ctx, 0),
+                0,
+                "{name}: stale snapshot"
+            );
+            assert!(p.iter().all(|w| w.load() == 0));
+        }
+    }
+
+    #[test]
+    fn prefill_history_refines_only_current_equal_work_without_reserving() {
+        use crate::policies::KvAwareOps;
+        let HistoryPrefillPool {
+            policy,
+            workers: p,
+            index,
+            info,
+        } = history_prefill_pool(2);
+        let ids: Vec<u32> = (0..33).collect();
+        let capture = policy.capture_prefill_history(&p, "model").unwrap();
+        let seed = policy
+            .prepare_prefill_history(&capture, p[1].as_ref(), &ids)
+            .unwrap();
+        policy.observe_completion_headers(p[1].as_ref(), seed.observation(&ids));
+        let hints: Vec<_> = p
+            .iter()
+            .map(|worker| policy.prepare_prefill_history(&capture, worker.as_ref(), &ids))
+            .collect();
+        let mut inputs = token_inputs(&p, &ids, &policy);
+        let endpoints: Vec<_> = p
+            .iter()
+            .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+            .collect();
+        let mut ctx = context();
+        ctx.prefill_inputs = Some(&inputs);
+        let loads = Loads::new();
+        // The ordinary position is an explicit deterministic A, not a random
+        // picker result. Only the advisory refinement changes it to B.
+        assert_eq!(
+            prefer_prefill_history(&loads, &p, &endpoints, &[0, 1], &policy, &ctx, 0),
+            0
+        );
+        ctx.prefill_history = Some(&hints);
+        // A single feasible target cannot be a history tie, even if it has a
+        // retained prefix. The decision remains the ordinary full-cost one.
+        assert_eq!(
+            prefer_prefill_history(&loads, &p, &endpoints, &[1], &policy, &ctx, 0),
+            0
+        );
+        assert_eq!(
+            prefer_prefill_history(&loads, &p, &endpoints, &[0, 1], &policy, &ctx, 0),
+            1
+        );
+        let d = pool("d", 1);
+        let manager = Arc::new(PdLoadManager::default());
+        let (selection, attempt) = admit_with(&manager, &p, &d, &policy, &ctx);
+        assert_eq!(selection.prefill.worker_index, 1);
+        assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+        assert_eq!(selection.prefill.credited_prefix_tokens, Some(0));
+        assert_eq!(
+            manager.snapshot()[&(Stage::Prefill, endpoints[1].clone())].active_prefill_tokens,
+            33
+        );
+        assert!(
+            p.iter().all(|worker| worker.load() == 0),
+            "history must not reserve worker load"
+        );
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+        let loaded = Loads::from([(
+            (Stage::Prefill, endpoints[1].clone()),
+            PdLoadSample {
+                prefill_requests: 1,
+                active_prefill_tokens: 1,
+                ..Default::default()
+            },
+        )]);
+        assert_eq!(
+            prefer_prefill_history(&loaded, &p, &endpoints, &[0, 1], &policy, &ctx, 0),
+            0
+        );
+        // Real credit on any candidate wins; history cannot turn it into a tie.
+        inputs
+            .get_mut(p[0].base_url())
+            .unwrap()
+            .work_by_rank
+            .get_mut(&None)
+            .unwrap()
+            .new_prefill_tokens = 1;
+        let credited = PdRequestContext {
+            prefill_inputs: Some(&inputs),
+            prefill_history: Some(&hints),
+            ..context()
+        };
+        assert_eq!(
+            prefer_prefill_history(&loads, &p, &endpoints, &[0, 1], &policy, &credited, 0),
+            0
+        );
+        let peer = policy
+            .prepare_prefill_history(&capture, p[0].as_ref(), &ids)
+            .unwrap();
+        policy.observe_completion_headers(p[0].as_ref(), peer.observation(&ids));
+        policy.unregister_worker(p[1].url());
+        policy.register_history_worker(&p[1], Some(&info[1]), Some(index));
+        assert_eq!(
+            policy
+                .prefill_history_evidence(p[1].as_ref(), hints[1].as_ref().unwrap())
+                .unwrap_or(0),
+            0
+        );
+        policy.observe_completion_headers(p[1].as_ref(), seed.observation(&ids));
+        let fresh = policy.capture_prefill_history(&p, "model").unwrap();
+        for (worker, expected) in p.iter().zip([32, 0]) {
+            let hint = policy
+                .prepare_prefill_history(&fresh, worker.as_ref(), &ids)
+                .unwrap();
+            assert_eq!(
+                policy
+                    .prefill_history_evidence(worker.as_ref(), &hint)
+                    .unwrap_or(0),
+                expected
+            );
+        }
+        let replacement = BasicWorker::new(
+            p[0].url().into(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        );
+        assert_eq!(
+            policy
+                .prefill_history_evidence(&replacement, &peer)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn prefill_history_tied_maxima_use_the_existing_picker() {
+        use crate::policies::{
+            KvAwareOps, KvRequestTokens, KvSelectionReceipt, PrefillHistoryHint,
+            PrefillWorkEstimate, StagePick, TieredMatchProvider,
+        };
+
+        struct PickSecond<'a>(&'a KvAwarePolicy);
+
+        impl KvAwareOps for PickSecond<'_> {
+            fn pick_prefill(&self, costs: &[f64], occupancy: &[usize]) -> Option<usize> {
+                assert_eq!(
+                    costs.len(),
+                    2,
+                    "both maximal-history candidates must reach the picker"
+                );
+                assert_eq!(costs[0], costs[1]);
+                assert_eq!(occupancy.len(), 2);
+                assert_eq!(occupancy[0], occupancy[1]);
+                Some(1)
+            }
+            fn prefill_history_evidence(
+                &self,
+                worker: &dyn Worker,
+                hint: &PrefillHistoryHint,
+            ) -> Result<usize, &'static str> {
+                self.0.prefill_history_evidence(worker, hint)
+            }
+            fn estimate_prefill_work(
+                &self,
+                _: &[(&dyn Worker, &[Vec<u32>], bool)],
+            ) -> Vec<PrefillWorkEstimate> {
+                unreachable!("tie refinement does not estimate or reserve work")
+            }
+            fn pick_decode(&self, _: &[usize]) -> Option<usize> {
+                unreachable!("tie refinement does not select Decode")
+            }
+            fn select_decode(
+                &self,
+                _: &[Arc<dyn Worker>],
+                _: Option<&AffinityKey>,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Option<StagePick> {
+                unreachable!("tie refinement does not select Decode")
+            }
+            fn session_affinity_enabled(&self) -> bool {
+                unreachable!("tie refinement does not change session affinity")
+            }
+            fn register_worker(
+                &self,
+                _: &dyn Worker,
+                _: Option<&crate::kv_index::WorkerKvInfo>,
+                _: Option<Arc<dyn TieredMatchProvider>>,
+            ) {
+                unreachable!("tie refinement does not register Workers")
+            }
+            fn unregister_worker(&self, _: &str) {
+                unreachable!("tie refinement does not unregister Workers")
+            }
+            fn has_affinity(
+                &self,
+                _: &[Arc<dyn Worker>],
+                _: Option<&str>,
+                _: Option<&str>,
+                _: &AffinityKey,
+            ) -> bool {
+                unreachable!("tie refinement does not change session affinity")
+            }
+            fn reconcile_decode_workers(&self, _: &[Arc<dyn Worker>]) {
+                unreachable!("tie refinement does not reconcile Decode")
+            }
+            fn select_worker_with_inputs(
+                &self,
+                _: &[Arc<dyn Worker>],
+                _: KvRequestTokens<'_>,
+                _: Option<&str>,
+                _: Option<&str>,
+                _: Option<&AffinityKey>,
+                _: &[String],
+            ) -> Option<KvSelectionReceipt> {
+                unreachable!("tie refinement must not enter Regular admission")
+            }
+        }
+
+        let HistoryPrefillPool {
+            policy, workers: p, ..
+        } = history_prefill_pool(3);
+        let ids: Vec<u32> = (0..33).collect();
+        let capture = policy.capture_prefill_history(&p, "model").unwrap();
+        let hints = || {
+            p.iter()
+                .map(|worker| policy.prepare_prefill_history(&capture, worker.as_ref(), &ids))
+                .collect::<Vec<_>>()
+        };
+        let inputs = token_inputs(&p, &ids, &policy);
+        let endpoints: Vec<_> = p
+            .iter()
+            .map(|worker| PdEndpoint::for_worker(worker.as_ref()))
+            .collect();
+        let loads = Loads::new();
+        let cold = hints();
+        let cold_context = PdRequestContext {
+            prefill_inputs: Some(&inputs),
+            prefill_history: Some(&cold),
+            ..context()
+        };
+        let controlled = PickSecond(&policy);
+        assert_eq!(
+            prefer_prefill_history(
+                &loads,
+                &p,
+                &endpoints,
+                &[0, 1, 2],
+                &controlled,
+                &cold_context,
+                2
+            ),
+            2
+        );
+        for worker in &p[..2] {
+            let hint = policy
+                .prepare_prefill_history(&capture, worker.as_ref(), &ids)
+                .unwrap();
+            policy.observe_completion_headers(worker.as_ref(), hint.observation(&ids));
+        }
+        let warm = hints();
+        let warm_context = PdRequestContext {
+            prefill_inputs: Some(&inputs),
+            prefill_history: Some(&warm),
+            ..context()
+        };
+        // P2 has no history; the existing picker must receive both P0 and P1,
+        // and its controlled second choice must map back to P1, not P0.
+        assert_eq!(
+            prefer_prefill_history(
+                &loads,
+                &p,
+                &endpoints,
+                &[0, 1, 2],
+                &controlled,
+                &warm_context,
+                2
+            ),
+            1
+        );
+        for ordinary in [0, 1] {
+            assert_eq!(
+                prefer_prefill_history(
+                    &loads,
+                    &p,
+                    &endpoints,
+                    &[0, 1, 2],
+                    &controlled,
+                    &warm_context,
+                    ordinary
+                ),
+                ordinary
+            );
+        }
+        let manager = Arc::new(PdLoadManager::default());
+        let (selection, attempt) = admit_with(&manager, &p, &pool("d", 1), &policy, &warm_context);
+        assert!([0, 1].contains(&selection.prefill.worker_index));
+        assert_eq!(selection.prefill.new_prefill_tokens, Some(33));
+        assert_eq!(selection.prefill.credited_prefix_tokens, Some(0));
+        assert_eq!(
+            sample(&manager, Stage::Prefill, &selection.prefill.endpoint).active_prefill_tokens,
+            33
+        );
+        assert!(p.iter().all(|worker| worker.load() == 0));
+        drop(attempt);
+        assert!(manager.snapshot().is_empty());
+    }
+
     #[test]
     fn cold_prefill_ties_use_every_worker_in_an_idle_pool() {
         let manager = Arc::new(PdLoadManager::default());
@@ -3601,6 +4346,7 @@ mod admission_tests {
         fn ctx(model: &str) -> PdRequestContext<'_> {
             PdRequestContext {
                 prefill_inputs: None,
+                prefill_history: None,
                 model_id: Some(model),
                 legacy_policy_input: Some("original request"),
                 prefill_cache: None,

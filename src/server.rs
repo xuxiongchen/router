@@ -75,6 +75,12 @@ impl AppContext {
                 source.validate(worker).map_err(|error| error.to_string())?;
             }
         }
+        if router_config.kv_aware_prefill_history {
+            match router_config.prefill_history_support() {
+                Ok(()) => info!("Prefill history requested for eligible static KV sources; completed P responses are advisory, not connector identity verification"),
+                Err(reason) => warn!(reason, "Prefill history disabled"),
+            }
+        }
         if router_config.kv_aware_completion_history {
             match router_config.regular_history_support() {
                 Ok(()) => {

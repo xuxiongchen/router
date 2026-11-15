@@ -90,12 +90,18 @@ fn probe_outcome(existing: Option<&Binding>, signature: Option<&str>) -> ProbeOu
     }
 }
 
+struct RegisteredTarget {
+    signature: String,
+    history_worker: Option<std::sync::Weak<dyn Worker>>,
+}
+
 pub(super) struct PdKvState {
     client: reqwest::Client,
     api_key: Option<String>,
     supervisor: KvIndexSupervisor,
     bindings: Mutex<HashMap<String, Binding>>,
-    targets: Mutex<HashMap<String, String>>,
+    targets: Mutex<HashMap<String, RegisteredTarget>>,
+    pub(super) history_enabled: bool,
     // Serializes bind() runs. Discovery and subscriber handshakes run outside
     // the map locks, so a slow P engine can only delay its own refresh —
     // never the request path's short binding reads.
@@ -114,15 +120,21 @@ impl std::fmt::Debug for PdKvState {
 }
 
 impl PdKvState {
+    pub(super) fn has_history_source(&self, worker: &dyn Worker) -> bool {
+        self.supervisor.has_static_pd_source(worker.base_url())
+    }
+
     pub(super) async fn start(
         client: reqwest::Client,
         api_key: Option<String>,
         sources: HashMap<String, crate::config::types::PdKvEventSources>,
         workers: Vec<Arc<dyn Worker>>,
         policy: Arc<dyn LoadBalancingPolicy>,
+        history_enabled: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
+        state.history_enabled = history_enabled;
         state.supervisor.set_api_key(state.api_key.clone());
         state.refresh_inputs = Mutex::new(RefreshInputs {
             workers: workers.iter().cloned().collect(),
@@ -164,6 +176,7 @@ impl PdKvState {
             api_key: None,
             bindings: Mutex::new(HashMap::new()),
             targets: Mutex::new(HashMap::new()),
+            history_enabled: false,
             bind_lock: Mutex::new(()),
             refresh_inputs: Mutex::new(RefreshInputs::default()),
             // Subscribers enforce trust by suspending/clearing affected sources.
@@ -333,11 +346,18 @@ impl PdKvState {
         let bindings = self.bindings.lock().await;
         let mut targets = self.targets.lock().await;
         for worker in workers {
+            let history_enabled = self.history_enabled && self.has_history_source(worker.as_ref());
             let binding = bindings.get(worker.base_url());
             let signature = binding
                 .map(|binding| format!("{}:{:?}", binding.signature, binding.info))
                 .unwrap_or_default();
-            if targets.get(worker.url()) == Some(&signature) {
+            if targets.get(worker.url()).is_some_and(|previous| {
+                previous.signature == signature
+                    && (!history_enabled
+                        || previous.history_worker.as_ref().is_some_and(|witness| {
+                            std::ptr::addr_eq(witness.as_ptr(), worker.as_ref())
+                        }))
+            }) {
                 continue;
             }
             policy.unregister_worker(worker.url());
@@ -353,8 +373,18 @@ impl PdKvState {
                     .then(|| self.supervisor.match_provider_for_worker(worker.base_url()))
                     .flatten()
             });
-            policy.register_worker(worker.as_ref(), info, matches);
-            targets.insert(worker.url().to_owned(), signature);
+            if history_enabled {
+                policy.register_history_worker(worker, info, matches);
+            } else {
+                policy.register_worker(worker.as_ref(), info, matches);
+            }
+            targets.insert(
+                worker.url().to_owned(),
+                RegisteredTarget {
+                    signature,
+                    history_worker: history_enabled.then(|| Arc::downgrade(worker)),
+                },
+            );
         }
     }
 
@@ -412,6 +442,7 @@ impl PdKvState {
 
     /// `router_prompts` are the router's own token ids for `grpc://` pools;
     /// HTTP pools pass `None` and render through each backend.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
     pub(super) async fn prepare(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -421,6 +452,30 @@ impl PdKvState {
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
     ) -> HashMap<String, PdPrefillInput> {
+        self.prepare_with_history(
+            workers,
+            policy,
+            request,
+            route,
+            headers,
+            router_prompts,
+            None,
+        )
+        .await
+        .inputs
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn prepare_with_history(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        request: &Value,
+        route: &str,
+        headers: Option<&HeaderMap>,
+        router_prompts: Option<&Arc<[Vec<u32>]>>,
+        capture: Option<&crate::policies::CompletionHistoryRequest>,
+    ) -> super::pd_types::PdPreparedInputs {
         let started = Instant::now();
         *self.refresh_inputs.lock().await = RefreshInputs {
             workers: workers.iter().cloned().collect(),
@@ -484,6 +539,7 @@ impl PdKvState {
                 .set(if input.allow_credit { 1.0 } else { 0.0 });
             prepared.insert(base, input);
         }
+        let mut history = HashMap::new();
         if let Some(kv) = kv_aware_ops(policy.as_ref()) {
             let inputs: Vec<_> = workers
                 .iter()
@@ -496,13 +552,24 @@ impl PdKvState {
                     ))
                 })
                 .collect();
-            let work: Vec<_> = inputs
-                .iter()
-                .zip(kv.estimate_prefill_work(&inputs))
-                .map(|((worker, _, _), estimate)| {
-                    (worker.base_url().to_owned(), worker.dp_rank(), estimate)
-                })
-                .collect();
+            let mut collect_work = |worker: &dyn Worker, estimate, hint| {
+                if let Some(hint) = hint {
+                    history.insert(worker.url().to_owned(), hint);
+                }
+                (worker.base_url().to_owned(), worker.dp_rank(), estimate)
+            };
+            let work: Vec<_> = match capture {
+                Some(capture) => inputs
+                    .iter()
+                    .zip(kv.estimate_prefill_work_with_history(capture, &inputs))
+                    .map(|((worker, _, _), (work, hint))| collect_work(*worker, work, hint))
+                    .collect(),
+                None => inputs
+                    .iter()
+                    .zip(kv.estimate_prefill_work(&inputs))
+                    .map(|((worker, _, _), work)| collect_work(*worker, work, None))
+                    .collect(),
+            };
             for (base, rank, work) in work {
                 prepared
                     .get_mut(&base)
@@ -513,7 +580,10 @@ impl PdKvState {
         }
         metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
             .record(started.elapsed().as_secs_f64());
-        prepared
+        super::pd_types::PdPreparedInputs {
+            inputs: prepared,
+            history,
+        }
     }
 }
 

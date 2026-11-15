@@ -19,7 +19,7 @@ use crate::request_identity::StableIdentity;
 
 mod history;
 use history::CompletionHistory;
-pub use history::{CompletionHistoryRequest, HistoryObservation};
+pub use history::{CompletionHistoryRequest, HistoryObservation, PrefillHistoryHint};
 
 // Process-wide identity, allocated for every registration including load-only
 // targets. Never reuse an ID: even unreachable overflow fails closed.
@@ -130,6 +130,37 @@ pub trait KvAwareOps: Send + Sync {
 
     /// Commit an observation at successful upstream headers, without owning load.
     fn observe_completion_headers(&self, _worker: &dyn Worker, _observation: HistoryObservation) {}
+
+    /// Capture independently addressed P registrations before preparation.
+    fn capture_prefill_history(
+        &self,
+        _workers: &[Arc<dyn Worker>],
+        _requested_model: &str,
+    ) -> Option<CompletionHistoryRequest> {
+        None
+    }
+
+    /// Estimate work and history eligibility from one placement snapshot.
+    /// Implementers without this evidence must not infer zero credit from billing.
+    fn estimate_prefill_work_with_history(
+        &self,
+        _capture: &CompletionHistoryRequest,
+        inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+    ) -> Vec<(PrefillWorkEstimate, Option<PrefillHistoryHint>)> {
+        self.estimate_prefill_work(inputs)
+            .into_iter()
+            .map(|work| (work, None))
+            .collect()
+    }
+
+    /// Revalidate the unrounded credit witness before advisory selection.
+    fn prefill_history_evidence(
+        &self,
+        _worker: &dyn Worker,
+        _hint: &PrefillHistoryHint,
+    ) -> Result<usize, &'static str> {
+        Err("missing_evidence")
+    }
 
     /// Ordinary and history-assisted requests share selection and reservation.
     /// Implementers without history keep their existing qualification behavior.
@@ -1366,8 +1397,11 @@ impl KvAwarePolicy {
         affinity_key: Option<&AffinityKey>,
         excluded_workers: &[String],
     ) -> Option<(KvSelectionReceipt, Option<HistoryObservation>)> {
-        let history = input.history.filter(|_| {
-            self.params.router_temperature == 0.0 && lora_name.is_none() && cache_salt.is_none()
+        let history = input.history.filter(|capture| {
+            !capture.prefill
+                && self.params.router_temperature == 0.0
+                && lora_name.is_none()
+                && cache_salt.is_none()
         });
         let digest = affinity_key.map(|key| key.scoped_digest(lora_name, cache_salt));
         // Re-query at most three times under registration churn. The final
@@ -2012,6 +2046,87 @@ impl LoadBalancingPolicy for KvAwarePolicy {
     }
 }
 
+impl KvAwarePolicy {
+    fn estimate_prefill_snapshot(
+        &self,
+        inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+        capture: Option<&CompletionHistoryRequest>,
+        mut hints: Option<&mut Vec<Option<PrefillHistoryHint>>>,
+    ) -> Vec<PrefillWorkEstimate> {
+        let mut query_cache = HashMap::new();
+        // Retain every provider while pointer identities key this call's memo.
+        // Equal model/cache keys do not imply an equal placement source.
+        let bindings: Vec<_> = inputs
+            .iter()
+            .map(|(worker, _, _)| self.binding_for_worker(*worker))
+            .collect();
+        inputs
+            .iter()
+            .zip(&bindings)
+            .map(|(&(worker, prompts, credit), binding)| {
+                let verified = credit && binding.cache_key.is_some();
+                let params = CostParams {
+                    block_size: binding.block_size,
+                    ..self.params
+                };
+                let mut new_prefill_tokens = 0u64;
+                let mut positive_credit = false;
+                for tokens in prompts {
+                    let hits = if verified {
+                        query_cache
+                            .entry((
+                                Arc::as_ptr(&binding.matches) as *const () as usize,
+                                binding.cache_key.clone(),
+                                tokens.as_slice(),
+                            ))
+                            .or_insert_with(|| {
+                                Self::placement_matches(binding, Some(tokens), None, true)
+                            })
+                            .as_slice()
+                    } else {
+                        &[]
+                    };
+                    let matches: Vec<_> = hits
+                        .iter()
+                        .filter(|hit| hit.target == binding.target)
+                        .cloned()
+                        .collect();
+                    let candidate = CandidateView {
+                        target: &binding.target,
+                        matches: &matches,
+                        load: LoadSample::default(),
+                        input_tokens: tokens.len(),
+                        prefill_tokens: None,
+                    };
+                    let credit = credited_tokens(&candidate, &params);
+                    positive_credit |= credit > 0.0;
+                    new_prefill_tokens =
+                        new_prefill_tokens.saturating_add(remaining_work(tokens.len(), credit));
+                }
+                if let Some(hints) = hints.as_mut() {
+                    let hint = capture.filter(|_| verified).and_then(|capture| {
+                        let [ids] = prompts else {
+                            return None;
+                        };
+                        self.prefill_history_hint_from_binding(
+                            capture,
+                            worker,
+                            ids,
+                            binding,
+                            Some(positive_credit),
+                        )
+                    });
+                    hints.push(hint);
+                }
+                PrefillWorkEstimate {
+                    new_prefill_tokens,
+                    placement_verified: verified,
+                }
+            })
+            .collect()
+    }
+}
+
 impl KvAwareOps for KvAwarePolicy {
     fn register_history_worker(
         &self,
@@ -2033,11 +2148,46 @@ impl KvAwareOps for KvAwarePolicy {
         workers: &[Arc<dyn Worker>],
         requested_model: &str,
     ) -> Option<CompletionHistoryRequest> {
-        Some(self.capture_history_registrations(workers, requested_model))
+        Some(self.capture_history_registrations(workers, requested_model, false))
     }
 
     fn observe_completion_headers(&self, worker: &dyn Worker, observation: HistoryObservation) {
         self.commit_history_observation(worker, observation);
+    }
+
+    fn capture_prefill_history(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        requested_model: &str,
+    ) -> Option<CompletionHistoryRequest> {
+        (self.params.router_temperature == 0.0)
+            .then(|| self.capture_history_registrations(workers, requested_model, true))
+    }
+
+    fn prefill_history_evidence(
+        &self,
+        worker: &dyn Worker,
+        hint: &PrefillHistoryHint,
+    ) -> Result<usize, &'static str> {
+        let binding = self.targets.get(worker.url()).ok_or("missing_evidence")?;
+        if hint.registration_id != binding.registration_id || !binding.is_history_worker(worker) {
+            return Err("missing_evidence");
+        }
+        match hint.positive_credit {
+            Some(true) => Err("positive_credit"),
+            Some(false) => Ok(hint.len_at(Instant::now())),
+            None => Err("missing_evidence"),
+        }
+    }
+
+    fn estimate_prefill_work_with_history(
+        &self,
+        capture: &CompletionHistoryRequest,
+        inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+    ) -> Vec<(PrefillWorkEstimate, Option<PrefillHistoryHint>)> {
+        let mut hints = Vec::with_capacity(inputs.len());
+        let work = self.estimate_prefill_snapshot(inputs, Some(capture), Some(&mut hints));
+        work.into_iter().zip(hints).collect()
     }
 
     fn select_with_context(
@@ -2105,50 +2255,7 @@ impl KvAwareOps for KvAwarePolicy {
         &self,
         inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
     ) -> Vec<PrefillWorkEstimate> {
-        let mut query_cache = HashMap::new();
-        inputs
-            .iter()
-            .map(|&(worker, prompts, credit)| {
-                let binding = self.binding_for_worker(worker);
-                let verified = credit && binding.cache_key.is_some();
-                let params = CostParams {
-                    block_size: binding.block_size,
-                    ..self.params
-                };
-                let mut new_prefill_tokens = 0u64;
-                for tokens in prompts {
-                    let hits = if verified {
-                        query_cache
-                            .entry((binding.cache_key.clone(), tokens.as_slice()))
-                            .or_insert_with(|| {
-                                Self::placement_matches(&binding, Some(tokens), None, true)
-                            })
-                            .as_slice()
-                    } else {
-                        &[]
-                    };
-                    let matches: Vec<_> = hits
-                        .iter()
-                        .filter(|hit| hit.target == binding.target)
-                        .cloned()
-                        .collect();
-                    new_prefill_tokens = new_prefill_tokens.saturating_add(request_prefill_tokens(
-                        &CandidateView {
-                            target: &binding.target,
-                            matches: &matches,
-                            load: LoadSample::default(),
-                            input_tokens: tokens.len(),
-                            prefill_tokens: None,
-                        },
-                        &params,
-                    ));
-                }
-                PrefillWorkEstimate {
-                    new_prefill_tokens,
-                    placement_verified: verified,
-                }
-            })
-            .collect()
+        self.estimate_prefill_snapshot(inputs, None, None)
     }
 
     fn pick_prefill(&self, costs: &[f64], occupancy: &[usize]) -> Option<usize> {
@@ -4736,8 +4843,8 @@ mod tests {
                     );
                 }
             }));
-            let history =
-                history_enabled.then(|| policy.capture_history_registrations(&workers, "model"));
+            let history = history_enabled
+                .then(|| policy.capture_history_registrations(&workers, "model", false));
             let mut inputs = WorkerTokenInputs::new();
             for (worker, length) in workers.iter().zip([33, 17]) {
                 inputs.insert(

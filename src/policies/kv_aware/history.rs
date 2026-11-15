@@ -1,6 +1,5 @@
-//! Advisory Regular Completion observations. A registration ID is local to the
+//! Advisory Completion observations. A registration ID is local to the
 //! Router process and identifies one registration; it is not a Worker UUID.
-
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
@@ -19,6 +18,7 @@ const TTL: Duration = Duration::from_secs(60);
 /// another Worker object at the same URL, even on a retry of the same request.
 pub struct CompletionHistoryRequest {
     registrations: HashSet<u64>,
+    pub(super) prefill: bool,
 }
 
 impl CompletionHistoryRequest {
@@ -33,7 +33,7 @@ impl CompletionHistoryRequest {
 }
 
 impl TargetBinding {
-    fn is_history_worker(&self, worker: &dyn Worker) -> bool {
+    pub(super) fn is_history_worker(&self, worker: &dyn Worker) -> bool {
         // The Weak keeps this allocation's address from being recycled; the
         // registration ID separately fences re-registration of the same Arc.
         self.history_worker
@@ -47,6 +47,29 @@ pub struct HistoryObservation {
     prefix: Arc<[u32]>,
 }
 
+/// A prefix lookup prepared before P/D admission. It owns no load or tokens;
+/// admission rechecks its expiry and registration before using its overlap.
+#[derive(Debug, Clone)]
+pub struct PrefillHistoryHint {
+    pub(super) registration_id: u64,
+    hit: Option<HistoryHit>,
+    pub(super) positive_credit: Option<bool>,
+}
+
+impl PrefillHistoryHint {
+    /// Mint the selected P's observation from the same prepared input used for
+    /// this lookup. Call only after admission, outside its load lock.
+    pub(crate) fn observation(&self, ids: &[u32]) -> HistoryObservation {
+        HistoryObservation::new(self.registration_id, ids)
+    }
+}
+
+impl PrefillHistoryHint {
+    pub(super) fn len_at(&self, now: Instant) -> usize {
+        self.hit.as_ref().map_or(0, |hit| hit.len_at(now))
+    }
+}
+
 impl HistoryObservation {
     pub(super) fn new(registration_id: u64, tokens: &[u32]) -> Self {
         Self {
@@ -56,6 +79,7 @@ impl HistoryObservation {
     }
 }
 
+#[derive(Debug, Clone)]
 pub(super) struct HistoryHit {
     length: usize,
     expires: Instant,
@@ -197,13 +221,18 @@ impl KvAwarePolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         requested_model: &str,
+        prefill: bool,
     ) -> CompletionHistoryRequest {
         let registrations = workers
             .iter()
             .filter_map(|worker| {
                 let b = self.targets.get(worker.url())?;
-                (worker.worker_type() == WorkerType::Regular
-                    && worker.connection_mode() == ConnectionMode::Http
+                ((if prefill {
+                    matches!(worker.worker_type(), WorkerType::Prefill { .. })
+                        && worker.dp_size().is_none_or(|size| size == 1)
+                } else {
+                    worker.worker_type() == WorkerType::Regular
+                }) && worker.connection_mode() == ConnectionMode::Http
                     && worker.dp_rank().is_none()
                     && b.target.dp_rank == 0
                     && b.is_history_worker(worker.as_ref())
@@ -214,7 +243,48 @@ impl KvAwarePolicy {
             })
             .collect();
         self.completion_history.get_or_init(Default::default);
-        CompletionHistoryRequest { registrations }
+        CompletionHistoryRequest {
+            registrations,
+            prefill,
+        }
+    }
+
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    pub(crate) fn prepare_prefill_history(
+        &self,
+        capture: &CompletionHistoryRequest,
+        worker: &dyn Worker,
+        ids: &[u32],
+    ) -> Option<PrefillHistoryHint> {
+        use super::KvAwareOps;
+        self.estimate_prefill_work_with_history(capture, &[(worker, &[ids.to_vec()], true)])
+            .into_iter()
+            .next()
+            .and_then(|(_, hint)| hint)
+    }
+
+    pub(super) fn prefill_history_hint_from_binding(
+        &self,
+        capture: &CompletionHistoryRequest,
+        worker: &dyn Worker,
+        ids: &[u32],
+        binding: &TargetBinding,
+        positive_credit: Option<bool>,
+    ) -> Option<PrefillHistoryHint> {
+        if self.params.router_temperature != 0.0 || !capture.prefill || ids.is_empty() {
+            return None;
+        }
+        let registration_id = capture.registration_id(worker, binding)?;
+        Some(PrefillHistoryHint {
+            registration_id,
+            hit: self.completion_history.get()?.match_prefix(
+                registration_id,
+                ids,
+                binding.block_size,
+                Instant::now(),
+            ),
+            positive_credit,
+        })
     }
 
     pub(super) fn commit_history_observation(

@@ -183,6 +183,10 @@ impl KvIndexSupervisor {
         (supervisor, signals)
     }
 
+    pub(crate) fn has_static_pd_source(&self, worker_url: &str) -> bool {
+        self.static_pd_sources.contains_key(worker_url)
+    }
+
     /// Resolve source-owned feedback to registered URLs, never remote metadata addresses.
     pub fn worker_urls_for_source(&self, source: &SourceId) -> Vec<String> {
         self.workers
