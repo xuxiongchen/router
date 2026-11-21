@@ -685,6 +685,7 @@ impl CliArgs {
             disable_circuit_breaker: self.disable_circuit_breaker,
             kv_aware_session_affinity_ttl_secs: self.kv_aware_session_affinity_ttl_secs,
             kv_aware_completion_history: self.kv_aware_completion_history,
+            kv_aware_prefill_history: false,
             health_check: HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,

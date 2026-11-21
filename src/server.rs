@@ -80,6 +80,11 @@ impl AppContext {
                 warn!(reason, "Completion history disabled");
             }
         }
+        if router_config.kv_aware_prefill_history {
+            if let Err(reason) = router_config.prefill_history_support() {
+                warn!(reason, "Prefill history disabled");
+            }
+        }
         let rate_limit_tokens = rate_limit_tokens_per_second.unwrap_or(max_concurrent_requests);
         let rate_limiter = Arc::new(TokenBucket::new(max_concurrent_requests, rate_limit_tokens));
 

@@ -169,6 +169,8 @@ pub(crate) fn http_input_requires_render(body: &serde_json::Value, route: &str) 
 pub(crate) struct HttpTokenInput {
     pub prompts: Arc<[Vec<u32>]>,
     pub source: &'static str,
+    /// Direct client IDs or HTTP preparation from the requested endpoint.
+    pub(crate) same_endpoint: bool,
 }
 
 /// The router's own token ids for `grpc://` pools, which take token ids and
@@ -185,6 +187,7 @@ pub(crate) fn router_token_inputs(
     let input = checked.map(|()| HttpTokenInput {
         prompts: prompts.clone(),
         source: "prepared",
+        same_endpoint: false,
     });
     urls.into_iter().map(|url| (url, input.clone())).collect()
 }
@@ -214,6 +217,7 @@ pub(crate) async fn prepare_http_token_inputs(
                     Ok(HttpTokenInput {
                         prompts: prompts.clone(),
                         source: "token_ids",
+                        same_endpoint: true,
                     }),
                 )
             })
@@ -244,17 +248,20 @@ pub(crate) async fn prepare_http_token_inputs(
             let tokenize_fallback = &tokenize_fallback;
             async move {
                 let result = async {
-                    let (prompts, source) =
+                    let (prompts, source, same_endpoint) =
                         match http_input_json(client, &url, path, body, headers, api_key).await {
-                            Ok(rendered) => (http_rendered_tokens(&rendered)?, "render"),
+                            Ok((rendered, same_endpoint)) => {
+                                (http_rendered_tokens(&rendered)?, "render", same_endpoint)
+                            }
                             Err("render_unavailable") => {
                                 let requests = tokenize_fallback
                                     .get_or_init(|| http_tokenize_fallback(body, route))
                                     .as_ref()
                                     .ok_or("render_unavailable")?;
                                 let mut prompts = Vec::with_capacity(requests.len());
+                                let mut same_endpoint = true;
                                 for request in requests {
-                                    let tokenized = http_input_json(
+                                    let (tokenized, direct) = http_input_json(
                                         client,
                                         &url,
                                         "/tokenize",
@@ -263,6 +270,7 @@ pub(crate) async fn prepare_http_token_inputs(
                                         api_key,
                                     )
                                     .await?;
+                                    same_endpoint &= direct;
                                     let ids = dense_token_ids(&tokenized["tokens"])?;
                                     if tokenized["count"].as_u64() != Some(ids.len() as u64)
                                         || tokenized["max_model_len"]
@@ -273,14 +281,18 @@ pub(crate) async fn prepare_http_token_inputs(
                                     }
                                     prompts.push(ids);
                                 }
-                                (Arc::from(prompts), "tokenize")
+                                (Arc::from(prompts), "tokenize", same_endpoint)
                             }
                             Err(reason) => return Err(reason),
                         };
                     if prompts.len() != expected_prompts {
                         return Err("invalid_preparation_response");
                     }
-                    Ok(HttpTokenInput { prompts, source })
+                    Ok(HttpTokenInput {
+                        prompts,
+                        source,
+                        same_endpoint,
+                    })
                 }
                 .await;
                 (url, result)
@@ -302,9 +314,10 @@ async fn http_input_json(
     body: &serde_json::Value,
     headers: Option<&http::HeaderMap>,
     api_key: Option<&str>,
-) -> Result<serde_json::Value, &'static str> {
+) -> Result<(serde_json::Value, bool), &'static str> {
+    let url = format!("{}{path}", base.trim_end_matches('/'));
     let mut request = client
-        .post(format!("{}{path}", base.trim_end_matches('/')))
+        .post(&url)
         .timeout(std::time::Duration::from_secs(5))
         .json(body);
     if let Some(key) = api_key {
@@ -323,10 +336,12 @@ async fn http_input_json(
         status if !status.is_success() => return Err("preparation_rejected"),
         _ => {}
     }
-    response
+    let same_endpoint = reqwest::Url::parse(&url).is_ok_and(|expected| &expected == response.url());
+    let body = response
         .json()
         .await
-        .map_err(|_| "invalid_preparation_response")
+        .map_err(|_| "invalid_preparation_response")?;
+    Ok((body, same_endpoint))
 }
 
 pub(crate) fn http_tokenize_fallback(

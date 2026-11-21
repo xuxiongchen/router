@@ -13,7 +13,9 @@ use crate::core::{
     Worker, WorkerRegistry, WorkerResult, WorkerType,
 };
 use crate::policies::WorkerTokenInputs;
-use crate::policies::{kv_aware_ops, LoadBalancingPolicy, PolicyRegistry};
+use crate::policies::{
+    kv_aware_ops, kv_aware_policy, LoadBalancingPolicy, PolicyRegistry, PrefillTieCandidate,
+};
 use crate::routers::header_utils;
 use async_trait::async_trait;
 use axum::{
@@ -272,30 +274,62 @@ fn select_stage(
         // Token costs and request counts have different units. If any
         // eligible P has unknown work, compare the whole pool by occupancy.
         if let Some(inputs) = inputs {
-            let work: Vec<_> = inputs.iter().map(|(_, _, work)| *work).collect();
-            let costs: Vec<_> = selected_indices
+            let active: Vec<_> = selected_indices
                 .iter()
-                .zip(&work)
-                .map(|(&index, work)| {
+                .map(|&index| {
                     loads
                         .get(&(stage, endpoints[index].clone()))
                         .copied()
                         .unwrap_or_default()
                         .active_prefill_tokens
-                        .saturating_add(work.new_prefill_tokens) as f64
+                })
+                .collect();
+            let costs: Vec<_> = inputs
+                .iter()
+                .zip(&active)
+                .map(|((_, _, work), &active)| {
+                    active.saturating_add(work.new_prefill_tokens) as f64
                 })
                 .collect();
             let occupancy: Vec<_> = projected.iter().map(|worker| worker.load()).collect();
             debug!(version = 1, stage = "prefill", endpoints = ?selected_indices.iter()
                 .map(|&index| &endpoints[index]).collect::<Vec<_>>(), ?costs, ?occupancy,
-                remaining_work = ?work, "P/D token-cost candidates");
+                remaining_work = ?inputs.iter().map(|(_, _, work)| work).collect::<Vec<_>>(),
+                "P/D token-cost candidates");
             // P follows actual token work across the full eligible pool;
             // decode session affinity must never filter or pin prefill.
-            if let Some(picked) = kv.pick_prefill(&costs, &occupancy) {
-                let (input, tokens, _) = inputs[picked];
-                let estimate = work[picked];
+            if let Some(ordinary) = kv.pick_prefill(&costs, &occupancy) {
+                let (picked, history_used) = if let Some((hints, policy)) =
+                    context.prefill_history.zip(kv_aware_policy(policy))
+                {
+                    let candidates: Vec<_> = selected_indices
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &index)| {
+                            let worker = workers[index].as_ref();
+                            PrefillTieCandidate {
+                                worker,
+                                hint: hints.get(worker.url()),
+                                cost: costs[i],
+                                occupancy: occupancy[i],
+                                active_prefill_tokens: active[i],
+                            }
+                        })
+                        .collect();
+                    let (picked, reason) = policy.refine_prefill_tie(&candidates, ordinary);
+                    crate::metrics::RouterMetrics::record_history_decision(
+                        "prefill_history",
+                        reason,
+                    );
+                    (picked, picked != ordinary)
+                } else {
+                    (ordinary, false)
+                };
+                let (input, tokens, estimate) = inputs[picked];
                 let new_tokens = estimate.new_prefill_tokens;
-                let outcome = if !estimate.placement_verified {
+                let outcome = if history_used {
+                    "history_hint"
+                } else if !estimate.placement_verified {
                     "unverified_identity"
                 } else {
                     "prefix_cost"
@@ -331,6 +365,16 @@ fn select_stage(
         }
     }
     let mut decode_prices_used = false;
+    if stage == Stage::Prefill && context.prefill_history.is_some() {
+        crate::metrics::RouterMetrics::record_history_decision(
+            "prefill_history",
+            if unknown_backlog {
+                "unknown_prefill_backlog"
+            } else {
+                "unknown_prefill_work"
+            },
+        );
+    }
     let (picked, affinity_outcome, affinity_binding) = if stage == Stage::Decode && kv_aware {
         // Decode never queries placement or applies the P temperature:
         // deterministic minimum occupancy with rotating equal-load ties, and
@@ -1369,6 +1413,8 @@ impl PdRouterBase {
                         .is_some()
                         .then(|| decode_policy.clone()),
                     ctx.router_config.kv_event_strict_recovery,
+                    ctx.router_config.kv_aware_prefill_history
+                        && ctx.router_config.prefill_history_support().is_ok(),
                 )
                 .await,
             )
@@ -1570,6 +1616,7 @@ impl PdRouterBase {
     ) -> Response {
         let context = PdRequestContext {
             prefill_inputs: None,
+            prefill_history: None,
             model_id: None,
             legacy_policy_input: None,
             prefill_cache: None,
@@ -2103,6 +2150,7 @@ mod tests {
         let decode_workers = router.worker_registry.get_decode_workers();
         let context = PdRequestContext {
             prefill_inputs: None,
+            prefill_history: None,
             model_id: None,
             legacy_policy_input: None,
             prefill_cache: None,
@@ -2134,6 +2182,7 @@ mod tests {
         let empty: Vec<Arc<dyn Worker>> = Vec::new();
         let context = PdRequestContext {
             prefill_inputs: None,
+            prefill_history: None,
             model_id: None,
             legacy_policy_input: None,
             prefill_cache: None,
@@ -2979,6 +3028,7 @@ mod admission_tests {
     fn context() -> PdRequestContext<'static> {
         PdRequestContext {
             prefill_inputs: None,
+            prefill_history: None,
             model_id: None,
             legacy_policy_input: Some("original request"),
             prefill_cache: None,
@@ -3046,6 +3096,7 @@ mod admission_tests {
     fn context_with_session(session: &str) -> PdRequestContext<'static> {
         PdRequestContext {
             prefill_inputs: None,
+            prefill_history: None,
             model_id: None,
             legacy_policy_input: Some("original request"),
             prefill_cache: None,
@@ -3798,6 +3849,7 @@ mod admission_tests {
         fn ctx(model: &str) -> PdRequestContext<'_> {
             PdRequestContext {
                 prefill_inputs: None,
+                prefill_history: None,
                 model_id: Some(model),
                 legacy_policy_input: Some("original request"),
                 prefill_cache: None,

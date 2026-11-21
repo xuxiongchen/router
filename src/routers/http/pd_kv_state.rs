@@ -8,12 +8,15 @@ use crate::core::worker::worker_get;
 use crate::core::Worker;
 use crate::kv_index::discovery::WorkerDiscovery;
 use crate::kv_index::{HashMode, KvIndexSupervisor, WorkerKvInfo};
-use crate::policies::{kv_aware_ops, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy, PromptHashes};
+use crate::policies::{
+    kv_aware_ops, kv_aware_policy, KvAwareOps, KvAwarePolicy, LoadBalancingPolicy,
+    PrefillHistoryCapture, PrefillHistoryHint, PromptHashes,
+};
 use axum::http::HeaderMap;
 use futures_util::{stream, StreamExt};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -48,6 +51,13 @@ struct Discovery {
 struct TargetRegistration {
     signature: String,
     decode: bool,
+    history_worker: Option<Weak<dyn Worker>>,
+}
+
+pub(super) struct PreparedPdStages {
+    pub prefill: HashMap<String, PdPrefillInput>,
+    pub decode: Option<HashMap<String, u64>>,
+    pub history: Option<HashMap<String, PrefillHistoryHint>>,
 }
 
 /// Consecutive failed probes before a previously healthy binding is treated as
@@ -99,6 +109,7 @@ pub(super) struct PdKvState {
     registry: Option<Arc<crate::core::WorkerRegistry>>,
     prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
     decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+    pub(super) history_enabled: bool,
     bindings: Mutex<HashMap<String, Binding>>,
     targets: Mutex<HashMap<String, TargetRegistration>>,
     // Serializes bind() runs. Discovery and subscriber handshakes run outside
@@ -120,6 +131,7 @@ impl PdKvState {
     /// `prefill_policy` and `decode_policy` rank the stages that publish KV.
     /// Worker membership comes from `registry`; startup binds through the same
     /// entry point as refresh so the two cannot diverge.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn start(
         client: reqwest::Client,
         api_key: Option<String>,
@@ -128,12 +140,18 @@ impl PdKvState {
         prefill_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         decode_policy: Option<Arc<dyn LoadBalancingPolicy>>,
         strict_recovery: bool,
+        history_enabled: bool,
     ) -> Arc<Self> {
         let mut state = Self::new_with_statics(client, sources);
         state.api_key = api_key;
         state.supervisor.set_api_key(state.api_key.clone());
         state.supervisor.set_strict_recovery(strict_recovery);
         state.registry = Some(registry);
+        state.history_enabled = history_enabled
+            && prefill_policy
+                .as_deref()
+                .and_then(kv_aware_policy)
+                .is_some();
         state.prefill_policy = prefill_policy;
         state.decode_policy = decode_policy;
         let state = Arc::new(state);
@@ -169,6 +187,19 @@ impl PdKvState {
         self.bindings.lock().await
     }
 
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(super) async fn rebind_prefill_for_test(&self) {
+        self.bind_refresh(false).await;
+    }
+
+    /// Freeze policy registration while a test replaces a registry Worker.
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    pub(super) async fn lock_refresh_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.bind_lock.lock().await
+    }
+
     fn new_with_statics(
         client: reqwest::Client,
         static_sources: HashMap<String, crate::config::types::PdKvEventSources>,
@@ -182,12 +213,17 @@ impl PdKvState {
             registry: None,
             prefill_policy: None,
             decode_policy: None,
+            history_enabled: false,
             bindings: Mutex::new(HashMap::new()),
             targets: Mutex::new(HashMap::new()),
             bind_lock: Mutex::new(()),
             // Subscribers enforce trust by suspending/clearing affected sources.
             signals: tokio::spawn(async move { while signals.recv().await.is_some() {} }),
         }
+    }
+
+    pub(super) fn has_history_source(&self, worker: &dyn Worker) -> bool {
+        self.supervisor.has_static_pd_source(worker.base_url())
     }
 
     /// Reconcile bindings off the request path. Requests never wait for
@@ -414,13 +450,22 @@ impl PdKvState {
         let bindings = self.bindings.lock().await;
         let mut targets = self.targets.lock().await;
         for worker in workers {
+            let history =
+                !decode && self.history_enabled && self.has_history_source(worker.as_ref());
             let binding = bindings.get(worker.base_url());
             let signature = binding
                 .map(|binding| format!("{}:{:?}", binding.signature, binding.info))
                 .unwrap_or_default();
             let previous = targets.get(worker.url());
             let same = previous.is_some_and(|registration| {
-                registration.signature == signature && registration.decode == decode
+                registration.signature == signature
+                    && registration.decode == decode
+                    && match registration.history_worker.as_ref() {
+                        Some(previous) => {
+                            history && std::ptr::addr_eq(previous.as_ptr(), worker.as_ref())
+                        }
+                        None => !history,
+                    }
             });
             if same {
                 continue;
@@ -448,10 +493,18 @@ impl PdKvState {
                     .then(|| self.supervisor.match_provider_for_worker(worker.base_url()))
                     .flatten()
             });
-            policy.register_worker(worker.as_ref(), info, matches);
+            if history {
+                policy.register_history_worker(worker, info, matches);
+            } else {
+                policy.register_worker(worker.as_ref(), info, matches);
+            }
             targets.insert(
                 worker.url().to_owned(),
-                TargetRegistration { signature, decode },
+                TargetRegistration {
+                    signature,
+                    decode,
+                    history_worker: history.then(|| Arc::downgrade(worker)),
+                },
             );
         }
     }
@@ -621,10 +674,8 @@ impl PdKvState {
         headers: Option<&HeaderMap>,
         router_prompts: Option<&Arc<[Vec<u32>]>>,
         defer_decode: bool,
-    ) -> (
-        HashMap<String, PdPrefillInput>,
-        Option<HashMap<String, u64>>,
-    ) {
+        capture: Option<&PrefillHistoryCapture>,
+    ) -> PreparedPdStages {
         let started = Instant::now();
         let allow_credit = self.credit_by_base(request).await;
         let cache_salt = request.get("cache_salt").and_then(Value::as_str);
@@ -680,10 +731,24 @@ impl PdKvState {
         // requires an empty LoRA adapter: `http_cache_identity` refuses any
         // other request, so both estimates hash the base model's blocks.
         let mut hashes = PromptHashes::new();
+        let redirected_bases = if capture.is_some() {
+            prefill_results
+                .iter()
+                .filter(|(_, result)| result.as_ref().is_ok_and(|input| !input.same_endpoint))
+                .map(|(base, _)| base.clone())
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let mut prepared = Self::build_prefill_inputs(request, &allow_credit, prefill_results);
-        if let Some(kv) = kv_aware_ops(prefill_policy.as_ref()) {
-            Self::attach_prefill_work(kv, prefill_workers, &mut prepared, &mut hashes);
-        }
+        let history = Self::attach_prefill_work(
+            prefill_policy.as_ref(),
+            prefill_workers,
+            &mut prepared,
+            &mut hashes,
+            capture,
+            &redirected_bases,
+        );
         // One eligibility decision for both stages, so the two cannot diverge.
 
         let decode_context = if decode_priced_here {
@@ -706,7 +771,11 @@ impl PdKvState {
         };
         metrics::histogram!("vllm_router_pd_kv_prepare_seconds")
             .record(started.elapsed().as_secs_f64());
-        (prepared, decode_context)
+        PreparedPdStages {
+            prefill: prepared,
+            decode: decode_context,
+            history,
+        }
     }
 
     /// Render the request against each base, or reuse the router's own ids.
@@ -766,11 +835,14 @@ impl PdKvState {
     }
 
     fn attach_prefill_work(
-        kv: &dyn KvAwareOps,
+        policy: &dyn LoadBalancingPolicy,
         workers: &[Arc<dyn Worker>],
         prepared: &mut HashMap<String, PdPrefillInput>,
         hashes: &mut PromptHashes,
-    ) {
+        capture: Option<&PrefillHistoryCapture>,
+        redirected_bases: &HashSet<String>,
+    ) -> Option<HashMap<String, PrefillHistoryHint>> {
+        let kv = kv_aware_ops(policy)?;
         let inputs: Vec<_> = workers
             .iter()
             .filter_map(|worker| {
@@ -782,18 +854,40 @@ impl PdKvState {
                 ))
             })
             .collect();
-        let work: Vec<_> = inputs
-            .iter()
-            .zip(kv.estimate_prefill_work(&inputs, hashes))
-            .map(|((worker, _, _), estimate)| {
-                (worker.base_url().to_owned(), worker.dp_rank(), estimate)
-            })
-            .collect();
+        let (work, history) = match capture.zip(kv_aware_policy(policy)) {
+            Some((capture, policy)) => {
+                let mut history = HashMap::new();
+                let work: Vec<_> = inputs
+                    .iter()
+                    .zip(policy.estimate_prefill_work_with_history(capture, &inputs, hashes))
+                    .map(|((worker, _, _), (work, hint))| {
+                        if let Some(hint) =
+                            hint.filter(|_| !redirected_bases.contains(worker.base_url()))
+                        {
+                            history.insert(worker.url().to_owned(), hint);
+                        }
+                        (worker.base_url().to_owned(), worker.dp_rank(), work)
+                    })
+                    .collect();
+                (work, Some(history))
+            }
+            None => (
+                inputs
+                    .iter()
+                    .zip(kv.estimate_prefill_work(&inputs, hashes))
+                    .map(|((worker, _, _), work)| {
+                        (worker.base_url().to_owned(), worker.dp_rank(), work)
+                    })
+                    .collect(),
+                None,
+            ),
+        };
         for (base, rank, work) in work {
             if let Some(entry) = prepared.get_mut(&base) {
                 entry.work_by_rank.insert(rank, work);
             }
         }
+        history
     }
 
     /// Pure: the Decode estimate over already-rendered prompts.
@@ -986,9 +1080,10 @@ mod kv_input_tests {
                 headers,
                 None,
                 true,
+                None,
             )
             .await
-            .0
+            .prefill
     }
     #[tokio::test]
     async fn unsupported_inputs_fall_back_without_control_or_tokenization_requests() {
@@ -1354,6 +1449,7 @@ mod kv_input_tests {
                 Some(Arc::new(KvAwarePolicy::default())),
                 Some(Arc::new(KvAwarePolicy::default())),
                 strict,
+                false,
             )
             .await;
 
@@ -1452,6 +1548,7 @@ mod kv_input_tests {
             registry.clone(),
             Some(prefill_policy.clone()),
             Some(decode_policy.clone()),
+            false,
             false,
         )
         .await;

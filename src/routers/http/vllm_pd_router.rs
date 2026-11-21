@@ -6,6 +6,7 @@ use super::pd_cached_tokens;
 use super::pd_program_adapter::{self, PdProgramRuntime};
 use super::pd_router::PdRouterBase;
 use super::pd_types::{error_chain, PDRouterError, PdAttempt, PdEndpoint, PdRequestContext};
+use super::prefill_history::{fresh_prefill_handoff, prefill_history_model, PrefillObservation};
 use super::router::{hold_request_load_until_body_done, prepare_error_status, RequestLoadGuard};
 use super::usage_merge;
 use super::vllm_service_discovery::{MoriIOTransferMode, ServiceRegistry, ServiceType};
@@ -15,7 +16,8 @@ use crate::core::{BasicWorker, DPAwareWorker, Worker, WorkerType};
 use crate::metrics::RouterMetrics;
 use crate::otel_http::{self, ClientRequestOptions};
 use crate::policies::{
-    kv_aware_ops, AffinityKey, LoadBalancingPolicy, PolicyRegistry, WorkerTokenInputs,
+    kv_aware_ops, kv_aware_policy, AffinityKey, LoadBalancingPolicy, PolicyRegistry,
+    WorkerTokenInputs,
 };
 use crate::program_scheduling::ProgramIdentity;
 use crate::routers::{header_utils, RouterTrait, WorkerManagement};
@@ -194,6 +196,7 @@ struct Admission {
     /// Resolved once at admission so the commitment does not re-read the
     /// headers and body.
     affinity_key: Option<AffinityKey>,
+    prefill_observation: Option<PrefillObservation>,
 }
 
 /// Transfer ID prefix used by MoRI-IO to correlate prefill and decode legs.
@@ -1162,52 +1165,90 @@ impl VllmPDRouter {
         // One hash cache for the request and one credit decision for both stages. The two
         // renders run concurrently - they are the only network work here - and only the
         // local estimation walks the prompts in sequence.
-        let (prefill_inputs, decode_inputs, decode_context) = match self.pd_router.kv_state.as_ref()
-        {
-            Some(state) => {
-                let (stages, decode_inputs) = tokio::join!(
-                    state.prepare_stages(
-                        prefill_workers,
-                        &prefill_policy,
-                        &priceable_decode,
-                        &decode_policy,
-                        request,
-                        path,
-                        headers,
-                        router_prompts,
-                        defer_decode,
-                    ),
-                    self.pd_router.prepare_decode_inputs(
-                        decode_workers,
-                        request,
-                        path,
-                        headers,
-                        router_prompts,
-                    ),
-                );
-                let (prefill_inputs, decode_context) = stages;
-                (Some(prefill_inputs), decode_inputs, decode_context)
-            }
-            None => {
-                let (prefill_inputs, decode_inputs) = tokio::join!(
-                    self.pd_router.prepare_prefill_inputs(
-                        prefill_workers,
-                        request,
-                        path,
-                        headers,
-                        router_prompts,
-                    ),
-                    self.pd_router.prepare_decode_inputs(
-                        decode_workers,
-                        request,
-                        path,
-                        headers,
-                        router_prompts,
-                    ),
-                );
-                (prefill_inputs, decode_inputs, None)
-            }
-        };
+        let (prefill_inputs, decode_inputs, decode_context, mut history) =
+            match self.pd_router.kv_state.as_ref() {
+                Some(state) => {
+                    // Configuration already excludes discovery, EPD, and other
+                    // connectors. Check the current sequential P path and this
+                    // request, then capture the registration before any render.
+                    let capture = if !state.history_enabled {
+                        None
+                    } else if !prefill_workers
+                        .iter()
+                        .any(|worker| state.has_history_source(worker.as_ref()))
+                    {
+                        RouterMetrics::record_history_decision(
+                            "prefill_history_input",
+                            "missing_static_source",
+                        );
+                        None
+                    } else {
+                        let capture = (defer_decode
+                            && path == "/v1/completions"
+                            && router_prompts.is_none())
+                        .then(|| {
+                            kv_aware_policy(prefill_policy.as_ref())?.capture_prefill_history(
+                                prefill_workers,
+                                prefill_history_model(request)?,
+                            )
+                        })
+                        .flatten();
+                        if capture.is_none() {
+                            RouterMetrics::record_history_decision(
+                                "prefill_history_input",
+                                "unsupported_or_missing_evidence",
+                            );
+                        }
+                        capture
+                    };
+                    let (stages, decode_inputs) = tokio::join!(
+                        state.prepare_stages(
+                            prefill_workers,
+                            &prefill_policy,
+                            &priceable_decode,
+                            &decode_policy,
+                            request,
+                            path,
+                            headers,
+                            router_prompts,
+                            defer_decode,
+                            capture.as_ref(),
+                        ),
+                        self.pd_router.prepare_decode_inputs(
+                            decode_workers,
+                            request,
+                            path,
+                            headers,
+                            router_prompts,
+                        ),
+                    );
+                    (
+                        Some(stages.prefill),
+                        decode_inputs,
+                        stages.decode,
+                        stages.history,
+                    )
+                }
+                None => {
+                    let (prefill_inputs, decode_inputs) = tokio::join!(
+                        self.pd_router.prepare_prefill_inputs(
+                            prefill_workers,
+                            request,
+                            path,
+                            headers,
+                            router_prompts,
+                        ),
+                        self.pd_router.prepare_decode_inputs(
+                            decode_workers,
+                            request,
+                            path,
+                            headers,
+                            router_prompts,
+                        ),
+                    );
+                    (prefill_inputs, decode_inputs, None, None)
+                }
+            };
         let model_id = request.get("model").and_then(Value::as_str);
         let cache_salt = request
             .get("cache_salt")
@@ -1236,8 +1277,25 @@ impl VllmPDRouter {
         // The prepared selection gates deferral; token inputs are retained so
         // cache matches can be recomputed against the tree at dispatch.
         let decode_cache = decode_cache.map(Arc::new);
+        if let Some(history) = history.as_mut() {
+            // A render may finish after the registry replaced its Worker, but
+            // before policy refresh retires the captured registration. Drop
+            // only its advisory hint; ordinary admission keeps its candidates.
+            for worker in prefill_workers {
+                if history.contains_key(worker.url())
+                    && !self
+                        .pd_router
+                        .worker_registry
+                        .get_by_url(worker.url())
+                        .is_some_and(|current| Arc::ptr_eq(&current, worker))
+                {
+                    history.remove(worker.url());
+                }
+            }
+        }
         let context = PdRequestContext {
             prefill_inputs: prefill_inputs.as_ref(),
+            prefill_history: history.as_ref(),
             model_id,
             legacy_policy_input: text.as_deref(),
             prefill_cache: prefill_cache.as_ref(),
@@ -1259,11 +1317,29 @@ impl VllmPDRouter {
             &context,
             defer_decode,
         )?;
+        let prefill_observation = history.as_ref().and_then(|history| {
+            let picked = &selection.prefill;
+            let worker = prefill_workers.get(picked.worker_index)?;
+            let hint = history.get(worker.url())?;
+            let [ids] = prefill_inputs
+                .as_ref()?
+                .get(worker.base_url())?
+                .prompts
+                .as_deref()?
+            else {
+                return None;
+            };
+            Some(PrefillObservation {
+                input_tokens: ids.len(),
+                ticket: hint.observation(ids),
+            })
+        });
         Some(Admission {
             selection,
             attempt,
             decode_tokens: decode_cache.map(|_| decode_tokens),
             affinity_key,
+            prefill_observation,
         })
     }
 
@@ -1426,6 +1502,7 @@ impl VllmPDRouter {
         Self::retain_commit_candidates(&mut candidates, input.model_id.as_deref(), pin);
         let context = PdRequestContext {
             prefill_inputs: None,
+            prefill_history: None,
             model_id: input.model_id.as_deref(),
             legacy_policy_input: None,
             prefill_cache: None,
@@ -1662,6 +1739,7 @@ impl VllmPDRouter {
                 headers,
                 attempt.clone(),
                 Some(permit),
+                None,
                 None,
             )
             .await;
@@ -1909,6 +1987,7 @@ impl VllmPDRouter {
                 attempt.clone(),
                 None,
                 commit.as_ref(),
+                None,
             )
             .await
         {
@@ -2138,6 +2217,7 @@ impl VllmPDRouter {
             attempt,
             decode_tokens,
             affinity_key,
+            ..
         }) = self
             .admit_pair_with_tokens(
                 &prefill_workers,
@@ -2207,6 +2287,7 @@ impl VllmPDRouter {
         attempt: PdAttempt,
         prefill_permit: Option<OwnedSemaphorePermit>,
         commit: Option<&DecodeCommitInput>,
+        prefill_observation: Option<PrefillObservation>,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
         let start_time = Instant::now();
@@ -2391,6 +2472,12 @@ impl VllmPDRouter {
             },
         )
         .await;
+        // reqwest may follow redirects. Keep forwarding unchanged, but a
+        // response from any other URL cannot teach this static P's history.
+        let same_prefill_url = prefill_observation.is_some()
+            && prefill_response.as_ref().is_ok_and(|response| {
+                reqwest::Url::parse(&prefill_url).is_ok_and(|url| &url == response.url())
+            });
         let finished_prefill = self
             .finish_prefill_response(prefill_response, &prefill_base_url, &attempt)
             .await
@@ -2454,6 +2541,42 @@ impl VllmPDRouter {
                     "Prefill returned no KV transfer parameters; refusing metadata-only decode"
                         .into(),
             });
+        }
+
+        // Full P success is independent of the deferred Decode commitment
+        // and its outcome. Observe before any await in that leg.
+        if let Some(observation) = prefill_observation {
+            let reason = if !same_prefill_url {
+                "redirected_prefill"
+            } else if let Err(reason) = fresh_prefill_handoff(
+                &prefill_response_json,
+                &request_id,
+                observation.input_tokens,
+            ) {
+                reason
+            } else if self.prefill_pinned_to_provisional(
+                prefill_worker.as_ref(),
+                Some(&prefill_response_json),
+            ) {
+                // A push identity may have been cached since admission.
+                "push_handoff"
+            } else if self
+                .pd_router
+                .worker_registry
+                .get_by_url(prefill_worker.url())
+                .is_some_and(|current| Arc::ptr_eq(&current, &prefill_worker))
+                && kv_aware_policy(self.policy_registry.get_prefill_policy().as_ref()).is_some_and(
+                    |policy| {
+                        policy
+                            .commit_history_observation(prefill_worker.as_ref(), observation.ticket)
+                    },
+                )
+            {
+                "validated_handoff"
+            } else {
+                "stale_registration"
+            };
+            RouterMetrics::record_history_decision("prefill_history_commit", reason);
         }
 
         // The Prefill response is the first point where a deferred decode
@@ -3709,6 +3832,7 @@ impl RouterTrait for VllmPDRouter {
                 attempt,
                 decode_tokens,
                 affinity_key,
+                prefill_observation,
             } = match self
                 .admit_pair(
                     &prefill_workers,
@@ -3766,6 +3890,7 @@ impl RouterTrait for VllmPDRouter {
                     attempt.clone(),
                     None,
                     commit.as_ref(),
+                    prefill_observation,
                 )
                 .await
             {
@@ -3858,6 +3983,823 @@ mod tests {
     }
 
     use super::*;
+
+    struct PrefillHistoryCall {
+        stage: &'static str,
+        index: usize,
+        headers: HeaderMap,
+        body: Value,
+        response: tokio::sync::oneshot::Sender<Response>,
+    }
+
+    struct PrefillHistoryFixture {
+        router: Arc<dyn RouterTrait>,
+        prefill: Vec<Arc<dyn Worker>>,
+        decode: Vec<Arc<dyn Worker>>,
+        calls: tokio::sync::mpsc::UnboundedReceiver<PrefillHistoryCall>,
+        server: tokio::task::JoinHandle<()>,
+        _publishers: Vec<zmq::Socket>,
+    }
+
+    impl Drop for PrefillHistoryFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl PrefillHistoryFixture {
+        fn pd(&self) -> &VllmPDRouter {
+            self.router.as_any().downcast_ref().unwrap()
+        }
+
+        async fn next(&mut self, stage: &str) -> PrefillHistoryCall {
+            let call = tokio::time::timeout(std::time::Duration::from_secs(5), self.calls.recv())
+                .await
+                .expect("P/D request did not reach the backend")
+                .unwrap();
+            assert_eq!(call.stage, stage);
+            call
+        }
+
+        fn start(&self, token: u32) -> tokio::task::JoinHandle<Response> {
+            self.start_prompt(json!(vec![token; 33]))
+        }
+
+        fn start_prompt(&self, prompt: Value) -> tokio::task::JoinHandle<Response> {
+            let router = self.router.clone();
+            tokio::spawn(async move {
+                router
+                    .route_completion(
+                        None,
+                        &serde_json::from_value(
+                            json!({"model":"m", "prompt":prompt, "stream":false}),
+                        )
+                        .unwrap(),
+                        None,
+                    )
+                    .await
+            })
+        }
+
+        fn observed(&self, index: usize, token: u32) -> usize {
+            self.observed_prefix(index, &[token; 33])
+        }
+
+        fn observed_prefix(&self, index: usize, ids: &[u32]) -> usize {
+            let policy = self.pd().policy_registry.get_prefill_policy();
+            kv_aware_policy(policy.as_ref())
+                .unwrap()
+                .observed_completion_prefix(self.prefill[index].as_ref(), ids)
+        }
+
+        fn assert_prefill_charge(&self, index: usize, tokens: u64) {
+            let load = self.pd().pd_router.pd_load.snapshot();
+            assert_eq!(
+                load[&(
+                    super::super::pd_types::Stage::Prefill,
+                    PdEndpoint::for_worker(self.prefill[index].as_ref())
+                )]
+                    .active_prefill_tokens,
+                tokens
+            );
+        }
+
+        fn assert_idle(&self) {
+            assert!(self.pd().pd_router.pd_load.snapshot().is_empty());
+            assert!(self
+                .prefill
+                .iter()
+                .chain(&self.decode)
+                .all(|worker| worker.load() == 0));
+        }
+    }
+
+    fn prefill_history_handoff(call: &PrefillHistoryCall) -> Value {
+        let request_id = call.headers["x-request-id"].to_str().unwrap();
+        super::super::prefill_history::fixture_handoff(request_id, call.index)
+    }
+
+    async fn prefill_history_fixture(enabled: bool) -> PrefillHistoryFixture {
+        prefill_history_fixture_with_source(enabled, true).await
+    }
+
+    async fn prefill_history_fixture_with_source(
+        enabled: bool,
+        static_source: bool,
+    ) -> PrefillHistoryFixture {
+        use crate::config::{PdKvEventSources, PolicyConfig, RouterConfig, RoutingMode};
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        let (sent, calls) = tokio::sync::mpsc::unbounded_channel();
+        let context = zmq::Context::new();
+        let mut publishers = Vec::new();
+        let endpoints: Vec<_> = (0..2)
+            .map(|_| {
+                let socket = context.socket(zmq::PUB).unwrap();
+                socket.bind("tcp://127.0.0.1:*").unwrap();
+                let endpoint = socket.get_last_endpoint().unwrap().unwrap();
+                publishers.push(socket);
+                endpoint
+            })
+            .collect();
+        let mut app = Router::new();
+        for (stage, root) in [("P", "p"), ("D", "d")] {
+            for (index, endpoint) in endpoints.iter().enumerate() {
+                let path = format!("/{root}{index}");
+                app = app.route(&format!("{path}/health"), get(|| async { "ok" }));
+                app = app.route(
+                    &format!("{path}/v1/models"),
+                    get(|| async { Json(json!({"data":[{"id":"m", "parent":null}]})) }),
+                );
+                if stage == "P" && !static_source {
+                    let endpoint = endpoint.clone();
+                    app = app
+                        .route(
+                            &format!("{path}/server_info"),
+                            get(|| async {
+                                Json(json!({"vllm_config":{"model_config":{"model":"m"},
+                                "cache_config":{"block_size":16}}}))
+                            }),
+                        )
+                        .route(
+                            &format!("{path}/kv_event_sources"),
+                            get(move || {
+                                let endpoint = endpoint.clone();
+                                async move {
+                                    Json(json!({"0":{"publisher":"zmq", "endpoint":endpoint,
+                                "enable_kv_cache_events":true}}))
+                                }
+                            }),
+                        );
+                }
+                for (route, phase) in [
+                    ("/v1/completions", stage),
+                    ("/v1/completions/render", "render"),
+                ] {
+                    if phase == "render" && stage != "P" {
+                        continue;
+                    }
+                    let sent = sent.clone();
+                    app = app.route(
+                        &format!("{path}{route}"),
+                        post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                            let sent = sent.clone();
+                            async move {
+                                let (response, receive) = tokio::sync::oneshot::channel();
+                                sent.send(PrefillHistoryCall {
+                                    stage: phase,
+                                    index,
+                                    headers,
+                                    body,
+                                    response,
+                                })
+                                .unwrap();
+                                receive.await.unwrap_or_else(|_| {
+                                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                                })
+                            }
+                        }),
+                    );
+                }
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let prefill_urls: Vec<_> = (0..2)
+            .map(|index| (format!("{base}/p{index}"), None))
+            .collect();
+        let decode_urls: Vec<_> = (0..2).map(|index| format!("{base}/d{index}")).collect();
+        let sources = prefill_urls
+            .iter()
+            .enumerate()
+            .filter(|_| static_source)
+            .map(|(index, (base, _))| {
+                (
+                    base.clone(),
+                    PdKvEventSources {
+                        endpoints: vec![endpoints[index].clone()],
+                        replay_endpoints: None,
+                        block_size: 16,
+                        model: Some("m".into()),
+                    },
+                )
+            })
+            .collect();
+        let config = RouterConfig {
+            mode: RoutingMode::VllmPrefillDecode {
+                prefill_urls: prefill_urls.clone(),
+                decode_urls: decode_urls.clone(),
+                prefill_policy: None,
+                decode_policy: None,
+                discovery_address: None,
+            },
+            policy: PolicyConfig::KvAware {
+                router_temperature: 0.0,
+                kv_penalty_host: 0.8,
+                kv_penalty_external: 0.6,
+                kv_penalty_disk: 0.3,
+                static_kv_event_sources: Default::default(),
+            },
+            kv_aware_prefill_history: enabled,
+            pd_kv_event_sources: sources,
+            worker_startup_timeout_secs: 5,
+            ..Default::default()
+        };
+        let ctx = Arc::new(
+            crate::server::AppContext::new(config, reqwest::Client::new(), 64, None, vec![])
+                .unwrap(),
+        );
+        let router: Arc<dyn RouterTrait> = Arc::from(
+            crate::routers::factory::RouterFactory::create_router(&ctx)
+                .await
+                .unwrap(),
+        );
+        let pd = router.as_any().downcast_ref::<VllmPDRouter>().unwrap();
+        let prefill = pd.pd_router.worker_registry.get_prefill_workers();
+        let decode = pd.pd_router.worker_registry.get_decode_workers();
+        assert_eq!((prefill.len(), decode.len()), (2, 2));
+        if enabled && static_source {
+            let policy = pd.policy_registry.get_prefill_policy();
+            let ops = kv_aware_policy(policy.as_ref()).unwrap();
+            let captured = ops.capture_prefill_history(&prefill, "m").unwrap();
+            for worker in &prefill {
+                assert!(
+                    ops.estimate_prefill_work_with_history(
+                        &captured,
+                        &[(worker.as_ref(), &[vec![42; 33]], true)],
+                        &mut crate::policies::PromptHashes::new(),
+                    )
+                    .into_iter()
+                    .next()
+                    .and_then(|(_, hint)| hint)
+                    .is_some(),
+                    "startup must install the actual P witness, not silently bypass history"
+                );
+            }
+        }
+        PrefillHistoryFixture {
+            router,
+            prefill,
+            decode,
+            calls,
+            server,
+            _publishers: publishers,
+        }
+    }
+
+    #[tokio::test]
+    async fn prefill_history_observation_commits_only_after_full_response() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let mut f = prefill_history_fixture(true).await;
+        // Both Ps stay feasible throughout. Removing a P even temporarily can
+        // retire its registration during refresh, which is not an equal-cost tie.
+        let request = f.start(42);
+        let p = f.next("P").await;
+        let learned = p.index;
+        let handoff = prefill_history_handoff(&p);
+        assert_ne!(
+            f.prefill[learned].url(),
+            handoff["kv_transfer_params"]["remote_engine_id"]
+                .as_str()
+                .unwrap(),
+            "static target URLs and connector engine IDs are distinct namespaces"
+        );
+        assert_eq!(f.observed(learned, 42), 0);
+        let bytes = Bytes::from(serde_json::to_vec(&handoff).unwrap());
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let (polled, first_polled) = tokio::sync::oneshot::channel();
+        let body = futures_util::stream::once({
+            let first = bytes.slice(..bytes.len() - 1);
+            async move {
+                let _ = polled.send(());
+                Ok::<_, std::io::Error>(first)
+            }
+        })
+        .chain(futures_util::stream::once(async move {
+            finished.await.unwrap();
+            Ok(bytes.slice(bytes.len() - 1..))
+        }));
+        p.response
+            .send(Response::new(Body::from_stream(body)))
+            .unwrap();
+        first_polled.await.unwrap();
+        assert_eq!(
+            f.observed(learned, 42),
+            0,
+            "partial body is not a successful observation"
+        );
+        assert_eq!(f.prefill[learned].load(), 1);
+        finish.send(()).unwrap();
+        let d = f.next("D").await;
+        assert_eq!(d.body["kv_transfer_params"], handoff["kv_transfer_params"]);
+        assert_eq!(
+            f.observed(learned, 42),
+            32,
+            "selected static P may record advisory history after full body"
+        );
+        d.response
+            .send(StatusCode::SERVICE_UNAVAILABLE.into_response())
+            .unwrap();
+        assert_eq!(
+            request.await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        f.assert_idle();
+        assert_eq!(
+            f.observed(learned, 42),
+            32,
+            "D-only failure does not erase P success"
+        );
+        let repeated = f.start(42);
+        let p = f.next("P").await;
+        assert_eq!(
+            p.index, learned,
+            "the actual consumer returns to the learned P"
+        );
+        f.assert_prefill_charge(learned, 33);
+        let fresh = prefill_history_handoff(&p);
+        assert_ne!(
+            fresh["kv_transfer_params"]["remote_request_id"],
+            handoff["kv_transfer_params"]["remote_request_id"]
+        );
+        p.response
+            .send(axum::Json(fresh.clone()).into_response())
+            .unwrap();
+        let d = f.next("D").await;
+        assert_eq!(d.body["kv_transfer_params"], fresh["kv_transfer_params"]);
+        d.response
+            .send(axum::Json(json!({"choices":[]})).into_response())
+            .unwrap();
+        assert_eq!(repeated.await.unwrap().status(), StatusCode::OK);
+        f.assert_idle();
+        let metrics = handle.render();
+        assert!(
+            metrics.lines().any(|line| {
+                line.starts_with("vllm_router_history_decisions_total{")
+                    && line.contains("phase=\"prefill_history\"")
+                    && (line.contains("reason=\"override\"")
+                        || line.contains("reason=\"eligible_ordinary\""))
+                    && line.ends_with(" 1")
+            }),
+            "real admission must consume an eligible history witness: {metrics}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefill_history_requires_static_enrollment_even_with_discovered_metadata() {
+        for (enabled, static_source) in [(false, true), (true, false)] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let _metrics = metrics::set_default_local_recorder(&recorder);
+            let mut f = prefill_history_fixture_with_source(enabled, static_source).await;
+            let policy = f.pd().policy_registry.get_prefill_policy();
+            let ops = kv_aware_ops(policy.as_ref()).unwrap();
+            assert!(
+                ops.estimate_prefill_work(
+                    &[(f.prefill[0].as_ref(), &[vec![42; 33]], true)],
+                    &mut crate::policies::PromptHashes::new(),
+                )[0]
+                .placement_verified,
+                "the negative must reach a real usable placement binding"
+            );
+            let request = f.start(42);
+            let p = f.next("P").await;
+            let selected = p.index;
+            f.assert_prefill_charge(selected, 33);
+            let handoff = prefill_history_handoff(&p);
+            p.response
+                .send(axum::Json(handoff.clone()).into_response())
+                .unwrap();
+            let d = f.next("D").await;
+            assert_eq!(d.body["kv_transfer_params"], handoff["kv_transfer_params"]);
+            assert_eq!(f.observed(selected, 42), 0);
+            d.response
+                .send(axum::Json(json!({"choices":[]})).into_response())
+                .unwrap();
+            assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+            f.assert_idle();
+            let text = handle.render();
+            assert_eq!(
+                text.lines()
+                    .filter(|line| {
+                        line.starts_with("vllm_router_history_decisions_total{")
+                            && line.contains("phase=\"prefill_history_input\"")
+                            && line.contains("reason=\"missing_static_source\"")
+                            && line.ends_with(" 1")
+                    })
+                    .count(),
+                usize::from(enabled),
+                "{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prefill_history_rejects_failed_cancelled_and_stale_handoffs() {
+        let mut f = prefill_history_fixture(true).await;
+        f.prefill[0].set_healthy(false);
+        let mut old_handoff = None;
+        for (case, token) in [
+            ("http-error", 10),
+            ("invalid-json", 11),
+            ("body-error", 16),
+            ("wrong-id", 12),
+            ("wrong-item", 18),
+            ("old-handoff", 13),
+            ("partial-coverage", 17),
+            ("redirect", 19),
+        ] {
+            let request = f.start(token);
+            let p = f.next("P").await;
+            assert_eq!(p.index, 1);
+            let fresh = prefill_history_handoff(&p);
+            let response = match case {
+                "redirect" => {
+                    let prefill_request = p.body.clone();
+                    p.response
+                        .send(
+                            (
+                                StatusCode::TEMPORARY_REDIRECT,
+                                [(http::header::LOCATION, "/d1/v1/completions")],
+                            )
+                                .into_response(),
+                        )
+                        .unwrap();
+                    let redirected = f.next("D").await;
+                    assert_eq!(redirected.body, prefill_request);
+                    redirected
+                        .response
+                        .send(axum::Json(fresh.clone()).into_response())
+                        .unwrap();
+                    let d = f.next("D").await;
+                    assert_eq!(d.body["kv_transfer_params"], fresh["kv_transfer_params"]);
+                    d.response
+                        .send(axum::Json(json!({"choices":[]})).into_response())
+                        .unwrap();
+                    assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+                    assert_eq!(f.observed(1, token), 0, "{case}");
+                    f.assert_idle();
+                    continue;
+                }
+                "http-error" => {
+                    old_handoff = Some(fresh.clone());
+                    (StatusCode::BAD_REQUEST, axum::Json(fresh)).into_response()
+                }
+                "invalid-json" => (StatusCode::OK, "{not-json").into_response(),
+                "body-error" => Response::new(Body::from_stream(futures_util::stream::iter([
+                    Ok(Bytes::from_static(b"{\"id\":\"partial")),
+                    Err(std::io::Error::other("prefill body interrupted")),
+                ]))),
+                "wrong-id" => {
+                    let mut body = fresh;
+                    body["kv_transfer_params"]["remote_request_id"] = json!("unrelated-request-0");
+                    axum::Json(body).into_response()
+                }
+                "wrong-item" => {
+                    let mut body = fresh;
+                    let remote = body["kv_transfer_params"]["remote_request_id"]
+                        .as_str()
+                        .unwrap()
+                        .replace("-0-", "-1-");
+                    body["kv_transfer_params"]["remote_request_id"] = json!(remote);
+                    axum::Json(body).into_response()
+                }
+                "old-handoff" => axum::Json(old_handoff.as_ref().unwrap().clone()).into_response(),
+                "partial-coverage" => {
+                    let mut body = fresh;
+                    body["kv_transfer_params"]["remote_num_tokens"] = json!(1);
+                    axum::Json(body).into_response()
+                }
+                _ => unreachable!(),
+            };
+            p.response.send(response).unwrap();
+            if matches!(
+                case,
+                "wrong-id" | "wrong-item" | "old-handoff" | "partial-coverage"
+            ) {
+                // Invalid observation evidence does not tighten the existing
+                // ordinary forwarding contract into a new HTTP rejection.
+                let d = f.next("D").await;
+                assert_eq!(f.observed(1, token), 0, "{case}");
+                d.response
+                    .send(axum::Json(json!({"choices":[]})).into_response())
+                    .unwrap();
+            }
+            let response = request.await.unwrap();
+            if case == "http-error" {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+            if matches!(case, "invalid-json" | "body-error") {
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            drop(response);
+            assert_eq!(f.observed(1, token), 0, "{case}");
+            f.assert_idle();
+        }
+        let cancelled = f.start(14);
+        let p = f.next("P").await;
+        let unused = prefill_history_handoff(&p);
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        f.assert_idle();
+        let _ = p.response.send(axum::Json(unused).into_response());
+        assert_eq!(f.observed(1, 14), 0);
+        // This is a fresh client attempt, not a claimed built-in PD failover.
+        let recovered = f.start(15);
+        let p = f.next("P").await;
+        let fresh = prefill_history_handoff(&p);
+        assert_ne!(
+            fresh["kv_transfer_params"]["remote_request_id"],
+            old_handoff.unwrap()["kv_transfer_params"]["remote_request_id"]
+        );
+        p.response.send(axum::Json(fresh).into_response()).unwrap();
+        let d = f.next("D").await;
+        assert_eq!(
+            f.observed(1, 15),
+            32,
+            "a fresh valid attempt can record advisory history"
+        );
+        assert_eq!(f.observed(1, 14), 0);
+        d.response
+            .send(axum::Json(json!({"choices":[]})).into_response())
+            .unwrap();
+        assert_eq!(recovered.await.unwrap().status(), StatusCode::OK);
+        f.assert_idle();
+
+        // The same text may tokenize differently at another endpoint. A
+        // successful handoff from P0 cannot endorse IDs supplied by P1.
+        f.prefill[0].set_healthy(true);
+        f.prefill[1].set_healthy(false);
+        for (redirect, ids, expected) in [(true, 52, 0), (false, 53, 32)] {
+            let request = f.start_prompt(json!("text to render"));
+            let mut render = f.next("render").await;
+            assert_eq!(render.index, 0);
+            if redirect {
+                let original_body = render.body;
+                render
+                    .response
+                    .send(
+                        (
+                            StatusCode::TEMPORARY_REDIRECT,
+                            [(http::header::LOCATION, "/p1/v1/completions/render")],
+                        )
+                            .into_response(),
+                    )
+                    .unwrap();
+                render = f.next("render").await;
+                assert_eq!(render.index, 1);
+                assert_eq!(render.body, original_body);
+            }
+            render
+                .response
+                .send(axum::Json(json!({"token_ids": vec![ids; 33]})).into_response())
+                .unwrap();
+            let p = f.next("P").await;
+            assert_eq!(p.index, 0);
+            assert_eq!(p.body["prompt"], "text to render");
+            f.assert_prefill_charge(0, 33);
+            let fresh = prefill_history_handoff(&p);
+            p.response
+                .send(axum::Json(fresh.clone()).into_response())
+                .unwrap();
+            let d = f.next("D").await;
+            assert_eq!(d.body["kv_transfer_params"], fresh["kv_transfer_params"]);
+            assert_eq!(f.observed(0, ids), expected, "render redirect: {redirect}");
+            d.response
+                .send(axum::Json(json!({"choices":[]})).into_response())
+                .unwrap();
+            assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+            f.assert_idle();
+        }
+    }
+
+    #[tokio::test]
+    async fn prefill_history_drops_stale_worker_evidence_after_render() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let mut f = prefill_history_fixture(true).await;
+        let seed = f.start(42);
+        let p = f.next("P").await;
+        let stale = p.index;
+        let handoff = prefill_history_handoff(&p);
+        p.response
+            .send(axum::Json(handoff).into_response())
+            .unwrap();
+        let d = f.next("D").await;
+        d.response
+            .send(axum::Json(json!({"choices":[]})).into_response())
+            .unwrap();
+        assert_eq!(seed.await.unwrap().status(), StatusCode::OK);
+        f.assert_idle();
+        assert_eq!(f.observed(stale, 42), 32);
+
+        let state = f.pd().pd_router.kv_state.as_ref().unwrap().clone();
+        let _refresh = state.lock_refresh_for_test().await;
+        let request = f.start_prompt(json!("text to render during replacement"));
+        let first = f.next("render").await;
+        let second = f.next("render").await;
+        assert_ne!(first.index, second.index);
+
+        let registry = &f.pd().pd_router.worker_registry;
+        let url = f.prefill[stale].url();
+        registry.remove_by_url(url).unwrap();
+        let replacement: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            url.to_owned(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        registry.register(replacement.clone());
+        // Policy intentionally still sees the old object; it cannot detect
+        // this membership change without the admission-side registry check.
+        assert_eq!(f.observed(stale, 42), 32);
+        let mut new_ids = vec![43; 33];
+        new_ids[..16].fill(42);
+        assert_eq!(f.observed_prefix(stale, &new_ids), 16);
+        // Both snapshots are idle and render 33 tokens. Without the registry
+        // check, the stale P has the unique history match in this real tie.
+        for render in [first, second] {
+            render
+                .response
+                .send(axum::Json(json!({"token_ids": new_ids})).into_response())
+                .unwrap();
+        }
+        let p = f.next("P").await;
+        f.assert_prefill_charge(p.index, 33);
+        let metrics = handle.render();
+        assert!(
+            metrics.lines().any(|line| {
+                line.starts_with("vllm_router_history_decisions_total{")
+                    && line.contains("phase=\"prefill_history\"")
+                    && line.contains("reason=\"missing_evidence\"")
+                    && line.ends_with(" 1")
+            }),
+            "admission must reject stale evidence before refinement: {metrics}"
+        );
+        let handoff = prefill_history_handoff(&p);
+        p.response
+            .send(axum::Json(handoff.clone()).into_response())
+            .unwrap();
+        let d = f.next("D").await;
+        assert_eq!(d.body["kv_transfer_params"], handoff["kv_transfer_params"]);
+        assert_eq!(f.observed_prefix(stale, &new_ids), 16);
+        assert_eq!(replacement.load(), 0);
+        d.response
+            .send(axum::Json(json!({"choices":[]})).into_response())
+            .unwrap();
+        assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+        f.assert_idle();
+    }
+
+    #[tokio::test]
+    async fn prefill_history_fences_replacement_and_preserves_deferred_decode() {
+        use crate::kv_index::{CacheKey, HashMode, KvBlockIndexer, WorkerKvInfo};
+        let mut f = prefill_history_fixture(true).await;
+        let policy = f.pd().policy_registry.get_prefill_policy();
+        let ops = kv_aware_ops(policy.as_ref()).unwrap();
+        let register = |worker: &Arc<dyn Worker>| {
+            ops.unregister_worker(worker.url());
+            ops.register_history_worker(
+                worker,
+                Some(&WorkerKvInfo {
+                    instance_id: worker.url().to_owned(),
+                    ranks: vec![0],
+                    cache_key: Some(CacheKey {
+                        model: Arc::from("m"),
+                        hash_mode: HashMode::Sha256,
+                        block_size: 16,
+                    }),
+                    ..WorkerKvInfo::default()
+                }),
+                Some(Arc::new(KvBlockIndexer::new())),
+            );
+        };
+        f.prefill[0].set_healthy(false);
+        let seed = f.start(21);
+        let p = f.next("P").await;
+        let handoff = prefill_history_handoff(&p);
+        p.response
+            .send(axum::Json(handoff).into_response())
+            .unwrap();
+        let d = f.next("D").await;
+        d.response
+            .send(axum::Json(json!({"choices":[]})).into_response())
+            .unwrap();
+        assert_eq!(seed.await.unwrap().status(), StatusCode::OK);
+        f.assert_idle();
+        assert_eq!(f.observed(1, 21), 32);
+        let stale = f.start(23);
+        let p = f.next("P").await;
+        assert_eq!(p.index, 1);
+        let body = prefill_history_handoff(&p);
+        register(&f.prefill[1]);
+        p.response.send(axum::Json(body).into_response()).unwrap();
+        let d = f.next("D").await;
+        assert_eq!(
+            f.observed(1, 23),
+            0,
+            "old ticket cannot cross same-Arc re-registration"
+        );
+        assert_eq!(
+            f.observed(1, 21),
+            0,
+            "old registration's history is retired"
+        );
+        d.response
+            .send(axum::Json(json!({"choices":[]})).into_response())
+            .unwrap();
+        assert_eq!(stale.await.unwrap().status(), StatusCode::OK);
+        f.assert_idle();
+
+        let fresh = f.start(24);
+        let p = f.next("P").await;
+        let body = prefill_history_handoff(&p);
+        p.response.send(axum::Json(body).into_response()).unwrap();
+        let d = f.next("D").await;
+        assert_eq!(
+            f.observed(1, 24),
+            32,
+            "new attempt uses the current registration"
+        );
+        d.response
+            .send(axum::Json(json!({"choices":[]})).into_response())
+            .unwrap();
+        assert_eq!(fresh.await.unwrap().status(), StatusCode::OK);
+        f.assert_idle();
+
+        let old = f.start(22);
+        let p = f.next("P").await;
+        assert_eq!(p.index, 1);
+        let handoff = prefill_history_handoff(&p);
+        let registry = &f.pd().pd_router.worker_registry;
+        registry.remove_by_url(f.prefill[1].url()).unwrap();
+        let replacement: Arc<dyn Worker> = Arc::new(BasicWorker::new(
+            f.prefill[1].url().to_owned(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+        ));
+        registry.register(replacement.clone());
+        // Same URL and binding signature: only the changed Worker Arc
+        // distinguishes this registration from the previous incarnation.
+        f.pd()
+            .pd_router
+            .kv_state
+            .as_ref()
+            .unwrap()
+            .rebind_prefill_for_test()
+            .await;
+        // The provisional decoder is D0; its removal while P is pending must
+        // remain visible to deferred commitment, not redirect P's observation.
+        registry.remove_by_url(f.decode[0].url()).unwrap();
+        p.response
+            .send(axum::Json(handoff).into_response())
+            .unwrap();
+        let d = f.next("D").await;
+        assert_eq!(d.index, 1);
+        let kv = crate::policies::kv_aware_policy(policy.as_ref()).unwrap();
+        assert_eq!(
+            kv.observed_completion_prefix(replacement.as_ref(), &[22; 33]),
+            0
+        );
+        assert_eq!(
+            f.observed(1, 24),
+            0,
+            "the old Worker does not inherit the replacement registration"
+        );
+        d.response
+            .send(axum::Json(json!({"choices":[]})).into_response())
+            .unwrap();
+        assert_eq!(old.await.unwrap().status(), StatusCode::OK);
+        f.assert_idle();
+        assert_eq!(replacement.load(), 0);
+
+        let fresh = f.start(25);
+        let p = f.next("P").await;
+        assert_eq!(p.index, 1);
+        let handoff = prefill_history_handoff(&p);
+        p.response
+            .send(axum::Json(handoff).into_response())
+            .unwrap();
+        let d = f.next("D").await;
+        assert_eq!(
+            kv.observed_completion_prefix(replacement.as_ref(), &[25; 33]),
+            32,
+            "same-signature refresh must register the replacement Worker"
+        );
+        d.response
+            .send(axum::Json(json!({"choices":[]})).into_response())
+            .unwrap();
+        assert_eq!(fresh.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(replacement.load(), 0);
+        f.assert_idle();
+    }
 
     #[tokio::test]
     async fn prefill_body_limit_rejects_oversized_responses() {
@@ -5258,6 +6200,7 @@ mod tests {
                 "/v1/completions",
                 None,
                 attempt.clone(),
+                None,
                 None,
                 None,
             );

@@ -178,6 +178,8 @@ pub struct PdPrefillInput {
 /// effective input, so different tokenizer/template configurations never mix.
 pub struct PdRequestContext<'a> {
     pub prefill_inputs: Option<&'a HashMap<String, PdPrefillInput>>,
+    /// Prepared from the same snapshot as Prefill work, keyed by worker URL.
+    pub(super) prefill_history: Option<&'a HashMap<String, crate::policies::PrefillHistoryHint>>,
     pub model_id: Option<&'a str>,
     pub legacy_policy_input: Option<&'a str>,
     pub(crate) prefill_cache: Option<&'a crate::policies::PreparedCacheSelection>,

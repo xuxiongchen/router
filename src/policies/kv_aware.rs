@@ -13,7 +13,7 @@ use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
 use super::{get_healthy_worker_indices, pick_tied, LoadBalancingPolicy, RequestHeaders};
-use crate::core::Worker;
+use crate::core::{ConnectionMode, Worker, WorkerType};
 use crate::kv_index::{CacheKey, MatchQuery, RoutableTarget, StorageTier, TierMatch, WorkerKvInfo};
 use crate::request_identity::StableIdentity;
 
@@ -32,6 +32,40 @@ impl CompletionHistoryRequest {
         (self.registrations.contains(&binding.registration_id) && binding.is_history_worker(worker))
             .then_some(binding.registration_id)
     }
+}
+
+/// Static Prefill registrations captured before issuing preparation RPCs.
+pub(crate) struct PrefillHistoryCapture {
+    registrations: HashSet<u64>,
+}
+
+/// A request-local lookup from the same binding and placement query as the
+/// work estimate. Advisory overlap is not evidence of KV residency.
+pub(crate) struct PrefillHistoryHint {
+    registration_id: u64,
+    hit: Option<history::HistoryHit>,
+    positive_credit: bool,
+}
+
+impl PrefillHistoryHint {
+    /// Use the selected worker's same prepared prompt, outside admission.
+    pub(crate) fn observation(&self, ids: &[u32]) -> HistoryObservation {
+        HistoryObservation::new(self.registration_id, ids)
+    }
+
+    fn overlap(&self, now: Instant) -> usize {
+        self.hit.as_ref().map_or(0, |hit| hit.len_at(now))
+    }
+}
+
+/// The ordinary P/D admission comparison, with the actual worker rather than
+/// its projected-load wrapper so its registration can be revalidated.
+pub(crate) struct PrefillTieCandidate<'a> {
+    pub(crate) worker: &'a dyn Worker,
+    pub(crate) hint: Option<&'a PrefillHistoryHint>,
+    pub(crate) cost: f64,
+    pub(crate) occupancy: usize,
+    pub(crate) active_prefill_tokens: u64,
 }
 
 // Process-wide identity, allocated for every registration including load-only
@@ -1146,11 +1180,39 @@ impl KvAwarePolicy {
         workers: &[Arc<dyn Worker>],
         requested_model: &str,
     ) -> CompletionHistoryRequest {
+        CompletionHistoryRequest {
+            registrations: self.history_registrations(workers, requested_model, |worker| {
+                worker.worker_type() == WorkerType::Regular
+            }),
+        }
+    }
+
+    /// The caller has already qualified the static topology and request shape.
+    pub(crate) fn capture_prefill_history(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        requested_model: &str,
+    ) -> Option<PrefillHistoryCapture> {
+        (self.params.router_temperature == 0.0).then(|| PrefillHistoryCapture {
+            registrations: self.history_registrations(workers, requested_model, |worker| {
+                matches!(worker.worker_type(), WorkerType::Prefill { .. })
+                    && worker.connection_mode() == ConnectionMode::Http
+                    && worker.dp_size().is_none_or(|size| size == 1)
+            }),
+        })
+    }
+
+    fn history_registrations(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        requested_model: &str,
+        eligible: impl Fn(&dyn Worker) -> bool,
+    ) -> HashSet<u64> {
         let registrations = workers
             .iter()
             .filter_map(|worker| {
                 let b = self.targets.get(worker.url())?;
-                (worker.worker_type() == crate::core::WorkerType::Regular
+                (eligible(worker.as_ref())
                     && worker.dp_rank().is_none()
                     && b.target.dp_rank == 0
                     && b.is_history_worker(worker.as_ref())
@@ -1161,22 +1223,29 @@ impl KvAwarePolicy {
             })
             .collect();
         self.completion_history.get_or_init(Default::default);
-        CompletionHistoryRequest { registrations }
+        registrations
     }
 
-    fn commit_history_observation(&self, worker: &dyn Worker, observation: HistoryObservation) {
+    pub(crate) fn commit_history_observation(
+        &self,
+        worker: &dyn Worker,
+        observation: HistoryObservation,
+    ) -> bool {
         // Keep this read guard through publication so replacement either
         // removes this insertion or makes its old registration fail the check.
         let Some(binding) = self.targets.get(worker.url()) else {
-            return;
+            return false;
         };
         let Some(store) = self.completion_history.get() else {
-            return;
+            return false;
         };
         if binding.registration_id == observation.registration_id
             && binding.is_history_worker(worker)
         {
             store.insert(observation, binding.block_size, Instant::now());
+            true
+        } else {
+            false
         }
     }
 
@@ -2186,6 +2255,196 @@ impl LoadBalancingPolicy for KvAwarePolicy {
     }
 }
 
+impl KvAwarePolicy {
+    pub(crate) fn estimate_prefill_work_with_history(
+        &self,
+        capture: &PrefillHistoryCapture,
+        inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
+        hashes: &mut PromptHashes,
+    ) -> Vec<(PrefillWorkEstimate, Option<PrefillHistoryHint>)> {
+        let store = self.completion_history.get();
+        self.estimate_prefill_snapshot(inputs, hashes)
+            .zip(inputs)
+            .map(
+                |((work, binding, positive_credit), &(worker, prompts, _))| {
+                    let hint = store.and_then(|store| {
+                        let [ids] = prompts else {
+                            return None;
+                        };
+                        let registration_id = binding.registration_id;
+                        if ids.is_empty()
+                            || !work.placement_verified
+                            || !capture.registrations.contains(&registration_id)
+                            || !binding.is_history_worker(worker)
+                        {
+                            return None;
+                        }
+                        Some(PrefillHistoryHint {
+                            registration_id,
+                            hit: store.match_prefix(
+                                registration_id,
+                                ids,
+                                binding.block_size,
+                                Instant::now(),
+                            ),
+                            positive_credit,
+                        })
+                    });
+                    (work, hint)
+                },
+            )
+            .collect()
+    }
+
+    /// Refine the ordinary token-cost pick without estimating or reserving
+    /// work again. Even workers outside its tie must prove zero credit.
+    pub(crate) fn refine_prefill_tie(
+        &self,
+        candidates: &[PrefillTieCandidate<'_>],
+        ordinary: usize,
+    ) -> (usize, &'static str) {
+        if self.params.router_temperature != 0.0 {
+            return (ordinary, "no_tie");
+        }
+        let Some(base) = candidates.get(ordinary) else {
+            return (ordinary, "no_tie");
+        };
+        let now = Instant::now();
+        let mut positive_credit = false;
+        let mut missing_evidence = false;
+        let overlaps: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                if let Some(hint) = candidate.hint.filter(|hint| {
+                    self.targets.get(candidate.worker.url()).is_some_and(|b| {
+                        b.registration_id == hint.registration_id
+                            && b.is_history_worker(candidate.worker)
+                    })
+                }) {
+                    positive_credit |= hint.positive_credit;
+                    hint.overlap(now)
+                } else {
+                    missing_evidence = true;
+                    0
+                }
+            })
+            .collect();
+        if positive_credit {
+            return (ordinary, "positive_credit");
+        }
+        if missing_evidence {
+            return (ordinary, "missing_evidence");
+        }
+
+        let ordinary_overlap = overlaps[ordinary];
+        let mut longest = ordinary_overlap;
+        let mut maxima = Vec::new();
+        let mut equal_work = 0;
+        for (position, (candidate, overlap)) in candidates.iter().zip(overlaps).enumerate() {
+            if !candidate.cost.is_finite() || candidate.cost < base.cost {
+                return (ordinary, "no_tie");
+            }
+            if candidate.cost != base.cost
+                || candidate.occupancy != base.occupancy
+                || candidate.active_prefill_tokens > base.active_prefill_tokens
+            {
+                continue;
+            }
+            equal_work += 1;
+            if overlap <= ordinary_overlap || overlap < longest {
+                continue;
+            }
+            if overlap > longest {
+                longest = overlap;
+                maxima.clear();
+            }
+            maxima.push(position);
+        }
+        if equal_work < 2 {
+            return (ordinary, "no_tie");
+        }
+        match maxima.as_slice() {
+            [] if ordinary_overlap > 0 => (ordinary, "eligible_ordinary"),
+            [] => (ordinary, "no_overlap"),
+            [only] => (*only, "override"),
+            _ => self
+                .pick_prefill(
+                    &vec![base.cost; maxima.len()],
+                    &vec![base.occupancy; maxima.len()],
+                )
+                .map_or((ordinary, "no_tie"), |picked| (maxima[picked], "override")),
+        }
+    }
+
+    fn estimate_prefill_snapshot<'a>(
+        &'a self,
+        inputs: &'a [(&'a dyn Worker, &'a [Vec<u32>], bool)],
+        hashes: &'a mut PromptHashes,
+    ) -> impl Iterator<Item = (PrefillWorkEstimate, TargetBinding, bool)> + 'a {
+        let mut query_cache = HashMap::new();
+        inputs.iter().map(move |&(worker, prompts, credit)| {
+            let binding = self.binding_for_worker(worker);
+            let verified = credit && binding.cache_key.is_some();
+            let params = CostParams {
+                block_size: binding.block_size,
+                ..self.params
+            };
+            let mut new_prefill_tokens = 0u64;
+            let mut positive_credit = false;
+            for tokens in prompts {
+                let hits = if verified {
+                    let key = (
+                        provider_id(&binding.matches),
+                        binding.cache_key.clone(),
+                        prompt_fingerprint(tokens),
+                    );
+                    query_cache
+                        .entry(key)
+                        .or_insert_with(|| {
+                            let local = hashes.hashes_for(binding.block_size, tokens);
+                            // Keep the allocation alive even if a later
+                            // input observes a replaced registration.
+                            (
+                                binding.matches.clone(),
+                                Self::placement_matches_with(&binding, local),
+                            )
+                        })
+                        .1
+                        .as_slice()
+                } else {
+                    &[]
+                };
+                let matches: Vec<_> = hits
+                    .iter()
+                    .filter(|hit| hit.target == binding.target)
+                    .cloned()
+                    .collect();
+                let credit = credited_tokens(
+                    &CandidateView {
+                        target: &binding.target,
+                        matches: &matches,
+                        load: LoadSample::default(),
+                        input_tokens: tokens.len(),
+                        prefill_tokens: None,
+                    },
+                    &params,
+                );
+                positive_credit |= credit > 0.0;
+                new_prefill_tokens =
+                    new_prefill_tokens.saturating_add(remaining_work(tokens.len(), credit));
+            }
+            (
+                PrefillWorkEstimate {
+                    new_prefill_tokens,
+                    placement_verified: verified,
+                },
+                binding,
+                positive_credit,
+            )
+        })
+    }
+}
+
 impl KvAwareOps for KvAwarePolicy {
     fn register_history_worker(
         &self,
@@ -2281,61 +2540,8 @@ impl KvAwareOps for KvAwarePolicy {
         inputs: &[(&dyn Worker, &[Vec<u32>], bool)],
         hashes: &mut PromptHashes,
     ) -> Vec<PrefillWorkEstimate> {
-        let mut query_cache = HashMap::new();
-        inputs
-            .iter()
-            .map(|&(worker, prompts, credit)| {
-                let binding = self.binding_for_worker(worker);
-                let verified = credit && binding.cache_key.is_some();
-                let params = CostParams {
-                    block_size: binding.block_size,
-                    ..self.params
-                };
-                let mut new_prefill_tokens = 0u64;
-                for tokens in prompts {
-                    let hits = if verified {
-                        let key = (
-                            provider_id(&binding.matches),
-                            binding.cache_key.clone(),
-                            prompt_fingerprint(tokens),
-                        );
-                        query_cache
-                            .entry(key)
-                            .or_insert_with(|| {
-                                let local = hashes.hashes_for(binding.block_size, tokens);
-                                // Keep the allocation alive even if a later
-                                // input observes a replaced registration.
-                                (
-                                    binding.matches.clone(),
-                                    Self::placement_matches_with(&binding, local),
-                                )
-                            })
-                            .1
-                            .as_slice()
-                    } else {
-                        &[]
-                    };
-                    let matches: Vec<_> = hits
-                        .iter()
-                        .filter(|hit| hit.target == binding.target)
-                        .cloned()
-                        .collect();
-                    new_prefill_tokens = new_prefill_tokens.saturating_add(request_prefill_tokens(
-                        &CandidateView {
-                            target: &binding.target,
-                            matches: &matches,
-                            load: LoadSample::default(),
-                            input_tokens: tokens.len(),
-                            prefill_tokens: None,
-                        },
-                        &params,
-                    ));
-                }
-                PrefillWorkEstimate {
-                    new_prefill_tokens,
-                    placement_verified: verified,
-                }
-            })
+        self.estimate_prefill_snapshot(inputs, hashes)
+            .map(|(work, _, _)| work)
             .collect()
     }
 
@@ -5063,6 +5269,277 @@ mod tests {
             );
             assert_eq!(workers[1].load(), 0);
         }
+    }
+
+    fn prefill_history_workers() -> ([Arc<dyn Worker>; 3], WorkerKvInfo) {
+        let workers = ["http://p0", "http://p1", "http://p2"].map(|url| {
+            Arc::new(BasicWorker::new(
+                url.into(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+            )) as Arc<dyn Worker>
+        });
+        let info = WorkerKvInfo {
+            ranks: vec![0],
+            cache_key: Some(CacheKey {
+                model: Arc::from("prefill-model"),
+                hash_mode: crate::kv_index::HashMode::Sha256,
+                block_size: 16,
+            }),
+            ..Default::default()
+        };
+        (workers, info)
+    }
+
+    #[test]
+    fn prefill_history_uses_unrounded_credit_from_its_own_provider() {
+        struct CountedMatches {
+            calls: AtomicUsize,
+            hits: Vec<TierMatch>,
+        }
+        impl TieredMatchProvider for CountedMatches {
+            fn find_tiered_matches(&self, _: &MatchQuery) -> Vec<TierMatch> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.hits.clone()
+            }
+        }
+
+        for (case, disk, source, distinct_provider, verified, expected) in [
+            ("zero", 0.0, 0, false, true, (1, "override")),
+            (
+                "fractional-in-tie",
+                0.01,
+                0,
+                false,
+                true,
+                (0, "positive_credit"),
+            ),
+            (
+                "fractional-outside-tie",
+                0.01,
+                2,
+                true,
+                true,
+                (0, "positive_credit"),
+            ),
+            ("integer", 1.0, 0, false, true, (0, "positive_credit")),
+            (
+                "unverified-in-tie",
+                0.0,
+                0,
+                false,
+                false,
+                (0, "missing_evidence"),
+            ),
+            (
+                "unverified-outside-tie",
+                0.0,
+                2,
+                false,
+                false,
+                (0, "missing_evidence"),
+            ),
+        ] {
+            let mut params = CostParams::default();
+            params.transfer_credits.disk = disk;
+            let policy = KvAwarePolicy::new(params);
+            let (workers, info) = prefill_history_workers();
+            let empty = Arc::new(CountedMatches {
+                calls: AtomicUsize::new(0),
+                hits: Vec::new(),
+            });
+            let placed = Arc::new(CountedMatches {
+                calls: AtomicUsize::new(0),
+                hits: vec![tier_match(
+                    &target(workers[source].url(), 0),
+                    StorageTier::Disk,
+                    &[(0, 1)],
+                )],
+            });
+            for (i, worker) in workers.iter().enumerate() {
+                let provider = if distinct_provider && i != source {
+                    &empty
+                } else {
+                    &placed
+                };
+                policy.register_history_worker(worker, Some(&info), Some(provider.clone()));
+            }
+            let prompts = [(0..33).collect::<Vec<_>>()];
+            let capture = policy
+                .capture_prefill_history(&workers, "prefill-model")
+                .unwrap();
+            let mut hashes = PromptHashes::new();
+            let seed = policy.estimate_prefill_work_with_history(
+                &capture,
+                &[(workers[1].as_ref(), &prompts, true)],
+                &mut hashes,
+            );
+            assert!(policy.commit_history_observation(
+                workers[1].as_ref(),
+                seed[0].1.as_ref().unwrap().observation(&prompts[0]),
+            ));
+            placed.calls.store(0, Ordering::Relaxed);
+            empty.calls.store(0, Ordering::Relaxed);
+
+            let inputs: Vec<_> = workers
+                .iter()
+                .enumerate()
+                .map(|(i, w)| (w.as_ref(), prompts.as_slice(), i != source || verified))
+                .collect();
+            let work = policy.estimate_prefill_work_with_history(&capture, &inputs, &mut hashes);
+            assert_eq!(placed.calls.load(Ordering::Relaxed), 1, "{case}");
+            assert_eq!(
+                empty.calls.load(Ordering::Relaxed),
+                usize::from(distinct_provider),
+                "{case}"
+            );
+            assert_eq!(
+                work[source].0.new_prefill_tokens,
+                if disk == 1.0 { 17 } else { 33 },
+                "{case}"
+            );
+            let candidates: Vec<_> = workers
+                .iter()
+                .zip(&work)
+                .enumerate()
+                .map(|(i, (worker, (estimate, hint)))| {
+                    let active_prefill_tokens = if i == 2 { 100 } else { 0 };
+                    PrefillTieCandidate {
+                        worker: worker.as_ref(),
+                        hint: hint.as_ref(),
+                        cost: (active_prefill_tokens + estimate.new_prefill_tokens) as f64,
+                        occupancy: usize::from(active_prefill_tokens != 0),
+                        active_prefill_tokens,
+                    }
+                })
+                .collect();
+            assert_eq!(
+                policy.refine_prefill_tie(&candidates, 0),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_history_refines_only_current_equal_work() {
+        let policy = KvAwarePolicy::default();
+        let (workers, info) = prefill_history_workers();
+        for worker in &workers {
+            policy.register_history_worker(worker, Some(&info), Some(policy.matches.clone()));
+        }
+        let capture = policy
+            .capture_prefill_history(&workers, "prefill-model")
+            .unwrap();
+        let prompts = [(0..33).collect::<Vec<_>>()];
+        let inputs = workers
+            .each_ref()
+            .map(|w| (w.as_ref(), prompts.as_slice(), true));
+        let mut hashes = PromptHashes::new();
+        let estimate = |capture: &PrefillHistoryCapture, hashes: &mut PromptHashes| {
+            policy.estimate_prefill_work_with_history(capture, &inputs, hashes)
+        };
+        for (worker, length) in workers.iter().zip([15, 17, 33]) {
+            let seed_prompt = [prompts[0][..length].to_vec()];
+            let seed = policy.estimate_prefill_work_with_history(
+                &capture,
+                &[(worker.as_ref(), &seed_prompt, true)],
+                &mut hashes,
+            );
+            assert!(policy.commit_history_observation(
+                worker.as_ref(),
+                seed[0].1.as_ref().unwrap().observation(&seed_prompt[0]),
+            ));
+        }
+        let warm = estimate(&capture, &mut hashes);
+        let now = Instant::now();
+        for ((estimate, hint), overlap) in warm.iter().zip([0, 16, 32]) {
+            assert_eq!(estimate.new_prefill_tokens, 33);
+            let hint = hint.as_ref().unwrap();
+            assert_eq!(hint.overlap(now), overlap);
+            assert_eq!(hint.overlap(now + Duration::from_secs(61)), 0);
+        }
+        let mut candidates: Vec<_> = workers
+            .iter()
+            .zip(&warm)
+            .map(|(worker, (estimate, hint))| PrefillTieCandidate {
+                worker: worker.as_ref(),
+                hint: hint.as_ref(),
+                cost: estimate.new_prefill_tokens as f64,
+                occupancy: 0,
+                active_prefill_tokens: 0,
+            })
+            .collect();
+        assert_eq!(
+            policy.refine_prefill_tie(&candidates[..1], 0),
+            (0, "no_tie")
+        );
+        assert_eq!(policy.refine_prefill_tie(&candidates, 0), (2, "override"));
+        assert_eq!(
+            policy.refine_prefill_tie(&candidates, 2),
+            (2, "eligible_ordinary")
+        );
+        for (cost, occupancy, active) in [(34.0, 0, 0), (33.0, 1, 0), (33.0, 0, 1)] {
+            candidates[2].cost = cost;
+            candidates[2].occupancy = occupancy;
+            candidates[2].active_prefill_tokens = active;
+            assert_eq!(policy.refine_prefill_tie(&candidates, 0), (1, "override"));
+        }
+        candidates[2].cost = 32.0;
+        assert_eq!(policy.refine_prefill_tie(&candidates, 0), (0, "no_tie"));
+        candidates[2].cost = 33.0;
+        candidates[2].active_prefill_tokens = 0;
+
+        assert!(policy.commit_history_observation(
+            workers[1].as_ref(),
+            warm[1].1.as_ref().unwrap().observation(&prompts[0]),
+        ));
+        let maxima = estimate(&capture, &mut hashes);
+        candidates[1].hint = maxima[1].1.as_ref();
+        let (picked, reason) = policy.refine_prefill_tie(&candidates, 0);
+        assert!([1, 2].contains(&picked));
+        assert_eq!(reason, "override");
+        assert_eq!(
+            policy.refine_prefill_tie(&candidates, 1),
+            (1, "eligible_ordinary")
+        );
+
+        let late = warm[2].1.as_ref().unwrap().observation(&prompts[0]);
+        let (replacement, _) = prefill_history_workers();
+        candidates[2].worker = replacement[2].as_ref();
+        assert_eq!(
+            policy.refine_prefill_tie(&candidates, 0),
+            (0, "missing_evidence")
+        );
+        policy.register_history_worker(&replacement[2], Some(&info), Some(policy.matches.clone()));
+        assert_eq!(
+            policy.refine_prefill_tie(&candidates, 0),
+            (0, "missing_evidence")
+        );
+        assert!(!policy.commit_history_observation(replacement[2].as_ref(), late));
+
+        // P1 is unchanged; a fresh capture of the new P2 must be cold.
+        let current = [
+            workers[0].clone(),
+            workers[1].clone(),
+            replacement[2].clone(),
+        ];
+        let fresh = policy
+            .capture_prefill_history(&current, "prefill-model")
+            .unwrap();
+        let current = current
+            .each_ref()
+            .map(|w| (w.as_ref(), prompts.as_slice(), true));
+        assert!(
+            policy.estimate_prefill_work_with_history(&capture, &current, &mut hashes)[2]
+                .1
+                .is_none()
+        );
+        let work = policy.estimate_prefill_work_with_history(&fresh, &current, &mut hashes);
+        assert_eq!(work[1].1.as_ref().unwrap().overlap(now), 32);
+        assert_eq!(work[2].1.as_ref().unwrap().overlap(now), 0);
+        assert!(workers.iter().all(|w| w.load() == 0));
     }
 
     #[test]
