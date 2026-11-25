@@ -1,0 +1,908 @@
+{
+  "router_sha": "d226cf43a459a91a65affff6d67d3887b5eb5605",
+  "manifest_sha256": "a2302a8149b2144a616aba37bdfd64a1ef214be09bccd0989ac76c1e9772765c",
+  "notes": [
+    "Source files are relative to each run in the on-site results export. Lines count LF-delimited lines. JSON pointers use zero-based indices.",
+    "Probe IDs join the harness affinity, transfer and smoke records. Published remote IDs preserve the unique request and attempt suffixes and omit encoded worker addresses.",
+    "For each transfer row the P response and D request carried identical kv_transfer_params. The exact original remote_request_id was matched against Decode read-completion logs.",
+    "Null represents unavailable evidence. Strict PASS also requires positive request-linked external allocation, the expected sender and absence of correlated failures."
+  ],
+  "transfer_row_columns": [
+    "probe_id",
+    "producer",
+    "remote_request_id_without_addresses",
+    "p_response_line",
+    "d_request_line",
+    "same_request_d_read_log_line",
+    "strict_status"
+  ],
+  "transfer_row_sources": {
+    "P0": "worker0.wire.jsonl",
+    "P1": "worker1.wire.jsonl",
+    "decode_request": "worker2.wire.jsonl",
+    "decode_read": "worker2.log",
+    "strict_status": "pd-requests.json#/rows"
+  },
+  "results": {
+    "qwen35-pd": {
+      "run_directory": "20261124T155530-abadf72a0e-qwen35-pd",
+      "prefill_policy": "kv_aware",
+      "harness_statuses": {
+        "model": "PASS",
+        "api": "PASS",
+        "generation": "PASS",
+        "mtp": "N/A",
+        "pd_transfer": "BLOCKED",
+        "hybrid_credit": "PASS",
+        "reuse": "PASS",
+        "bench": "NOT_RUN",
+        "layout_events": "PASS"
+      },
+      "connector_options": {
+        "router": "nixl",
+        "engine": "MooncakeConnectorV1"
+      },
+      "applied_rank0_seq0_replay_sources": {
+        "P0": "router.log:60",
+        "P1": "router.log:61"
+      },
+      "affinity": [
+        {
+          "label": "affinity-match-p0",
+          "probe_id": "pr493-b3a9189b6a1b4c4b8ba032004a52794b",
+          "selected_prefill": "P0",
+          "input_tokens": 1927,
+          "router_credit": 1920,
+          "prefill_cached_tokens": 1920,
+          "observations": {
+            "wire_usage": 1920,
+            "transfer": 1920
+          },
+          "source": "affinity.json#/probes/0"
+        },
+        {
+          "label": "affinity-match-p1",
+          "probe_id": "pr493-e0eef49a695b41fb964afd954a480df4",
+          "selected_prefill": "P1",
+          "input_tokens": 1927,
+          "router_credit": 1920,
+          "prefill_cached_tokens": 1920,
+          "observations": {
+            "wire_usage": 1920,
+            "transfer": 1920
+          },
+          "source": "affinity.json#/probes/1"
+        },
+        {
+          "label": "affinity-boundary-p0",
+          "probe_id": "pr493-2a7cd1ef5fb94010ab1d865279004ebf",
+          "selected_prefill": "P0",
+          "input_tokens": 1281,
+          "router_credit": 0,
+          "prefill_cached_tokens": 0,
+          "observations": {
+            "engine_lookup": 0,
+            "wire_usage": 0,
+            "transfer": 0
+          },
+          "source": "affinity.json#/probes/2",
+          "prefill_lookup": {
+            "prompt_tokens": 1280,
+            "source": "worker0.lookup.jsonl:1"
+          }
+        },
+        {
+          "label": "affinity-held-out",
+          "probe_id": "pr493-206951e95b1748768c7fd59cedbe8367",
+          "selected_prefill": "P1",
+          "input_tokens": 1927,
+          "router_credit": 0,
+          "prefill_cached_tokens": 0,
+          "observations": {
+            "wire_usage": 0,
+            "transfer": 0
+          },
+          "source": "affinity.json#/probes/3"
+        }
+      ],
+      "smoke": [
+        {
+          "probe_id": "pr493-6f713ee019334f3688079155d5d9469d",
+          "endpoint": "/v1/chat/completions",
+          "stream": false,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 144,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/0"
+        },
+        {
+          "probe_id": "pr493-155b5acd52f441c7942054fb489a282a",
+          "endpoint": "/v1/chat/completions",
+          "stream": true,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 144,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/1"
+        },
+        {
+          "probe_id": "pr493-2b6af3c1762c4e8c9162bd00e1d96624",
+          "endpoint": "/v1/completions",
+          "stream": false,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 2,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/2"
+        },
+        {
+          "probe_id": "pr493-5bc0d8e39ba54f839fc832fe7f7767bc",
+          "endpoint": "/v1/completions",
+          "stream": true,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 2,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/3"
+        }
+      ],
+      "transfer_counts_by_prefill": {
+        "P0": {
+          "wire_equal": 5,
+          "read_complete": 4,
+          "strict_pass": 4,
+          "positive_allocation_log": 4
+        },
+        "P1": {
+          "wire_equal": 3,
+          "read_complete": 3,
+          "strict_pass": 3,
+          "positive_allocation_log": 3
+        }
+      },
+      "transfer_rows": [
+        ["pr493-b3a9189b6a1b4c4b8ba032004a52794b", "P0", "cmpl-eddf632def13496ab88ca9b70c296e65-0-b29cb52c", 4, 1, 1961, "PASS"],
+        ["pr493-2a7cd1ef5fb94010ab1d865279004ebf", "P0", "cmpl-e073ea01977e406ab641c66800ef637f-0-82d5e784", 6, 5, null, "BLOCKED"],
+        ["pr493-6f713ee019334f3688079155d5d9469d", "P0", "chatcmpl-09db02af68114ea88b74a01ade25fb06-b7a1b127", 8, 9, 2526, "PASS"],
+        ["pr493-2b6af3c1762c4e8c9162bd00e1d96624", "P0", "cmpl-60dd18fed925438fb36531046a866547-0-a89b1bb1", 10, 13, 3628, "PASS"],
+        ["pr493-5bc0d8e39ba54f839fc832fe7f7767bc", "P0", "cmpl-c378aaedc628451a995b09661171521d-0-9f9f765a", 12, 15, 3754, "PASS"],
+        ["pr493-e0eef49a695b41fb964afd954a480df4", "P1", "cmpl-f2bc155591744d24a77824b21df3e311-0-9bcad5ee", 4, 3, 2193, "PASS"],
+        ["pr493-206951e95b1748768c7fd59cedbe8367", "P1", "cmpl-e017863535e9479caffc0b3583419d16-0-a147d011", 6, 7, 2382, "PASS"],
+        ["pr493-155b5acd52f441c7942054fb489a282a", "P1", "chatcmpl-1b602fef87ea44ddaea12a35e4c36776-8d34b6fa", 8, 11, 3077, "PASS"]
+      ],
+      "diagnostics": {
+        "affinity-boundary-p0": {
+          "probe_id": "pr493-2a7cd1ef5fb94010ab1d865279004ebf",
+          "source": "pd-requests.json#/rows/1",
+          "decode_external_allocation_log_tokens": 0,
+          "decode_remote_read_ms": null,
+          "decode_external_allocation_source": "worker2.log:2241",
+          "decode_local_lookup": {
+            "request_id": "cmpl-e073ea01977e406ab641c66800ef637f-0-a6233cd9",
+            "prompt_tokens": 1281,
+            "computed_tokens": 0,
+            "source": "worker2.lookup.jsonl:1"
+          },
+          "decode_connector_initial_computed_tokens": {
+            "value": 1280,
+            "source": "worker2.log:2240"
+          },
+          "decode_batch_tokens_in_request_window": {
+            "value": 1280,
+            "source": "worker2.log:2243"
+          }
+        }
+      }
+    },
+    "qwen38-pd": {
+      "run_directory": "20261124T155732-92f97fc871-qwen38-pd",
+      "prefill_policy": "kv_aware",
+      "harness_statuses": {
+        "model": "PASS",
+        "api": "PASS",
+        "generation": "PASS",
+        "mtp": "PASS",
+        "pd_transfer": "BLOCKED",
+        "hybrid_credit": "PASS",
+        "reuse": "PASS",
+        "bench": "NOT_RUN",
+        "layout_events": "PASS"
+      },
+      "connector_options": {
+        "router": "nixl",
+        "engine": "MooncakeConnectorV1"
+      },
+      "applied_rank0_seq0_replay_sources": {
+        "P1": "router.log:60",
+        "P0": "router.log:61"
+      },
+      "affinity": [
+        {
+          "label": "affinity-match-p0",
+          "probe_id": "pr493-2d18f28943674a44b79d287f483af2a9",
+          "selected_prefill": "P0",
+          "input_tokens": 2695,
+          "router_credit": 2688,
+          "prefill_cached_tokens": 2688,
+          "observations": {
+            "wire_usage": 2688,
+            "transfer": 2688
+          },
+          "source": "affinity.json#/probes/0"
+        },
+        {
+          "label": "affinity-match-p1",
+          "probe_id": "pr493-6b37d64bde994e52931a3eaa056f79c6",
+          "selected_prefill": "P1",
+          "input_tokens": 2695,
+          "router_credit": 2688,
+          "prefill_cached_tokens": 2688,
+          "observations": {
+            "wire_usage": 2688,
+            "transfer": 2688
+          },
+          "source": "affinity.json#/probes/1"
+        },
+        {
+          "label": "affinity-boundary-p0",
+          "probe_id": "pr493-f769b70790d44c47a9ee6fe2b08b1543",
+          "selected_prefill": "P0",
+          "input_tokens": 1793,
+          "router_credit": 0,
+          "prefill_cached_tokens": 0,
+          "observations": {
+            "engine_lookup": 0,
+            "wire_usage": 0,
+            "transfer": 0
+          },
+          "source": "affinity.json#/probes/2",
+          "prefill_lookup": {
+            "prompt_tokens": 1792,
+            "source": "worker0.lookup.jsonl:1"
+          }
+        },
+        {
+          "label": "affinity-held-out",
+          "probe_id": "pr493-e1348deef4864c5b95ebe3ca7b651cae",
+          "selected_prefill": "P0",
+          "input_tokens": 2695,
+          "router_credit": 0,
+          "prefill_cached_tokens": 0,
+          "observations": {
+            "wire_usage": 0,
+            "transfer": 0
+          },
+          "source": "affinity.json#/probes/3"
+        }
+      ],
+      "smoke": [
+        {
+          "probe_id": "pr493-164e96578b8c450f926f4f4324373a24",
+          "endpoint": "/v1/chat/completions",
+          "stream": false,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 43,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/0"
+        },
+        {
+          "probe_id": "pr493-c8d47470210b46979083b12febf74e2d",
+          "endpoint": "/v1/chat/completions",
+          "stream": true,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 43,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/1"
+        },
+        {
+          "probe_id": "pr493-f040409df6e349a5832bf451931a5f57",
+          "endpoint": "/v1/completions",
+          "stream": false,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 3,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/2"
+        },
+        {
+          "probe_id": "pr493-80270e3ca13b43cc94b17398fcf17813",
+          "endpoint": "/v1/completions",
+          "stream": true,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 3,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/3"
+        }
+      ],
+      "transfer_counts_by_prefill": {
+        "P0": {
+          "wire_equal": 16,
+          "read_complete": 15,
+          "strict_pass": 0,
+          "positive_allocation_log": 0
+        },
+        "P1": {
+          "wire_equal": 9,
+          "read_complete": 9,
+          "strict_pass": 0,
+          "positive_allocation_log": 0
+        }
+      },
+      "transfer_rows": [
+        ["pr493-2d18f28943674a44b79d287f483af2a9", "P0", "cmpl-19afefa149ac473a86bf82aee078cef8-0-80107d43", 4, 1, 4028, "BLOCKED"],
+        ["pr493-f769b70790d44c47a9ee6fe2b08b1543", "P0", "cmpl-d6521f29f0ac49fb92d52f2e0a9e6571-0-a58effed", 6, 5, null, "BLOCKED"],
+        ["pr493-e1348deef4864c5b95ebe3ca7b651cae", "P0", "cmpl-9f0647aedeb44ee7b109a11c8f20d805-0-af1205d3", 8, 7, 4033, "BLOCKED"],
+        ["pr493-164e96578b8c450f926f4f4324373a24", "P0", "chatcmpl-33173614666441948255d2e4aafbd50e-a9d0196c", 10, 9, 4035, "BLOCKED"],
+        ["pr493-c8d47470210b46979083b12febf74e2d", "P0", "chatcmpl-03bef4f063c0406da4eca052be41b685-af251602", 12, 11, 4038, "BLOCKED"],
+        ["pr493-f040409df6e349a5832bf451931a5f57", "P0", "cmpl-cb64764306644e3b989a731a18acb58a-0-b577eb20", 14, 13, 4039, "BLOCKED"],
+        ["pr493-80270e3ca13b43cc94b17398fcf17813", "P0", "cmpl-449784f2740145499975f37390cab6cd-0-99816be4", 16, 15, 4044, "BLOCKED"],
+        ["pr493-b39e1aa0a5a14778bd05fe63ec48d473", "P0", "cmpl-c0f0f806a0b84eb39a890ddfa7250f7a-0-8be8e25c", 18, 17, 4046, "BLOCKED"],
+        ["pr493-01cc7924094b4ffbaac4a6a6bced5d48", "P0", "cmpl-c3cb4ace8d5f4b49a157dde14ac90888-0-ba21264a", 21, 19, 4050, "BLOCKED"],
+        ["pr493-1230b04e89d047799cee704e195c3db5", "P0", "cmpl-ea05293a2829480e9001d02b6fdbd77e-0-8eee6e5c", 22, 21, 4052, "BLOCKED"],
+        ["pr493-02c373a7cc104b06aa019e1101ecf1fe", "P0", "cmpl-c225685d8dea497b96a452e58df2c146-0-8376b70b", 25, 28, 4059, "BLOCKED"],
+        ["pr493-b33606814c4d4cc6857af270e981700e", "P0", "cmpl-62440630f9bb4aaaa2b5fa702391e947-0-80dffc8b", 26, 29, 4060, "BLOCKED"],
+        ["pr493-54dd88bf6ad84fd8adbd480a7b11d8c9", "P0", "cmpl-3ecb0009442f42ff931cf73cc0616dc7-0-9ede031d", 29, 36, 4069, "BLOCKED"],
+        ["pr493-12ac155eeb1f4bb18b6308e40af64260", "P0", "cmpl-46bc366ecf424f99957be4de80105027-0-bef688ec", 30, 37, 4071, "BLOCKED"],
+        ["pr493-f63ea50314144696be0962569add691c", "P0", "cmpl-ddf51aee670044b6a550986f3b9940ad-0-b5ee5d7b", 33, 44, 4077, "BLOCKED"],
+        ["pr493-ebd4472fcaec43f3832e018b38bd4f64", "P0", "cmpl-d3b571f5ad2c4a8ca0a2383cec16ff43-0-bf0a0a01", 34, 45, 4078, "BLOCKED"],
+        ["pr493-6b37d64bde994e52931a3eaa056f79c6", "P1", "cmpl-1e95dd94dc294791aed5cb3c29d78700-0-8e1f5002", 4, 3, 4030, "BLOCKED"],
+        ["pr493-c44ca373cf4d43f1a521481eb433671b", "P1", "cmpl-92b55029a92f4447920bb54c7705d449-0-a3d7ff68", 7, 20, 4051, "BLOCKED"],
+        ["pr493-7506b48855724d59a3a015c6b6a4fc47", "P1", "cmpl-6900d4d801df42a9a79f0b610a375233-0-b6119b5c", 8, 22, 4053, "BLOCKED"],
+        ["pr493-63ed6b5b73a948c69062cd8aa934a494", "P1", "cmpl-7215e142de1644aeb81c096b26e77f1f-0-bf7693c7", 11, 27, 4058, "BLOCKED"],
+        ["pr493-0885254265984c95a2abfe974d2a10e6", "P1", "cmpl-497028f4fd0d44708bced32f48745153-0-8b6bdfc3", 12, 30, 4061, "BLOCKED"],
+        ["pr493-a6e3fac080334278b49b0e3fb80e5381", "P1", "cmpl-7cb52690de8b4b97b2a571617abfa269-0-a1743559", 15, 35, 4068, "BLOCKED"],
+        ["pr493-ab3674370b8d4703b113deca86173629", "P1", "cmpl-a4c00611ac454609bbfb366783fefb5d-0-80c4f13c", 16, 38, 4070, "BLOCKED"],
+        ["pr493-9d1f719f4a7e4153a3c7bace6dd86973", "P1", "cmpl-432417a9472c4e68a44d8a5261f5d21e-0-b8119d42", 19, 43, 4076, "BLOCKED"],
+        ["pr493-e5e6a707db08457aa35d3a120a08b0a5", "P1", "cmpl-b3cf8fdbf97e47a7bc1823612ed67e9d-0-980c37bd", 20, 46, 4079, "BLOCKED"]
+      ],
+      "diagnostics": {
+        "affinity-boundary-p0": {
+          "probe_id": "pr493-f769b70790d44c47a9ee6fe2b08b1543",
+          "source": "pd-requests.json#/rows/1",
+          "decode_external_allocation_log_tokens": null,
+          "decode_remote_read_ms": null,
+          "decode_local_lookup": {
+            "request_id": "cmpl-d6521f29f0ac49fb92d52f2e0a9e6571-0-b3984309",
+            "prompt_tokens": 1793,
+            "computed_tokens": 0,
+            "source": "worker2.lookup.jsonl:1"
+          }
+        },
+        "mtp_probe": {
+          "probe_id": "pr493-b39e1aa0a5a14778bd05fe63ec48d473",
+          "prompt_tokens": 915,
+          "completion_tokens": 48,
+          "decode_remote_read_ms": 5.81,
+          "sources": [
+            "validation.json#/mtp_probe",
+            "worker2.log:4046"
+          ],
+          "decode_counter_source_files": [
+            "requests/before-mtp-probe-worker2.prom",
+            "requests/after-mtp-probe-worker2.prom"
+          ],
+          "decode_counter_columns": [
+            "before",
+            "after",
+            "delta",
+            "line_in_both_files"
+          ],
+          "decode_counters": {
+            "draft_attempts": [
+              60,
+              76,
+              16,
+              39
+            ],
+            "draft_tokens": [
+              180,
+              228,
+              48,
+              45
+            ],
+            "accepted_tokens": [
+              68,
+              100,
+              32,
+              51
+            ],
+            "external_prefix_queries_tokens": [
+              10048,
+              10963,
+              915,
+              120
+            ],
+            "external_prefix_hits_tokens": [
+              8248,
+              9162,
+              914,
+              126
+            ]
+          }
+        },
+        "pre_mtp_probe_aggregate_decode_prompt_tokens": {
+          "local_compute": {
+            "value": 1800,
+            "source": "requests/before-mtp-probe-worker2.prom:156"
+          },
+          "local_cache_hit": {
+            "value": 0,
+            "source": "requests/before-mtp-probe-worker2.prom:157"
+          },
+          "external_kv_transfer": {
+            "value": 8248,
+            "source": "requests/before-mtp-probe-worker2.prom:158"
+          }
+        }
+      }
+    },
+    "dsv4mini4-pd": {
+      "run_directory": "20261124T155959-abebf14c03-dsv4mini4-pd",
+      "prefill_policy": "kv_aware",
+      "harness_statuses": {
+        "model": "PASS",
+        "api": "PASS",
+        "generation": "FAIL",
+        "mtp": "N/A",
+        "pd_transfer": "PASS",
+        "hybrid_credit": "PASS",
+        "reuse": "FAIL",
+        "bench": "NOT_RUN",
+        "layout_events": "PASS"
+      },
+      "connector_options": {
+        "router": "nixl",
+        "engine": "MooncakeHybridConnector"
+      },
+      "applied_rank0_seq0_replay_sources": {
+        "P0": "router.log:60",
+        "P1": "router.log:61"
+      },
+      "affinity": [
+        {
+          "label": "affinity-match-p0",
+          "probe_id": "pr493-2021c4b2541241f0ab83f4a8c9529e79",
+          "selected_prefill": "P0",
+          "input_tokens": 16401,
+          "router_credit": 16384,
+          "prefill_cached_tokens": 16384,
+          "observations": {
+            "engine_lookup": 16384,
+            "wire_usage": 16384,
+            "transfer": 16384
+          },
+          "source": "affinity.json#/probes/0",
+          "prefill_lookup": {
+            "prompt_tokens": 16400,
+            "source": "worker0.lookup.jsonl:2"
+          }
+        },
+        {
+          "label": "affinity-match-p1",
+          "probe_id": "pr493-b4adc11e06fb423094141b4e31d9dbec",
+          "selected_prefill": "P1",
+          "input_tokens": 16401,
+          "router_credit": 16384,
+          "prefill_cached_tokens": 16384,
+          "observations": {
+            "engine_lookup": 16384,
+            "wire_usage": 16384,
+            "transfer": 16384
+          },
+          "source": "affinity.json#/probes/1",
+          "prefill_lookup": {
+            "prompt_tokens": 16400,
+            "source": "worker1.lookup.jsonl:2"
+          }
+        },
+        {
+          "label": "affinity-boundary-p0",
+          "probe_id": "pr493-9ee90d40e50748c096b8e933c2289639",
+          "selected_prefill": "P0",
+          "input_tokens": 16385,
+          "router_credit": 16384,
+          "prefill_cached_tokens": 0,
+          "observations": {
+            "engine_lookup": 0,
+            "wire_usage": 0,
+            "transfer": 0
+          },
+          "source": "affinity.json#/probes/2",
+          "prefill_lookup": {
+            "prompt_tokens": 16384,
+            "source": "worker0.lookup.jsonl:3"
+          },
+          "router_decision_source": "router.log:65968"
+        },
+        {
+          "label": "affinity-held-out",
+          "probe_id": "pr493-f2935fc747e74d3099db84e8eb202ac0",
+          "selected_prefill": "P1",
+          "input_tokens": 16401,
+          "router_credit": 0,
+          "prefill_cached_tokens": 0,
+          "observations": {
+            "engine_lookup": 0,
+            "wire_usage": 0,
+            "transfer": 0
+          },
+          "source": "affinity.json#/probes/3",
+          "prefill_lookup": {
+            "prompt_tokens": 16400,
+            "source": "worker1.lookup.jsonl:3"
+          }
+        },
+        {
+          "label": "affinity-boundary-p0-16384",
+          "probe_id": "pr493-a58fae42cf8042fc87c12d35dbc5d6db",
+          "selected_prefill": "P1",
+          "input_tokens": 16384,
+          "router_credit": 0,
+          "prefill_cached_tokens": 0,
+          "observations": {
+            "engine_lookup": 0,
+            "wire_usage": 0,
+            "transfer": 0
+          },
+          "source": "affinity.json#/boundary_diagnostics/0",
+          "prefill_lookup": {
+            "prompt_tokens": 16383,
+            "source": "worker1.lookup.jsonl:4"
+          }
+        },
+        {
+          "label": "affinity-boundary-p0-16386",
+          "probe_id": "pr493-ce4041e0710d4f52be5d5f347a3e1232",
+          "selected_prefill": "P0",
+          "input_tokens": 16386,
+          "router_credit": 16384,
+          "prefill_cached_tokens": 16384,
+          "observations": {
+            "engine_lookup": 16384,
+            "wire_usage": 16384,
+            "transfer": 16384
+          },
+          "source": "affinity.json#/boundary_diagnostics/1",
+          "prefill_lookup": {
+            "prompt_tokens": 16385,
+            "source": "worker0.lookup.jsonl:4"
+          }
+        }
+      ],
+      "smoke": [
+        {
+          "probe_id": "pr493-86e095f838654b2eb823797cea1256d2",
+          "endpoint": "/v1/chat/completions",
+          "stream": false,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 1024,
+          "finish_reasons": [
+            "length"
+          ],
+          "generation_check": "repetitive_output",
+          "source": "validation.json#/smoke/0"
+        },
+        {
+          "probe_id": "pr493-8a154d2a8cde452ea9c2eb5bd91414a2",
+          "endpoint": "/v1/chat/completions",
+          "stream": true,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 1024,
+          "finish_reasons": [
+            "length"
+          ],
+          "generation_check": "repetitive_output",
+          "source": "validation.json#/smoke/1"
+        },
+        {
+          "probe_id": "pr493-abbe7e912839486f8a4a9d383991355b",
+          "endpoint": "/v1/completions",
+          "stream": false,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 1024,
+          "finish_reasons": [
+            "length"
+          ],
+          "generation_check": "repetitive_output",
+          "source": "validation.json#/smoke/2"
+        },
+        {
+          "probe_id": "pr493-4969b3b7df9740d6b9e618431646f67d",
+          "endpoint": "/v1/completions",
+          "stream": true,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 1024,
+          "finish_reasons": [
+            "length"
+          ],
+          "generation_check": "repetitive_output",
+          "source": "validation.json#/smoke/3"
+        }
+      ],
+      "transfer_counts_by_prefill": {
+        "P0": {
+          "wire_equal": 5,
+          "read_complete": 5,
+          "strict_pass": 5,
+          "positive_allocation_log": 5
+        },
+        "P1": {
+          "wire_equal": 5,
+          "read_complete": 5,
+          "strict_pass": 5,
+          "positive_allocation_log": 5
+        }
+      },
+      "transfer_rows": [
+        ["pr493-2021c4b2541241f0ab83f4a8c9529e79", "P0", "cmpl-3d337bbf9ec241ed9b9cbc9ea734b531-0-bdd7809a", 4, 1, 2191, "PASS"],
+        ["pr493-9ee90d40e50748c096b8e933c2289639", "P0", "cmpl-665eca305471461badba79d651747fe9-0-ab52831a", 6, 5, 7904, "PASS"],
+        ["pr493-ce4041e0710d4f52be5d5f347a3e1232", "P0", "cmpl-ea2683cf2b0643a8b1164686daa2cf7f-0-bbcf8393", 8, 11, 14437, "PASS"],
+        ["pr493-abbe7e912839486f8a4a9d383991355b", "P0", "cmpl-641d7de3f9af4713af62409bff06e5cc-0-a27e7dc1", 10, 17, 356252, "PASS"],
+        ["pr493-4969b3b7df9740d6b9e618431646f67d", "P0", "cmpl-7e6c1455a9b7401fa83c638a53c074c2-0-bd3b0ad7", 12, 19, 526075, "PASS"],
+        ["pr493-b4adc11e06fb423094141b4e31d9dbec", "P1", "cmpl-0c79c10647314b4bb33830e927112cb8-0-9608797e", 4, 3, 5724, "PASS"],
+        ["pr493-f2935fc747e74d3099db84e8eb202ac0", "P1", "cmpl-10c8038105e14f739d53a24393e71f84-0-aa57c104", 6, 7, 10080, "PASS"],
+        ["pr493-a58fae42cf8042fc87c12d35dbc5d6db", "P1", "cmpl-b5905c492d41476eb15bcaffaaaa4b06-0-ad697fe1", 8, 9, 12258, "PASS"],
+        ["pr493-86e095f838654b2eb823797cea1256d2", "P1", "chatcmpl-0b75f81bb330431583cf72310d047fce-a737e2b9", 10, 13, 16614, "PASS"],
+        ["pr493-8a154d2a8cde452ea9c2eb5bd91414a2", "P1", "chatcmpl-f2cdfb6564ae4f9d981a8b46be9d7938-b17655f4", 12, 15, 186433, "PASS"]
+      ],
+      "diagnostics": {
+        "affinity-boundary-p0": {
+          "probe_id": "pr493-9ee90d40e50748c096b8e933c2289639",
+          "source": "pd-requests.json#/rows/1",
+          "decode_external_allocation_log_tokens": 16384,
+          "decode_remote_read_ms": 2.11,
+          "decode_external_allocation_source": "worker2.log:7728",
+          "decode_local_lookup": {
+            "request_id": "cmpl-665eca305471461badba79d651747fe9-0-a9a71bcf",
+            "prompt_tokens": 16385,
+            "computed_tokens": 0,
+            "source": "worker2.lookup.jsonl:3"
+          }
+        },
+        "affinity-boundary-p0-16386": {
+          "probe_id": "pr493-ce4041e0710d4f52be5d5f347a3e1232",
+          "source": "pd-requests.json#/rows/2",
+          "decode_external_allocation_log_tokens": 16385,
+          "decode_remote_read_ms": 1.78,
+          "decode_external_allocation_source": "worker2.log:14262",
+          "decode_local_lookup": {
+            "request_id": "cmpl-ea2683cf2b0643a8b1164686daa2cf7f-0-8823b2a4",
+            "prompt_tokens": 16386,
+            "computed_tokens": 0,
+            "source": "worker2.lookup.jsonl:6"
+          }
+        }
+      }
+    },
+    "qwen35-pd-cold": {
+      "run_directory": "20261124T160449-81c3171d3d-qwen35-pd-cold",
+      "prefill_policy": "kv_aware",
+      "harness_statuses": {
+        "model": "PASS",
+        "api": "PASS",
+        "generation": "PASS",
+        "mtp": "N/A",
+        "pd_transfer": "BLOCKED",
+        "hybrid_credit": "PASS",
+        "reuse": "PASS",
+        "bench": "NOT_RUN",
+        "layout_events": "PASS"
+      },
+      "connector_options": {
+        "router": "nixl",
+        "engine": "MooncakeConnectorV1"
+      },
+      "applied_rank0_seq0_replay_sources": {
+        "P0": "router.log:60",
+        "P1": "router.log:61"
+      },
+      "affinity": [
+        {
+          "label": "affinity-boundary-p0-cold-d",
+          "probe_id": "pr493-0296e58301fa4d9496c6331d3d1796cb",
+          "selected_prefill": "P0",
+          "input_tokens": 1281,
+          "router_credit": 0,
+          "prefill_cached_tokens": 0,
+          "observations": {
+            "engine_lookup": 0,
+            "wire_usage": 0,
+            "transfer": 0
+          },
+          "source": "affinity.json#/probes/0",
+          "prefill_lookup": {
+            "prompt_tokens": 1280,
+            "source": "worker0.lookup.jsonl:1"
+          }
+        },
+        {
+          "label": "affinity-match-p0",
+          "probe_id": "pr493-424948488413403a8168bcdbf7b142aa",
+          "selected_prefill": "P0",
+          "input_tokens": 1927,
+          "router_credit": 1920,
+          "prefill_cached_tokens": 1920,
+          "observations": {
+            "wire_usage": 1920,
+            "transfer": 1920
+          },
+          "source": "affinity.json#/probes/1"
+        },
+        {
+          "label": "affinity-match-p1",
+          "probe_id": "pr493-3efe9a7828314a30b5f789b84f3fe5ee",
+          "selected_prefill": "P1",
+          "input_tokens": 1927,
+          "router_credit": 1920,
+          "prefill_cached_tokens": 1920,
+          "observations": {
+            "wire_usage": 1920,
+            "transfer": 1920
+          },
+          "source": "affinity.json#/probes/2"
+        },
+        {
+          "label": "affinity-boundary-p0-after-warm-attempt",
+          "probe_id": "pr493-e97a47e530e84d8e92704683d33b0606",
+          "selected_prefill": "P0",
+          "input_tokens": 1281,
+          "router_credit": 640,
+          "prefill_cached_tokens": 640,
+          "observations": {
+            "wire_usage": 640,
+            "transfer": 640
+          },
+          "source": "affinity.json#/probes/3"
+        },
+        {
+          "label": "affinity-held-out",
+          "probe_id": "pr493-094dac43018d410d9c56454f17ed5864",
+          "selected_prefill": "P0",
+          "input_tokens": 1927,
+          "router_credit": 0,
+          "prefill_cached_tokens": 0,
+          "observations": {
+            "wire_usage": 0,
+            "transfer": 0
+          },
+          "source": "affinity.json#/probes/4"
+        }
+      ],
+      "smoke": [
+        {
+          "probe_id": "pr493-bdf8132ec2a640f699b511f9608ef8ac",
+          "endpoint": "/v1/chat/completions",
+          "stream": false,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 144,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/0"
+        },
+        {
+          "probe_id": "pr493-bac4588cd68b4f07b19203a00d453a47",
+          "endpoint": "/v1/chat/completions",
+          "stream": true,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 144,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/1"
+        },
+        {
+          "probe_id": "pr493-c662fbbea12247f6bed7a728dedf5f70",
+          "endpoint": "/v1/completions",
+          "stream": false,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 2,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/2"
+        },
+        {
+          "probe_id": "pr493-7c09e5234585436695b49134d6b48c95",
+          "endpoint": "/v1/completions",
+          "stream": true,
+          "success": true,
+          "http_status": 200,
+          "completion_tokens": 2,
+          "finish_reasons": [
+            "stop"
+          ],
+          "generation_check": null,
+          "source": "validation.json#/smoke/3"
+        }
+      ],
+      "transfer_counts_by_prefill": {
+        "P0": {
+          "wire_equal": 7,
+          "read_complete": 6,
+          "strict_pass": 6,
+          "positive_allocation_log": 6
+        },
+        "P1": {
+          "wire_equal": 2,
+          "read_complete": 2,
+          "strict_pass": 2,
+          "positive_allocation_log": 2
+        }
+      },
+      "transfer_rows": [
+        ["pr493-0296e58301fa4d9496c6331d3d1796cb", "P0", "cmpl-803d5c455bf64f48bd9b5ec776863038-0-bc94ec7a", 4, 1, 1955, "PASS"],
+        ["pr493-424948488413403a8168bcdbf7b142aa", "P0", "cmpl-a92b9b2cac0a47e2b2c21f31b24f4e70-0-81fecf15", 6, 3, 2098, "PASS"],
+        ["pr493-e97a47e530e84d8e92704683d33b0606", "P0", "cmpl-82048c9cdeb840379bc6dcc386c97483-0-b578bf67", 8, 7, null, "BLOCKED"],
+        ["pr493-094dac43018d410d9c56454f17ed5864", "P0", "cmpl-8a884e454df94d969c91b7ce7149b941-0-b6a77a26", 10, 9, 2490, "PASS"],
+        ["pr493-bdf8132ec2a640f699b511f9608ef8ac", "P0", "chatcmpl-09b8a69648fd467b9a3b47d9e2a81dc2-8d6f0657", 12, 11, 2634, "PASS"],
+        ["pr493-bac4588cd68b4f07b19203a00d453a47", "P0", "chatcmpl-a6e2716bd9044131958f6b1c415679b9-80d65c9c", 14, 13, 3187, "PASS"],
+        ["pr493-7c09e5234585436695b49134d6b48c95", "P0", "cmpl-96d4a66b6bc443e9abc626cee89575df-0-87605356", 16, 17, 3858, "PASS"],
+        ["pr493-3efe9a7828314a30b5f789b84f3fe5ee", "P1", "cmpl-e2fa2ad8d1634fe697f2340e8a864df7-0-aa6092ab", 4, 5, 2306, "PASS"],
+        ["pr493-c662fbbea12247f6bed7a728dedf5f70", "P1", "cmpl-2560a068da66408794b8d2a5cbcaee84-0-ba999474", 6, 15, 3738, "PASS"]
+      ],
+      "diagnostics": {
+        "affinity-boundary-p0-cold-d": {
+          "probe_id": "pr493-0296e58301fa4d9496c6331d3d1796cb",
+          "source": "pd-requests.json#/rows/0",
+          "decode_external_allocation_log_tokens": 1280,
+          "decode_remote_read_ms": 83.43,
+          "decode_external_allocation_source": "worker2.log:1790"
+        },
+        "affinity-boundary-p0-after-warm-attempt": {
+          "probe_id": "pr493-e97a47e530e84d8e92704683d33b0606",
+          "source": "pd-requests.json#/rows/2",
+          "decode_external_allocation_log_tokens": 0,
+          "decode_remote_read_ms": null,
+          "decode_external_allocation_source": "worker2.log:2353",
+          "decode_connector_initial_computed_tokens": {
+            "value": 1280,
+            "source": "worker2.log:2352"
+          },
+          "decode_batch_tokens_in_request_window": {
+            "value": 1,
+            "source": "worker2.log:2355"
+          }
+        }
+      }
+    }
+  }
+}
