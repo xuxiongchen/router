@@ -35,7 +35,7 @@ The team also observed incorrect repetitive output in a separate DSpark-disabled
 
 Each model used one round, 24 requests per policy, six sessions with four turns each, up to four active sessions and one outstanding request per session. Each arm restarted the engines and Router. Within a model all arms received the same prerecorded conversation histories and produced the same output-token total (3,072). All **144/144** measured requests completed the stream and had a correlated successful, positive-length Mooncake read at the selected D. All **144/144** also stopped at the length cap with empty final-answer content.
 
-The table reports latency across 24 requests per policy. **Time to first token (TTFT)** measures the time from dispatch to the first nonempty text or reasoning fragment. **Time per output token (TPOT)** averages the time per subsequent token within each request, then takes the mean across requests. **End-to-end latency (E2E)** runs from dispatch to the end of the response stream. E2E P95 is the 95th percentile of those 24 request durations.
+**Because both Mini4 checkpoints failed the answer-quality checks, TPOT and E2E measured on these truncated responses are unreliable estimates of latency when generating correct answers.**
 
 | Model | Prefill policy | Requests completed | Output tokens/s ↑ | TTFT mean / P95 (s) ↓ | Mean TPOT (ms/token) ↓ | Mean E2E (s) ↓ | E2E P95 (s) ↓ | P cache hit | P tokens recomputed ↓ |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
